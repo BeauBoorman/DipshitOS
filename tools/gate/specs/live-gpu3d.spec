@@ -2,14 +2,15 @@
 # (GPUTRIANGLE.ELF) drives the opt-in VIR1 render device over the real seat
 # -> broker -> Metal path; the private profile's raw BGRA readback export and
 # the VZ scanout are pixel-proven by f1's independent comparator/geometry.
-# Thirteen independent boots, one leg each: 01 triangle, 02 mixed margins,
+# Fourteen independent boots, one leg each: 01 triangle, 02 mixed margins,
 # 03 resize/second generation, 04 close/reuse, 05 native-only (no render
 # device), 06 malformed/auth (invalid battery + forged kind-17), 07
 # wrong/stale fence, 08 stall/timeout + next-open drain, 09 M111b GPU
 # compute (slot-90 GEMM submit->fence->readback + named refusal), 10 M111c
 # GOINFER stub-model inference K=5, 11 GOINFER on a device-less boot, 12
 # GOINFER weights-absent honesty, 13 GOINFER owner-approved model
-# (SmolLM2-135M-Instruct, Apache-2.0) K=5 decode when a VIW is staged.
+# (SmolLM2-135M-Instruct, Apache-2.0) K=5 decode when a VIW is staged, 14
+# GOINFER hostile .VIW named refusal (swapped-shape embed).
 # `wm=none`
 # is seeded so the seat is the spec's own scripted exec; every leg ends on
 # a marker only its script can print. Leg 05 RUNS FIRST: the seed share is
@@ -20,7 +21,7 @@
 # device/app never ran cannot pass. HOST PREREQUISITE (fails honestly):
 #   bash tools/go/build-gotabwm.sh tools/go/build-gputriangle.sh
 
-vgate_name live-gpu3d "M102f2 #2171: guest triangle through real VIR1/Metal into the native 2D seat, 13 legs, raw-BGRA readback + scanout pixels + fence/timeout lifecycle + M111b #2409 slot-90 compute round trip + M111c #2410 GOINFER stub-model + owner-approved SmolLM2 inference"
+vgate_name live-gpu3d "M102f2 #2171: guest triangle through real VIR1/Metal into the native 2D seat, 14 legs, raw-BGRA readback + scanout pixels + fence/timeout lifecycle + M111b #2409 slot-90 compute round trip + M111c #2410 GOINFER stub-model + owner-approved SmolLM2 inference + hostile .VIW named refusal"
 vgate_share seed
 vgate_runner_flags -Xswiftc -DSPIKE
 
@@ -67,6 +68,10 @@ EOF
 
 vgate_file script-goinfer-model.txt <<'EOF'
 exec GOINFER.ELF model
+EOF
+
+vgate_file script-goinfer-hostile.txt <<'EOF'
+exec GOINFER.ELF model /host/HOSTILE.VIW
 EOF
 
 vgate_file script-rx.txt <<'EOF'
@@ -491,6 +496,35 @@ for row in ("compute\trefused\tinvalid", "compute\tstats\trefusals=1"):
     if row not in refuse:
         sys.exit("refuse receipt missing %r\n%s" % (row, refuse))
 print("compute receipt rows verified")
+
+# Leg 14's crafted image: a well-formed container — valid prefix, header,
+# tokenizer blob, directory — whose embed tensor declares dims
+# [dim, vocab] where the arch wants [vocab, dim]. payload_len still agrees
+# with the DECLARED dims, so the container parser accepts it and the
+# refusal must come from the shape check: a named error, never a panic.
+# It parks at the share ROOT — inside GOINFER/ it would break leg 11's
+# no-receipt-dir assert on the device-less boot.
+import struct
+h_hdr = ("\n".join([
+    "arch llama", "dim 64", "hidden 128", "layers 1", "heads 4",
+    "kv_heads 4", "vocab 32", "seq_cap 16", "rope half",
+    "rope_theta 10000", "rms_eps 1e-05", "tie 1", "bos 1", "eos 2",
+]) + "\n").encode()
+h_tok = struct.pack("<III", 1, 1, 2)  # kind=bytes, bos, eos
+h_n = 64 * 32                        # swapped-dims embed's own element count
+h_paylen = (h_n + 1) // 2 + ((h_n + 31) // 32) * 8  # u4asym group 32
+h_ent = bytearray(96)
+h_ent[0:5] = b"embed"
+h_ent[32] = 2   # fmt u4asym
+h_ent[33] = 2   # nd
+h_ent[34] = 32  # group
+struct.pack_into("<II", h_ent, 36, 64, 32)  # dims — the lie
+struct.pack_into("<Q", h_ent, 56, 64 + len(h_hdr) + len(h_tok) + 96)
+struct.pack_into("<Q", h_ent, 64, h_paylen)
+h_img = (struct.pack("<IIIII", 0x31574956, len(h_hdr), len(h_tok), 1, 0)
+         + bytes(44) + h_hdr + h_tok + bytes(h_ent) + bytes(h_paylen))
+open(os.path.join(share, "HOSTILE.VIW"), "wb").write(h_img)
+print("staged HOSTILE.VIW (%d bytes, embed dims swapped)" % len(h_img))
 PY
 
 # --- leg 11: GOINFER on a device-less boot (M111c, issue #2410) -----------
@@ -686,3 +720,31 @@ if body.count("model\trun\t") != 5:
     sys.exit("receipt wants 5 model run rows:\n%s" % body)
 print("model leg: pinned sha, licence receipt, K=5 consistent answer verified")
 PY
+
+# --- leg 14: hostile .VIW is a named refusal, not a crash ----------------
+# The setup's crafted image parses as a container but its embed tensor
+# lies about its shape; `goinfer model` must refuse the load with a named
+# error — console line, receipt, journey-end marker — never a panic, a
+# hang, or a fabricated answer. The detail substring pins that the refusal
+# is the loader's shape check, not a generic read failure.
+vgate_run 14 -- \
+    --screen '$RUN_DIR/screen-14' \
+    --gpu3d-metal \
+    --script '$RUN_DIR/script-seat.txt' \
+    --script2 '$RUN_DIR/script-goinfer-hostile.txt' \
+    --script2-after 'gotabwm: holding seat' \
+    --script3 '$RUN_DIR/script-rx.txt' \
+    --script3-after 'goinfer: done' \
+    --script-expect 'rx-g3-ok' --timeout 180
+
+vgate_assert 14 serial-contains 'gpu3d: armed did=0x1083'
+vgate_assert 14 serial-contains 'goinfer: error'
+vgate_assert 14 serial-contains 'viw tensor embed'
+vgate_assert 14 serial-contains 'goinfer: done'
+vgate_assert 14 serial-absent 'goinfer: model answer'
+vgate_assert 14 serial-absent 'goinfer OK'
+vgate_assert 14 serial-absent '[EXC] parking:'
+vgate_assert 14 serial-absent 'gpu3d: timeout'
+vgate_assert 14 serial-absent 'gpu3d: badresp'
+vgate_assert 14 output-contains 'compute-submits=0'
+vgate_assert 14 output-contains 'refusals=0'

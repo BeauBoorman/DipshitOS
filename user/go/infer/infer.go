@@ -11,6 +11,7 @@ package infer
 
 import (
 	"errors"
+	"fmt"
 	"io"
 )
 
@@ -32,6 +33,13 @@ func Load(r io.Reader, s Dev, stageBytes int) (*Model, error) {
 	if err != nil {
 		m.freeBuffers()
 		return nil, err
+	}
+	// An id the table can emit that the embedding has no row for is a
+	// load-time defect, not a decode-time panic.
+	if tok.MaxID() >= m.cfg.Vocab {
+		m.freeBuffers()
+		return nil, fmt.Errorf("viw: tokenizer id space %d exceeds vocab %d",
+			tok.MaxID()+1, m.cfg.Vocab)
 	}
 	m.tok = tok
 	return m, nil

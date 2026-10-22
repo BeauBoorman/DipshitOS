@@ -36,18 +36,19 @@ type Dev interface {
 // matrix; w13 the fused [2·hidden, dim] gate|up matrix. Fusions keep the
 // exchange count inside the ADR's one-outstanding-request budget.
 const (
-	tEmbed   = "embed"
-	tFinalN  = "final_norm"
-	tAttnN   = "attn_norm"
-	tFfnN    = "ffn_norm"
-	tWqkv    = "wqkv"
-	tWo      = "wo"
-	tW13     = "w13"
-	tW2      = "w2"
-	layerPfx = "l"
-	maxWBuf  = 16 * 1024 * 1024 // capset max_buffer_bytes
-	maxWBufs = 16               // capset max_buffers_per_ctx
-	stubSeed = 0x5eed5eed5eed001
+	tEmbed    = "embed"
+	tFinalN   = "final_norm"
+	tAttnN    = "attn_norm"
+	tFfnN     = "ffn_norm"
+	tWqkv     = "wqkv"
+	tWo       = "wo"
+	tW13      = "w13"
+	tW2       = "w2"
+	layerPfx  = "l"
+	maxWBuf   = 16 * 1024 * 1024 // capset max_buffer_bytes
+	maxWBufs  = 16               // capset max_buffers_per_ctx
+	maxLayers = 256              // far past the deepest llama-family model
+	stubSeed  = 0x5eed5eed5eed001
 )
 
 // devTensor is a device-resident weight: the buffer plus the three span
@@ -138,10 +139,76 @@ func (m *Model) checkArch() error {
 	if c.Rope != "half" && c.Rope != "interleaved" {
 		return fmt.Errorf("viw rope %q", c.Rope)
 	}
-	if c.Vocab > 49152 || c.SeqCap > 4096 || c.Dim > 4096 || c.Hidden > 4096 {
+	if c.Vocab > 49152 || c.SeqCap > 4096 || c.Dim > 4096 || c.Hidden > 4096 ||
+		c.Layers > maxLayers {
 		return errors.New("viw dims exceed the kernel bounds")
 	}
 	return nil
+}
+
+// checkTensor binds a directory entry to the header's architecture. The v1
+// vocabulary is closed — embed, final_norm and the six per-layer tensors —
+// and every one of them has a fixed fmt and a shape derived from the
+// config, so anything else (an unknown name, a layer index beyond Layers,
+// a swapped or inflated dim) is malformed. Pinning shapes here is what
+// bounds each payload before a single payload byte is read or allocated:
+// PayLen is already tied to the entry's own dims, and a hostile image can
+// only make those huge by lying about the shape.
+func (m *Model) checkTensor(t viwTensor) error {
+	c := m.cfg
+	want := func(rows, cols int) error {
+		if t.Dims[0] != uint32(rows) || t.Dims[1] != uint32(cols) {
+			return fmt.Errorf("viw tensor %s: dims [%d %d], want [%d %d]",
+				t.Name, t.Dims[0], t.Dims[1], rows, cols)
+		}
+		return nil
+	}
+	norm := func() error {
+		if t.Fmt != viwFmtF32 {
+			return fmt.Errorf("viw tensor %s: fmt %d, want f32 norm", t.Name, t.Fmt)
+		}
+		return want(c.Dim, 0)
+	}
+	quant := func(rows, cols int) error {
+		if t.Fmt != viwFmtU4Asym && t.Fmt != viwFmtQ8Sym {
+			return fmt.Errorf("viw tensor %s: fmt %d, want a quantized fmt",
+				t.Name, t.Fmt)
+		}
+		return want(rows, cols)
+	}
+	switch t.Name {
+	case tEmbed:
+		// u4asym specifically: the embedding gather and every lm_head
+		// slice walk the three-span nibble layout directly.
+		if t.Fmt != viwFmtU4Asym {
+			return fmt.Errorf("viw tensor %s: fmt %d, want u4asym embed",
+				t.Name, t.Fmt)
+		}
+		return want(c.Vocab, c.Dim)
+	case tFinalN:
+		return norm()
+	}
+	li := layerIndex(t.Name)
+	if li < 0 {
+		return fmt.Errorf("viw tensor %q: not in the v1 vocabulary", t.Name)
+	}
+	if li >= c.Layers {
+		return fmt.Errorf("viw tensor %s: layer %d beyond %d", t.Name, li, c.Layers)
+	}
+	dh := c.Dim / c.Heads
+	switch t.Name[strings.IndexByte(t.Name, '.')+1:] {
+	case tAttnN, tFfnN:
+		return norm()
+	case tWqkv:
+		return quant((c.Heads+2*c.KVHeads)*dh, c.Dim)
+	case tWo:
+		return quant(c.Dim, c.Heads*dh)
+	case tW13:
+		return quant(2*c.Hidden, c.Dim)
+	case tW2:
+		return quant(c.Dim, c.Hidden)
+	}
+	return fmt.Errorf("viw tensor %q: unknown layer tensor", t.Name)
 }
 
 // layerIndex parses "l<N>." prefixes; -1 when the name has none.
@@ -174,10 +241,15 @@ func loadModel(im *viwImage, r io.Reader, s Dev, stageBytes int) (*Model, error)
 	m.layers = make([]layerW, m.cfg.Layers)
 
 	// Pass 1: the directory is fully known before any payload arrives, so
-	// the pack plan (which buffer, which offset) is computable up front.
+	// the pack plan (which buffer, which offset) is computable up front —
+	// and every entry's shape is validated against the architecture before
+	// a single payload byte is allocated or read.
 	plan := make(map[string]*devTensor)
 	var pack []uint32
 	for _, t := range im.Dir {
+		if err := m.checkTensor(t); err != nil {
+			return nil, err
+		}
 		if isGuestTensor(t.Name) {
 			continue
 		}
@@ -220,7 +292,11 @@ func loadModel(im *viwImage, r io.Reader, s Dev, stageBytes int) (*Model, error)
 	// Pass 2: payloads arrive in directory order.
 	scratch := make([]byte, stageBytes)
 	for _, t := range im.Dir {
-		dst := m.tensorDest(t)
+		dst, err := m.tensorDest(t)
+		if err != nil {
+			m.freeBuffers()
+			return nil, err
+		}
 		left := t.PayLen
 		for left > 0 {
 			n := uint64(len(scratch))
@@ -321,33 +397,36 @@ func loadModel(im *viwImage, r io.Reader, s Dev, stageBytes int) (*Model, error)
 
 // tensorDest decides a payload's destination: a guest-side accumulator
 // (norms, embed) or nil — device weight. Accumulators are preallocated to
-// the payload length so the streamed append never doubles past its size.
-func (m *Model) tensorDest(t viwTensor) *[]byte {
+// the payload length so the streamed append never doubles past its size;
+// PayLen itself is already pinned to the config-derived shape by
+// checkTensor. A second tensor landing in the same slot is refused — the
+// vocabulary names each exactly once.
+func (m *Model) tensorDest(t viwTensor) (*[]byte, error) {
+	slot := func(dst **[]byte) (*[]byte, error) {
+		if *dst != nil {
+			return nil, fmt.Errorf("viw: duplicate %s tensor", t.Name)
+		}
+		b := make([]byte, 0, t.PayLen)
+		*dst = &b
+		return *dst, nil
+	}
 	switch t.Name {
 	case tEmbed:
-		b := make([]byte, 0, t.PayLen)
-		m.embedRaw = &b
-		return m.embedRaw
+		return slot(&m.embedRaw)
 	case tFinalN:
-		b := make([]byte, 0, t.PayLen)
-		m.finalRaw = &b
-		return m.finalRaw
+		return slot(&m.finalRaw)
 	}
 	if li := layerIndex(t.Name); li >= 0 && li < m.cfg.Layers {
 		lw := &m.layers[li]
 		sub := t.Name[strings.IndexByte(t.Name, '.')+1:]
 		switch sub {
 		case tAttnN:
-			b := make([]byte, 0, t.PayLen)
-			lw.attnRaw = &b
-			return lw.attnRaw
+			return slot(&lw.attnRaw)
 		case tFfnN:
-			b := make([]byte, 0, t.PayLen)
-			lw.ffnRaw = &b
-			return lw.ffnRaw
+			return slot(&lw.ffnRaw)
 		}
 	}
-	return nil // device weight
+	return nil, nil // device weight
 }
 
 func isGuestTensor(name string) bool {

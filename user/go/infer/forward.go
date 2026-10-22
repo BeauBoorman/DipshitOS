@@ -20,6 +20,7 @@ package infer
 
 import (
 	"errors"
+	"fmt"
 	"math"
 
 	"virelai/gpu3d"
@@ -374,6 +375,16 @@ func (e *engine) step(tok, pos int) error {
 	c := e.m.cfg
 	dh := e.m.headDim()
 	qg := c.Heads / c.KVHeads
+
+	// tok multiplies into the embed payload and pos into the KV cache —
+	// both must stay inside the bounds the config declared, no matter
+	// which tokenizer produced the id.
+	if tok < 0 || tok >= c.Vocab {
+		return fmt.Errorf("infer: token id %d outside vocab %d", tok, c.Vocab)
+	}
+	if pos < 0 || pos >= c.SeqCap {
+		return fmt.Errorf("infer: position %d outside seq_cap %d", pos, c.SeqCap)
+	}
 
 	// Embedding-row gather on the CPU: the packed row and its groups are
 	// slices of the guest-resident embed payload.

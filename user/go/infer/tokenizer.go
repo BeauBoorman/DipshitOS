@@ -21,6 +21,9 @@ type Tokenizer interface {
 	// Specials used by the sampler.
 	EOS() int
 	BOS() int
+	// MaxID is the largest id the table can emit; Load refuses a tokenizer
+	// whose id space outruns the model's vocab.
+	MaxID() int
 }
 
 // The VIW tokenizer blob is a small binary section — no format library:
@@ -71,6 +74,12 @@ func parseTokenizer(b []byte) (Tokenizer, error) {
 		}
 		nv := int(binary.LittleEndian.Uint32(b[p:]))
 		p += 4
+		// Bound the count by the bytes that remain BEFORE it sizes make():
+		// every entry costs at least its u16 length, so a lying count fails
+		// here instead of preallocating gigabytes of table.
+		if nv > (len(b)-p)/2 {
+			return nil, fmt.Errorf("viw: vocab count %d beyond blob", nv)
+		}
 		tb.vocab = make([]string, 0, nv)
 		for i := 0; i < nv; i++ {
 			if err := need(2); err != nil {
@@ -89,6 +98,9 @@ func parseTokenizer(b []byte) (Tokenizer, error) {
 		}
 		nm := int(binary.LittleEndian.Uint32(b[p:]))
 		p += 4
+		if nm > (len(b)-p)/8 {
+			return nil, fmt.Errorf("viw: merge count %d beyond blob", nm)
+		}
 		tb.merges = make([][2]uint32, 0, nm)
 		for i := 0; i < nm; i++ {
 			if err := need(8); err != nil {
@@ -177,6 +189,9 @@ func (t *bytesTok) Decode(ids []int) string {
 func (t *bytesTok) EOS() int { return t.eos }
 func (t *bytesTok) BOS() int { return t.bos }
 
+// MaxID is 255: byte-level ids are the bytes themselves.
+func (t *bytesTok) MaxID() int { return 255 }
+
 // --- GPT-2-style byte-level BPE ----------------------------------------------
 
 // bpeTok implements byte-level BPE: atoms are the 256 bytes mapped through
@@ -238,6 +253,10 @@ func buildByteTable(t *bpeTok) {
 
 func (t *bpeTok) EOS() int { return t.eos }
 func (t *bpeTok) BOS() int { return t.bos }
+
+// MaxID is the last vocab row — specials and merge results all live inside
+// the same table, so no emitted id can outrun it.
+func (t *bpeTok) MaxID() int { return len(t.idTok) - 1 }
 
 // atomize maps a byte slice to its unicode-atom token strings.
 func (t *bpeTok) atomize(bs []byte) []string {

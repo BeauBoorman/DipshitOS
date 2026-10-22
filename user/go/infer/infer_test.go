@@ -2,8 +2,10 @@ package infer
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"io"
+	"strings"
 	"testing"
 
 	"virelai/vi"
@@ -237,5 +239,167 @@ func TestCloseFreesAndRefuses(t *testing.T) {
 	}
 	if _, err := m.Generate([]int{1}, 4, nil); err == nil {
 		t.Fatal("Generate on a closed model must fail")
+	}
+}
+
+// --- hostile .VIW inputs ----------------------------------------------------
+//
+// A crafted image gets exactly one contract: a named Load/Generate error,
+// never a panic, a multi-gigabyte allocation, or a silent wrong answer.
+// tinyImage builds the smallest image that loads — one layer, dim 32 — so
+// every test mutates precisely one field of an otherwise valid file.
+
+func tinyImage(t *testing.T, tok []byte, mut func(w *viwWrite)) []byte {
+	t.Helper()
+	h := Header{Arch: "llama", Dim: 32, Hidden: 64, Layers: 1,
+		Heads: 2, KVHeads: 2, Vocab: 256, SeqCap: 16,
+		Rope: "half", RopeTheta: 10000, RmsEps: 1e-5,
+		Tie: true, BOS: 1, EOS: 2}
+	w := newViwWrite(h, tok)
+	u4 := func(rows, cols int) []byte {
+		return quantU4Asym(make([]float32, rows*cols), 32)
+	}
+	f32pay := func(n int) []byte { return make([]byte, n*4) }
+	w.add(tEmbed, viwFmtU4Asym, 32, [2]uint32{256, 32}, u4(256, 32))
+	w.add(tFinalN, viwFmtF32, 0, [2]uint32{32, 0}, f32pay(32))
+	w.add("l0."+tAttnN, viwFmtF32, 0, [2]uint32{32, 0}, f32pay(32))
+	w.add("l0."+tWqkv, viwFmtU4Asym, 32, [2]uint32{96, 32}, u4(96, 32))
+	w.add("l0."+tWo, viwFmtU4Asym, 32, [2]uint32{32, 32}, u4(32, 32))
+	w.add("l0."+tFfnN, viwFmtF32, 0, [2]uint32{32, 0}, f32pay(32))
+	w.add("l0."+tW13, viwFmtU4Asym, 32, [2]uint32{128, 32}, u4(128, 32))
+	w.add("l0."+tW2, viwFmtU4Asym, 32, [2]uint32{32, 64}, u4(32, 64))
+	if mut != nil {
+		mut(w)
+	}
+	return w.marshal()
+}
+
+// loadErr asserts the image is refused with want in the error — and that
+// the refusal is an error return, not a panic (a panic fails the test run
+// on its own).
+func loadErr(t *testing.T, img []byte, want string) {
+	t.Helper()
+	m, err := Load(bytes.NewReader(img), NewFakeDev(), 1<<20)
+	if err == nil {
+		m.Close()
+		t.Fatalf("hostile image loaded; want refusal matching %q", want)
+	}
+	if !strings.Contains(err.Error(), want) {
+		t.Fatalf("Load error %q, want substring %q", err, want)
+	}
+}
+
+// The fixture itself is valid: a no-mutation image must load and close.
+func TestTinyImageIsLoadable(t *testing.T) {
+	m, err := Load(bytes.NewReader(tinyImage(t, tokEmitBytes(1, 2), nil)),
+		NewFakeDev(), 1<<20)
+	if err != nil {
+		t.Fatalf("tiny image: %v", err)
+	}
+	m.Close()
+}
+
+// The tokenizer blob's section counts size the parse tables — a count that
+// outruns the blob must fail before it allocates.
+func TestHostileTokenizerCountsBeyondBlob(t *testing.T) {
+	b := make([]byte, 16)
+	binary.LittleEndian.PutUint32(b, tokKindBPE)
+	binary.LittleEndian.PutUint32(b[12:], 1<<30) // n_vocab
+	if _, err := parseTokenizer(b); err == nil {
+		t.Fatal("n_vocab beyond the blob accepted")
+	}
+	v := tokEmitBPE([]string{"a"}, nil, 0, 1)
+	binary.LittleEndian.PutUint32(v[len(v)-4:], 1<<30) // n_merges
+	if _, err := parseTokenizer(v); err == nil {
+		t.Fatal("n_merges beyond the blob accepted")
+	}
+}
+
+// Header fields bound every downstream allocation — a layers count past
+// the envelope must die in checkArch, before the layer table allocates.
+func TestHostileHeaderLayersExceedsBound(t *testing.T) {
+	img := tinyImage(t, tokEmitBytes(1, 2), func(w *viwWrite) {
+		w.header.Layers = 1 << 20
+	})
+	loadErr(t, img, "kernel bounds")
+}
+
+// Tensor dims are attacker-writable bytes — every v1 name has one
+// config-derived shape, and a consistent-with-itself lie must be refused.
+func TestHostileTensorShapes(t *testing.T) {
+	cases := []struct {
+		name string
+		mut  func(w *viwWrite)
+		want string
+	}{
+		{"embed dims swapped", func(w *viwWrite) {
+			w.dir[0].Dims = [2]uint32{128, 64} // same N, wrong shape
+		}, "dims"},
+		{"embed dims inflated", func(w *viwWrite) {
+			w.dir[0].Dims = [2]uint32{256, 64}
+			w.pay[0] = quantU4Asym(make([]float32, 256*64), 32)
+		}, "dims"},
+		{"embed wrong fmt", func(w *viwWrite) {
+			w.dir[0].Fmt = viwFmtF32
+			w.dir[0].Group = 0
+			w.pay[0] = make([]byte, 256*32*4)
+		}, "u4asym"},
+		{"norm dims wrong", func(w *viwWrite) {
+			w.dir[1].Dims = [2]uint32{64, 0}
+			w.pay[1] = make([]byte, 64*4)
+		}, "dims"},
+		{"wqkv dims wrong", func(w *viwWrite) {
+			w.dir[3].Dims = [2]uint32{48, 64} // same N, wrong split
+		}, "dims"},
+		{"layer index out of range", func(w *viwWrite) {
+			w.add("l5."+tAttnN, viwFmtF32, 0, [2]uint32{32, 0},
+				make([]byte, 128))
+		}, "beyond"},
+		{"unknown tensor name", func(w *viwWrite) {
+			w.add("rotary", viwFmtF32, 0, [2]uint32{32, 0},
+				make([]byte, 128))
+		}, "vocabulary"},
+		{"unknown layer tensor", func(w *viwWrite) {
+			w.add("l0.rotary", viwFmtF32, 0, [2]uint32{32, 0},
+				make([]byte, 128))
+		}, "unknown"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			loadErr(t, tinyImage(t, tokEmitBytes(1, 2), tc.mut), tc.want)
+		})
+	}
+}
+
+// A second tensor landing in the same guest slot is refused — each name
+// owns its accumulator exactly once.
+func TestHostileDuplicateGuestTensor(t *testing.T) {
+	img := tinyImage(t, tokEmitBytes(1, 2), func(w *viwWrite) {
+		w.add(tEmbed, viwFmtU4Asym, 32, [2]uint32{256, 32},
+			quantU4Asym(make([]float32, 256*32), 32))
+	})
+	loadErr(t, img, "duplicate")
+}
+
+// A tokenizer whose id space outruns the model's vocab is inconsistent —
+// Load refuses it rather than panic on the first out-of-range embed row.
+func TestHostileTokenizerIdSpaceExceedsVocab(t *testing.T) {
+	vocab := make([]string, 300) // id space 300 against model vocab 256
+	for i := range vocab {
+		vocab[i] = "x"
+	}
+	img := tinyImage(t, tokEmitBPE(vocab, nil, 0, 1), nil)
+	loadErr(t, img, "id space")
+}
+
+// A token id outside the vocab — however it reached the prompt — is a
+// named error, not an out-of-bounds embed-row gather.
+func TestGenerateRejectsOutOfRangeTokens(t *testing.T) {
+	m, _ := loadStub(t)
+	defer m.Close()
+	for _, prompt := range [][]int{{9999, 1}, {-1, 1}} {
+		if _, err := m.Generate(prompt, 4, nil); err == nil {
+			t.Fatalf("prompt %v ran an out-of-range token id", prompt)
+		}
 	}
 }
