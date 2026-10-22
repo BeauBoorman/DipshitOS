@@ -201,11 +201,11 @@ check_go_overlay() {
     # mallocinit and turns the whole shell fleet red with no spec naming the
     # cause (observed #1648: fork runtime files dated Sep 20, M71m merged
     # Sep 21). Cmp each overlay file against the fork's copy -- except the
-    # gostalgia/ and gostalgia-mods/ stage overlays, which are never fork
-    # files (only build-gostalgia.sh consumes them; apply.sh §2/§2c excludes
-    # them from the copy and deletes leaked copies). Without the same
-    # exclusion here they cmp stale on every run and the check can never
-    # pass.
+    # gostalgia/, gostalgia-mods/ and charm-mods/ stage overlays, which are
+    # never fork files (only build-gostalgia.sh / build-charmhello.sh consume
+    # them; apply.sh §2/§2c excludes them from the copy and deletes leaked
+    # copies). Without the same exclusion here they cmp stale on every run
+    # and the check can never pass.
     local _repo _fork _f _stale
     _repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)" || return 0
     [ -d "$_repo/tools/go/overlay" ] || return 0
@@ -215,7 +215,8 @@ check_go_overlay() {
     [ -d "$_fork/src" ] || return 0   # not provisioned yet: the build scripts will
     _stale=""
     for _f in $(cd "$_repo/tools/go/overlay" && find . -type f \
-        ! -path "./gostalgia/*" ! -path "./gostalgia-mods/*" | sed 's|^\./||'); do
+        ! -path "./gostalgia/*" ! -path "./gostalgia-mods/*" \
+        ! -path "./charm-mods/*" | sed 's|^\./||'); do
         cmp -s "$_repo/tools/go/overlay/$_f" "$_fork/src/$_f" 2>/dev/null || _stale="$_stale $_f"
     done
     [ -n "$_stale" ] || return 0
