@@ -1,8 +1,9 @@
 # ADR 0046: Multi-source audio — a kernel mixer over the B7 stream, not a userland AUDIOD
 
 - Date: 2026-10-13
-- Status: **Proposed** — awaiting owner review. No code lands here; this
-  ADR is the card (#2179) and, if approved, the split below is the arc.
+- Status: **Accepted** — shipped by M99b (M99 closed, index #2178): the
+  mixer is live (`kernel/src/pcm_playback.zig:25`); this ADR is the card
+  (#2179), and the split below is the arc.
 - Card: **#2179** (M99a of the M99 depth-pass index #2178). The follow-on
   implementation card is **#2180** (M99b); M99c (#2181) and M99d (#2182)
   consume the result.

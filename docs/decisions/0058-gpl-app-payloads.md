@@ -1,13 +1,13 @@
 # ADR 0058: GPL app payloads — the engine lives in a sibling repo and ships as a signed store release
 
 - Date: 2026-10-18
-- Status: **Proposed** — awaiting owner review. No code lands here;
-  this ADR is the card (#2618) and, if approved, the M130 arc
-  implements it in the filed order: M130b the sibling engine repo +
-  `DG_*` shim (#2619), M130c the playable slice (#2620), M130d sound
-  (#2621, ∥ c), M130e store packaging (#2622), M130f acceptance
-  (#2623). (Number 0058 was provisionally held for this card; 0059 is
-  the warm-checkpoint ADR, merged.)
+- Status: **Accepted** — shipped by the M130 arc (#2617, closed;
+  `tools/gate/specs/live-doom.spec:1,69`); this ADR is the card (#2618),
+  and the M130 arc implemented it in the filed order: M130b the sibling
+  engine repo + `DG_*` shim (#2619), M130c the playable slice (#2620),
+  M130d sound (#2621, ∥ c), M130e store packaging (#2622), M130f
+  acceptance (#2623). (Number 0058 was provisionally held for this
+  card; 0059 is the warm-checkpoint ADR, merged.)
 - Card: **#2618** (M130 index **#2617**) — card 1 of 6. This is the
   one doc for the arc (AGENTS.md: one doc per arc, not four).
 - Related: `AGENTS.md` *Scope rules* (the GPL bullet D7 amends),

@@ -1,1 +1,538 @@
-# ADR 0060: Time at human scale — the 1 Hz heartbeat plus a deadline overlay- Date: 2026-10-22- Status: **Proposed — owner review required.** No code lands here; this  ADR is the decision record for the wave-4 time arc (index #3021,  index #3022) plus its binding artefact, the tick-unit audit below.  If approved, the index-#3022 cards implement in their filed order: card #3033 the kernel overlay, card #3036 slots 94/95 + wrappers, card #3038 the free-file site migration, card #3034 the damage-driven  seat tick, card #3039 GOVIEW playback, card #3040 the bench.- Card: **#3027** (card 2 of 2 in #3021).- Related: ADR 0007 (syscall ABI; the wave-4 X1–X9 reservation rows land  in card #3026's amendment), ADR 0009 (kind-18 `COMPOSITE_TICK` — its  stale arg1 note is corrected by X4), ADR 0015 (the superseded "≤ 1 s  latency, accepted" line), ADR 0047 (procs v2 — the tick is the CPU  accounting sample), issues #1252/#1255/#1261/#1287 (the rejected  comparator-pull) and #1486 (the SMP reschedule seam that survived).> The 1 Hz tick is not a defect to be removed; it is three fixtures the> gates pin (wake clock, preemption quantum plus CPU accounting, wall> clock) and twenty spec files of byte-exact text. What the wave needs is> a *second* clock: sub-second deadlines that wake the sleeper without> touching the heartbeat. A deadline IRQ is not a tick — it advances no> counter the heartbeat text reads, and it forces no preemption.## Grounding (observed in tree `09d7458c`, 2026-10-22)- **The tick is three things.** `timer.period_ns = 1_000_000_000`  (`kernel/src/timer.zig:39`): a 1 Hz CNTP comparator. `tick()` consumes  it as the preemption quantum and CPU-accounting sample  (`kernel/src/scheduler.zig:3220-3224` — `smp.core_ticks[c]`,  `tasks[…].run_ticks`, then `cpu_ticks` via `on_tick`; ADR 0047). Core 0's  beat runs the housekeeping — `scheduler.on_tick`  (`scheduler.zig:2726-2738`) advances `tick_count` (:995), wakes  `sys_sleep` deadlines (`sleep_current` :2120, `wake_expired` :2598),  counts down app timers (`app_timers.on_tick`), and posts the kind-18  `COMPOSITE_TICK` heartbeat (`wm_server.on_tick` :641). `wall_epoch`  (`timer.zig:88-91`) derives Unix seconds as `boot_epoch_secs + ticks`.  A `timer heartbeat ticks=N irq=N poll=0` line prints per five ticks and  is asserted byte-exact by `live-timer.spec` (`:15`,`:22`: `irq=5` after  five ticks).- **EL0 already reads nanoseconds; it can only wait in seconds.**  `vi.Nanos()`/`vsys.Nanotime()` read the counter the kernel granted EL0  (`timer.zig` `allow_el0_counter`), and futex/sock-ready deadlines take  nanoseconds at the ABI (ADR 0007:1353-1355) — but `sys_sleep` (slot 4)  and `sys_timer_set` (slot 40) take *ticks*, so the kernel rounds every  sub-second wait UP to a whole second (`futex_deadline_tick`,  `syscall.zig:2598-2601`). Every millisecond-scale intent in userland  silently becomes ≤1 s — or worse, a guessed tick count becomes tens of  seconds (the X rows).- **A second timer channel already exists.** The profiler arms  `CNTV_CVAL_EL0` on `freq/100` (10 ms) deadlines on PPI 27  (`timer.zig:285-308` `profile_sync_local`/`profile_arm_local`,  `profile_next_deadline` :317-321 which *skips* missed periods rather  than flooding catch-up; IRQ dispatch at `exceptions.zig:1149-1154`,  `gic.profile_ppi` = 27 at `gic.zig:285`). A deadline overlay beside the  heartbeat is a pattern the tree already runs, not a novel mechanism.- **This was tried and rejected once — as a reschedule, not as a wake  clock.** WMP card 3 (#1252, draft PR #1255) pulled the comparator  forward ~2 ms on each wake funnel so a woken WM task preempted off the  period boundary: measured 815 ms → 2.5 ms input→present, and it kills  the SMP WM boot (`live-wnd5-gate2-policy` PASS → FAIL 0/4) with a  silent `VZVirtualMachine.State.error` — VZ aborts the VM, no `[EXC]`  block, no guest fault (#1261's instrumented bisection: the trigger is  the first `dui` burst under WM traffic, not the extra rotation in  general; #1287 closed out "make the VZ abort observable"). The  measurement scaffolding it left — the wake-funnel counters and the  IRQ-exit reschedule (`scheduler.zig:1068-1090`, `request_resched_on`  :1133, `irq_exit_reschedule` :1189) — is unchanged and does not move  the comparator. M70b (#1486) kept wake targeting + the RESCHEDULE SGI.- **The census is bigger than the index's grounding.** The index-#3021 row  estimated 172 EL0 sites. The commands below count **218** at this  tree: the delta is real growth since `ea41a50d` (the index-#2956 Bubble Tea  landings, GOSSHD, hostint) plus sites a shallow grep cannot see —  nine `svc1(SlotSleep, 1)` calls inside package `vi`, eighteen indirect  invocations through `sleepFn`/`sleepTicks`/`c.sleep` seams, eleven  `vi.Sleep` seam *bindings*, and six Zig sites that emit the slot-4 SVC  in naked asm or `zc` codegen rather than naming `sys_sleep`.## D1. The 1 Hz heartbeat stays; deadlines are an overlay on the same comparator**Unchanged:** `period_ns`, `ticks`, `irq_ticks`, `poll_ticks`, the`timer heartbeat` and `timer irq delivered` lines, `scheduler.tick_count`and every tick-counted consumer (sleep deadlines, app timers, kind-18,quantum, `cpu_ticks`/`run_ticks`, `wall_epoch`, aging, the CPU-limitbound). Slot 4 (`sys_sleep`), slots 40/41 (`sys_timer_set`/`cancel`) andslot 66 (`sys_time`) keep their contracts byte-for-byte (X5).**New:** a sorted set of nanosecond deadlines (per core where the requestwas made). After every arm/wake, the CNTP comparator is programmed to`min(next heartbeat boundary, earliest pending deadline)` — never earlierthan the next period edge unless a deadline says so, never later. Acomparator IRQ that is not the period boundary is a *deadline* IRQ: itwakes the due sleepers (the same `blocked → ready` flip `wake_expired`performs) and advances its own counter, `deadline_irqs` — it must notincrement `ticks` or `irq_ticks`, because `live-timer.spec:15,22` pins`irq=5` after five ticks and the heartbeat text is asserted in 14 specs.This is the same instruction stream `arm()` already writes(`timer.zig:170-186`: `cntp_cval_el0` + enable + `isb`) — the overlaychanges *what value* is programmed and *which counter* a fire advances,not the mechanism. The profiler's CNTV channel (10 ms, PPI 27) is theproof the hardware tolerates two cadences; the overlay does it on onecomparator by picking the nearest of two reasons to fire.## D2. Deadline granularity is 1 msSub-tick deadlines quantize to 1 ms — the X1–X3 reservations (slot 94`sys_sleep_ns`, slot 95 `sys_timer_set_ns`, slot 74 futex/op-74-2 nsrounding) all round UP to it. 1 ms is three orders below the heartbeatand comfortably above the counter's own cost (CNTFRQ is tens of MHz; a1 ms deadline is tens of thousands of cycles). Finer would invite100 Hz-rate interrupt storms for no consumer: the audit below shows nosite wanting finer than ~50 ms.## D3. No forced preemption on a deadlineA deadline wake marks tasks ready; it does not rotate. On a busy core awoken task runs at the next yield, block, or heartbeat quantum — which isnever later than today (today it would wait for the next tick anyway).This is the load-bearing difference from #1252: the nudge inserted anextra core-0 rotation off the period boundary and died under WM traffic;D3 does not create that path at all. The observed `resched_requested`funnel and `irq_exit_reschedule` are untouched — they remain the wake*measurement*, not a preemption trigger.## Why not 100 Hz or tickless- **100 Hz re-times three pinned contracts at once.** The tick is the  sleeper wake clock *and* the preemption/accounting quantum *and* the  wall clock. Moving it to 100 Hz would multiply quantum rotations ×100,  shrink `cpu_ticks` quanta to 10 ms (ADR 0047's "the tick is the  sample"), and force `wall_epoch` to stop counting ticks. Every spec  asserting `timer heartbeat` (14 files), `gotabwm: tick` (6 files) and  `live-wm-pacing`'s `tick_avg_ms` 800–1200 window would need re-timing —  for zero precision gain a deadline overlay doesn't already give.- **Tickless-idle throws away the heartbeat the system is built on.**  Removing the periodic tick removes the quantum, the accounting beat,  the wall clock's advance, and the `hb=`-paced fixture cadence — all to  be re-invented as on-demand deadlines. The overlay keeps the heartbeat  for everything that wants a beat and adds deadlines for everything that  wants a time.- **The rejected alternative was specifically a preemption change.** #1252  is not evidence against sub-second wakes; it is evidence against  *rotating core 0 off the period boundary*. The overlay's deadline IRQ  never rotates (D3), so the #1261 kill path is not exercised by this  design. card #3033 still carries a K=3 WM-boot leg per the index — prudence,  not a reopen.- **Catch-up stays bounded.** The overlay adds no catch-up loop: a missed  deadline fires once (the due set is flushed wholesale), like  `profile_next_deadline` skipping missed periods and the bounded drain  loops already in `tick()`'s tail (`scheduler.zig:3645-3657`).## Supersessions and amendments recorded- **ADR 0015:203** — "the WM serves them in its 1 Hz kind-18 wake (≤ 1 s  latency, accepted)". That acceptance is retired by the wave-4 contract:  the seat stops tolerating a 1 s input→present term. card #3034 adds  the damage-driven kind-18 tick (flags bit 0, X4 — at most one pending  per seat, cleared on the seat's REQUEST_PRESENT); card #3040 pins  the keystroke→glyph number. The heartbeat kind-18 stays 1 Hz and  flags-0; ADR 0015's text is not edited here (that file was in #3007's  Touches when this card was drafted).- **ADR 0007** — three rows are amended by the card #3026 wave-4  reservation amendment, not by this ADR: the slot-4 row's "1 tick ≈ 1 s"  phrasing gains the X1 sibling (`:298-300`), the futex `timeout_ns`  "rounding UP to whole scheduler ticks" note is superseded by X3's  1 ms rounding (`:1353-1355`), and op 74/2's `current_tick + timeout_ns /  1_000_000_000 + 1` deadline is superseded the same way (`:2116-2123`).  Slots 4/40/66 themselves are X5-frozen — unchanged.- **ADR 0009:70** — the kind-18 row says arg1 is reserved; arg1 has been  the damage mask since M33 SB4 (`wm_server.zig:650-656` region). X4  records both facts; recorded here as the audit's context, corrected in  the #3026 amendment.## The audit: every EL0 sleep/timer site, classifiedOne row per call site in `user/go` and `user/src` — including indirectinvocations through a `sleepFn`-family seam and the bindings that choosetheir unit — 218 sites at `09d7458c`. Classes:| Class | Meaning | Disposition ||---|---|---|| **H** | Heartbeat or tick-counted by design (fixtures, contract surfaces, deliberately heartbeat-paced) | stays || **D** | Wants a duration | migrate to slot 94/95 ns or a named duration || **S** | Settle guess — a sleep standing in for an event or a "wait a bit" | migrate to a named duration or an event || **P** | Poll / retry backoff | stays, or migrate if user-visible || **X** | Bug — the value does not deliver what the site says | fix |Owner column: the card that migrates the row — `card #3038` (card #3038, the eight free files), `card #3034` (the seat's refusal-path sleep),`card #3036` (`time.Sleep` and the `sleep_ns`/wrapper sites areprecise once the kernel rounds futex waits to 1 ms, no site edit needed),or **fold-in** for a file another lane holds (the `user/go/files/*`chain #2989→#2994, the index-#2956 cards' `pulse`/`charmhello`/`btmath`/`sshd`families, `edit/*` #2987/#2991, and the remaining unheld sites). `—`means the row stays.Counts at `09d7458c`: **H 18, D 32, S 53, P 104, X 11 — 218 sites.**The two `vi.Sleep(50) // hundreds of ms` rows the card names — 50 s, notms — are here, and the audit found four more of the same family:`ps`/`resmon`'s `timer_set(100)` commented "1 second", `top`'s`TimerSet(12)` "≈1 s", and `netstat`'s `refreshTicks = 4` "~1 Hz" (arefresh four times slower than its comment, twice over for the `Sleep`leg). All are X.Host-side notes outside the census: `*_test.go` sleeps run under `gotest` on the host (excluded by glob); `browser/peer_watch.py` is a hostscript (excluded by the `*.go` glob); `pdfproof/pause.go:32` countsbecause its seam is *sleep-shaped* — the guest binds it to `vi.Yield`,and its own comment ("an acknowledgment near the deadline must not waitfor another coarse tick") is evidence for D2. The Go runtime overlay isalready duration-shaped: `semasleep` parks on a futex with an ns timeout(`os_virelai.go:261-288`), `usleep` busy-yields to an ns deadline(`os_virelai.go:134-139`), and netpoll re-probes at `virPollForeverNs`= 1 ms (`netpoll_virelai.go:76`). Only kernel-side rounding standsbetween those sites and their real values — X3's job, not site edits.### Census commandRun from the repository root. Each line prints the size of one tablebelow (row counts as written on `origin/main` @ `09d7458c`):```bashecho "vi.Sleep calls:    $(rg -n 'vi\.Sleep\(' user/go -g'!*_test.go' --no-heading | rg -v ':\s*//' | wc -l | tr -d ' ')"              # 122echo "svc1(SlotSleep):   $(rg -n 'svc1\(SlotSleep' user/go -g'!*_test.go' --no-heading | wc -l | tr -d ' ')"                              # 9echo "in-package Sleep:  $(rg -n '(^|[^.[:alnum:]_])Sleep\(' user/go/vi -g'!*_test.go' --no-heading | rg -v 'func ' | wc -l | tr -d ' ')" # 1echo "time.Sleep calls:  $(rg -n 'time\.Sleep\(' user/go -g'!*_test.go' --no-heading | wc -l | tr -d ' ')"                                 # 13echo "TimerSet calls:    $(rg -n 'vsys\.TimerSet\(|timerSetFn\(' user/go -g'!*_test.go' --no-heading | wc -l | tr -d ' ')"                # 9echo "wrapper virtuals:  $(rg -n '\.(SleepTick|SleepSeconds)\(' user/go -g'!*_test.go' --no-heading | wc -l | tr -d ' ')"                 # 5echo "other .Sleep:      $(rg -n '\.Sleep\(' user/go -g'!*_test.go' --no-heading | rg -v '(vi|vsys|abi|time)\.Sleep|:\s*//' | wc -l | tr -d ' ')" # 2echo "seam invocations:  $(rg -n 'sleepFn\(|sleepTicks\(|\.sleep\(|[^.[:alnum:]_]sleep\(' user/go -g'*.go' -g'!*_test.go' --no-heading | rg -v ':\s*//' | wc -l | tr -d ' ')" # 18echo "seam bindings:     $(rg -n 'vi\.Sleep\b' user/go -g'!*_test.go' --no-heading | rg -v 'vi\.Sleep\(|:\s*//' | wc -l | tr -d ' ')"      # 11echo "zig call sites:    $(rg -n 'sleep_ticks\(|timer_set\(|sys_sleep' user/src -g'!**/lib/**' --no-heading | rg -v ':\s*//|:\s*\\|const |fn timer_set|test ' | wc -l | tr -d ' ')" # 22echo "zig asm/codegen:   $(rg -n 'x8, #4|w8, #4|movz\(8, 4' user/src --no-heading | wc -l | tr -d ' ')"                                   # 6echo "heartbeat specs:   $(rg -l 'timer heartbeat' tools/gate/specs | wc -l | tr -d ' ')"                                               # 14echo "gotabwm specs:     $(rg -l 'gotabwm: tick' tools/gate/specs | wc -l | tr -d ' ')"                                                 # 6````user/go` total 190 + `user/src` total 28 = **218**; spec census 14 + 6 +`live-wm-pacing`'s `tick_avg_ms` line (`live-wm-pacing.spec:116`).### Table A — `vi.Sleep(ticks)` call sites (122)| Site | Call | Class | Wants | Owner ||---|---|---|---|---|| `user/go/appkit/demo/main.go:203` | `vi.Sleep(1)` | P | — | — || `user/go/browser/bookmarks.go:584` | `vi.Sleep(10)` | S | ~300 ms | card #3038 || `user/go/browser/histmenu.go:69` | `vi.Sleep(10)` | S | ~300 ms | card #3038 || `user/go/browser/main.go:507` | `vi.Sleep(30)` | S | ~300 ms | card #3038 || `user/go/browser/main.go:514` | `vi.Sleep(5)` | S | ~300 ms | card #3038 || `user/go/browser/main.go:651` | `vi.Sleep(1)` | P | — | — || `user/go/browser/main.go:653` | `vi.Sleep(10)` | S | an event wait | card #3038 || `user/go/browser/main.go:1549` | `vi.Sleep(10)` | S | ~300 ms | card #3038 || `user/go/browser/main.go:1558` | `vi.Sleep(5)` | S | ~300 ms | card #3038 || `user/go/browser/network.go:333` | `vi.Sleep(1)` | P | — | — || `user/go/charmhello/main.go:55` | `vi.Sleep(4)` | S | ~250 ms paint settle | fold-in (index #2956) || `user/go/compose/main.go:122` | `vi.Sleep(1)` | P | — | — || `user/go/dns/main.go:174` | `vi.Sleep(cfg.gap)` | D | cfg.gap seconds | fold-in || `user/go/edit/main.go:767` | `vi.Sleep(1)` | P | — | — || `user/go/fetch/main.go:106` | `vi.Sleep(1)` | P | — | — || `user/go/files/main.go:113` | `vi.Sleep(50) // hundreds of ms: the screenshot at the rename mar` | X | ~300 ms | fold-in (#2989→#2994) || `user/go/files/main.go:130` | `vi.Sleep(1)` | S | ~100 ms | fold-in (files chain) || `user/go/files/main.go:301` | `vi.Sleep(2)` | S | ~200 ms | fold-in (files chain) || `user/go/files/main.go:360` | `vi.Sleep(2)` | S | ~200 ms | fold-in (files chain) || `user/go/files/main.go:421` | `vi.Sleep(1)` | S | ~100 ms | fold-in (files chain) || `user/go/files/main.go:442` | `vi.Sleep(1)` | S | ~100 ms | fold-in (files chain) || `user/go/files/main.go:546` | `vi.Sleep(1)` | S | ~100 ms | fold-in (files chain) || `user/go/files/main.go:582` | `vi.Sleep(1)` | S | ~100 ms | fold-in (files chain) || `user/go/files/main.go:634` | `vi.Sleep(1)` | S | ~100 ms | fold-in (files chain) || `user/go/files/main.go:656` | `vi.Sleep(1)` | S | ~100 ms | fold-in (files chain) || `user/go/files/pickrun.go:24` | `vi.Sleep(2)` | S | ~200 ms | fold-in (files chain) || `user/go/files/pickrun.go:62` | `vi.Sleep(1)` | S | ~100 ms | fold-in (files chain) || `user/go/files/pickrun.go:91` | `vi.Sleep(1)` | P | — | — || `user/go/flint/main.go:20` | `vi.Sleep(1)` | S | ~100 ms exit settle | fold-in || `user/go/gitui/main.go:134` | `vi.Sleep(2)` | S | ~200 ms | card #3038 || `user/go/gitui/main.go:150` | `vi.Sleep(1)` | S | ~100 ms | card #3038 || `user/go/gitui/main.go:226` | `vi.Sleep(2)` | S | ~200 ms | card #3038 || `user/go/gitui/main.go:260` | `vi.Sleep(1)` | P | — | — || `user/go/gobuild/main.go:34` | `vi.Sleep(1)` | S | ~100 ms exit settle | fold-in || `user/go/gobuild/spawn_guest.go:110` | `vi.Sleep(1) // one tick (~1s) between retries, gives the idle re` | P | — | — || `user/go/gobuild/spawn_guest.go:182` | `vi.Sleep(1)` | P | — | — || `user/go/goclock/main.go:311` | `vi.Sleep(1)` | P | — | — || `user/go/godiff/main.go:193` | `vi.Sleep(2)` | S | ~200 ms | card #3038 || `user/go/godiff/main.go:213` | `vi.Sleep(1)` | S | ~100 ms | card #3038 || `user/go/godiff/main.go:241` | `vi.Sleep(1)` | P | — | — || `user/go/goinfer/view.go:218` | `vi.Sleep(1)` | P | — | — || `user/go/goirc/dial.go:77` | `vi.Sleep(1)` | P | — | — || `user/go/goirc/main.go:387` | `vi.Sleep(1)` | P | — | — || `user/go/goirc/ui.go:737` | `vi.Sleep(1)` | P | — | — || `user/go/gopaint/main.go:249` | `vi.Sleep(1)` | P | — | — || `user/go/goprogress/main.go:48` | `vi.Sleep(1)` | P | — | — || `user/go/goreader/main.go:986` | `vi.Sleep(1)` | P | — | — || `user/go/gorec/view.go:187` | `vi.Sleep(1)` | P | — | — || `user/go/goset/main.go:203` | `vi.Sleep(1)` | P | — | — || `user/go/gosnap/view.go:534` | `vi.Sleep(1)` | P | — | — || `user/go/gosol/main.go:325` | `vi.Sleep(1)` | P | — | — || `user/go/gostore/main.go:130` | `vi.Sleep(1)` | P | — | — || `user/go/gotabwm/rfbserver.go:383` | `return &rfbStream{conn: conn, ready: vi.TCPReady, idle: func() {` | P | — | — || `user/go/gotabwm/seat.go:557` | `vi.Sleep(1) // never spin on a refused wait` | D | ~50 ms refused-wait | card #3034 || `user/go/gotabwm/windows.go:535` | `vi.Sleep(1)` | P | — | — || `user/go/goupd/main.go:38` | `vi.Sleep(1)` | S | ~100 ms exit settle | fold-in || `user/go/gputriangle/main.go:935` | `func (guestHost) Sleep(ticks uint64)   { vi.Sleep(ticks) }` | H | tick-shaped host iface | — || `user/go/help/main.go:63` | `vi.Sleep(50) // hundreds of ms: the screenshot at the detail mar` | X | ~300 ms | card #3038 || `user/go/help/main.go:99` | `vi.Sleep(2)` | S | ~250 ms | card #3038 || `user/go/help/main.go:141` | `vi.Sleep(2)` | S | ~250 ms | card #3038 || `user/go/help/main.go:150` | `vi.Sleep(1)` | P | — | — || `user/go/help/main.go:231` | `vi.Sleep(1)` | S | ~200 ms | card #3038 || `user/go/help/main.go:254` | `vi.Sleep(1)` | P | — | — || `user/go/imgcat/main.go:94` | `vi.Sleep(1)` | P | — | — || `user/go/init/main.go:65` | `vi.Sleep(1)` | P | — | — || `user/go/init/main.go:80` | `vi.Sleep(1)` | P | — | — || `user/go/netstat/main.go:289` | `vi.Sleep(1)` | P | — | — || `user/go/netstat/main.go:336` | `vi.Sleep(refreshTicks)` | X | ~1 s refresh | fold-in || `user/go/note/main.go:223` | `vi.Sleep(settleTicks)` | S | ~250 ms | card #3038 || `user/go/note/main.go:234` | `vi.Sleep(1)` | P | — | — || `user/go/observe/observe.go:153` | `vi.Sleep(pollTicks)` | P | — | — || `user/go/observe/observe.go:218` | `vi.Sleep(pollTicks)` | P | — | — || `user/go/observe/observe.go:316` | `vi.Sleep(1)` | S | ~100 ms measure settle | fold-in || `user/go/ping/main.go:309` | `vi.Sleep(1)` | D | ~1 s probe cadence | fold-in || `user/go/ping/main.go:333` | `vi.Sleep(1)` | D | ~1 s probe cadence | fold-in || `user/go/ping/main.go:345` | `vi.Sleep(1)` | D | ~1 s probe cadence | fold-in || `user/go/prof/capture.go:128` | `vi.Sleep(1)` | P | — | — || `user/go/proffixture/main.go:84` | `vi.Sleep(12)` | D | 12 s profile window | fold-in || `user/go/proffixture/main.go:100` | `vi.Sleep(1)` | D | 1 s profile window | fold-in || `user/go/proffixture/main.go:141` | `vi.Sleep(1)` | S | ~100 ms measure settle | fold-in || `user/go/proffixture/main.go:187` | `vi.Sleep(12)` | D | 12 s profile window | fold-in || `user/go/pulse/main.go:84` | `vi.Sleep(2)` | S | ~200 ms marker barrier | fold-in (index #2956) || `user/go/pulse/main.go:115` | `vi.Sleep(1)` | S | ~100 ms paint settle | fold-in (index #2956) || `user/go/pulse/main.go:143` | `vi.Sleep(1)` | S | ~100 ms paint settle | fold-in (index #2956) || `user/go/pulse/main.go:155` | `vi.Sleep(1)` | P | — | — || `user/go/r3d/main.go:52` | `vi.Sleep(1)` | P | — | — || `user/go/release/main.go:40` | `vi.Sleep(1)` | S | ~100 ms exit settle | fold-in || `user/go/release/spawn_virelai.go:49` | `vi.Sleep(1)` | P | — | — || `user/go/rss/main.go:144` | `vi.Sleep(2)` | S | ~200 ms | card #3038 || `user/go/rss/main.go:159` | `vi.Sleep(1)` | S | ~100 ms | card #3038 || `user/go/rss/main.go:174` | `vi.Sleep(1)` | P | — | — || `user/go/selftest/main.go:156` | `vi.Sleep(1)` | P | — | — || `user/go/sh/main.go:450` | `vi.Sleep(1)` | P | — | — || `user/go/sh/main.go:461` | `vi.Sleep(1)` | P | — | — || `user/go/sh/main.go:669` | `func (g *goshHost) SleepTick() { vi.Sleep(1) }` | P | — | — || `user/go/sh/main.go:885` | `vi.Sleep(1)` | P | — | — || `user/go/sh/main.go:901` | `vi.Sleep(uint64(n))` | D | n seconds | card #3036 || `user/go/ssh/main.go:119` | `vi.Sleep(1)` | P | — | — || `user/go/ssh/main.go:259` | `vi.Sleep(1)` | P | — | — || `user/go/ssh/main.go:299` | `vi.Sleep(1)` | P | — | — || `user/go/sshd/main.go:394` | `vi.Sleep(1)` | P | — | — || `user/go/sshd/tui.go:371` | `vi.Sleep(1)` | P | — | — || `user/go/store/main/main.go:37` | `vi.Sleep(2)` | S | ~250 ms exit settle | fold-in || `user/go/stormfixture/main.go:124` | `vi.Sleep(10 + uint64(idx))` | S | ~50 ms × idx stagger | fold-in || `user/go/stormfixture/main.go:140` | `vi.Sleep(1) // one tick — let a still-starting peer drain` | P | — | — || `user/go/stormfixture/main.go:154` | `vi.Sleep(3600)` | S | indefinite park → event | fold-in || `user/go/strace/cmd/main.go:92` | `vi.Sleep(1)` | P | — | — || `user/go/strace/fixture/main.go:96` | `vi.Sleep(60)` | S | ~60 s hold window | fold-in || `user/go/svfixture/main.go:29` | `vi.Sleep(1)` | S | indefinite park → event | fold-in || `user/go/svfixture/main.go:101` | `vi.Sleep(1)` | P | — | — || `user/go/tabapp/demo/main.go:76` | `vi.Sleep(1)` | P | — | — || `user/go/teatty/teatty.go:158` | `vi.Sleep(1)` | P | — | — || `user/go/term/main.go:429` | `vi.Sleep(1)` | P | — | — || `user/go/term/main.go:546` | `vi.Sleep(1)` | P | — | — || `user/go/term/main.go:736` | `func (g *termHost) SleepTick() { vi.Sleep(1) }` | P | — | — || `user/go/term/main.go:901` | `vi.Sleep(1)` | P | — | — || `user/go/term/main.go:917` | `vi.Sleep(uint64(n))` | D | n seconds | card #3036 || `user/go/timesync/udp.go:82` | `vi.Sleep(1)` | P | — | — || `user/go/tls/stream.go:176` | `vi.Sleep(1)` | P | — | — || `user/go/top/main.go:243` | `vi.Sleep(1)` | P | — | — || `user/go/view/main.go:466` | `vi.Sleep(1)` | P | — | — || `user/go/wmrpcprobe/main.go:41` | `vi.Sleep(1)` | P | — | — |### Table B — other direct EL0 sleep/timer calls (57)| Site | Call | Class | Wants | Owner ||---|---|---|---|---|| `user/go/vi/conn.go:295` | `svc1(SlotSleep, 1)` | P | — | — || `user/go/vi/conn.go:348` | `svc1(SlotSleep, 1)` | P | — | — || `user/go/vi/conn.go:476` | `svc1(SlotSleep, 1)` | P | — | — || `user/go/vi/conn.go:584` | `svc1(SlotSleep, 1)` | P | — | — || `user/go/vi/conn.go:627` | `svc1(SlotSleep, 1)` | P | — | — || `user/go/vi/wmclient.go:380` | `_ = svc1(SlotSleep, 1)` | P | — | — || `user/go/vi/wmclient.go:405` | `_ = svc1(SlotSleep, 1)` | P | — | — || `user/go/vi/wmquery.go:238` | `_ = svc1(SlotSleep, 1)` | P | — | — || `user/go/vi/dns.go:274` | `svc1(SlotSleep, 1)` | P | — | — || `user/go/vi/proc.go:104` | `Sleep(1)` | P | — | — || `user/go/heapfixture/budget/main.go:29` | `time.Sleep(time.Second)` | D | 1 s (already ns) | card #3036 || `user/go/heapfixture/main.go:49` | `time.Sleep(2 * time.Second)` | D | 2 s (already ns) | card #3036 || `user/go/heapfixture/main.go:57` | `time.Sleep(60 * time.Second)` | D | 60 s (already ns) | card #3036 || `user/go/btmath/model.go:414` | `time.Sleep(r.delay)` | D | r.delay (already ns) | card #3036 || `user/go/logfixture/main.go:70` | `time.Sleep(time.Second)` | D | 1 s (already ns) | card #3036 || `user/go/logfixture/main.go:74` | `time.Sleep(2 * time.Second)` | D | 2 s (already ns) | card #3036 || `user/go/logview/main.go:104` | `time.Sleep(time.Second)` | D | 1 s (already ns) | card #3036 || `user/go/logview/main.go:317` | `}, func(uint64) { time.Sleep(time.Second) })` | D | 1 s (already ns) | card #3036 || `user/go/gsport/childfix/main.go:78` | `time.Sleep(time.Hour)` | D | 1 h park (already ns) | card #3036 || `user/go/heap/publish.go:108` | `time.Sleep(time.Duration(every) * time.Second)` | D | every s (already ns) | card #3036 || `user/go/heap/view.go:106` | `time.Sleep(time.Second)` | D | 1 s (already ns) | card #3036 || `user/go/crashview/main.go:383` | `time.Sleep(time.Second)` | D | 1 s (already ns) | card #3036 || `user/go/crashview/main.go:539` | `}, func(uint64) { time.Sleep(time.Second) })` | D | 1 s (already ns) | card #3036 || `user/go/netstat/main.go:275` | `if vsys.TimerSet(refreshTicks) < 0 {` | X | ~1 s refresh | fold-in || `user/go/netstat/main.go:308` | `if vsys.TimerSet(refreshTicks) < 0 {` | X | ~1 s refresh | fold-in || `user/go/pulse/main.go:47` | `return vsys.TimerSet(1) >= 0 // 1 tick = 1 s on VZ: the 1 Hz ref` | D | 1 s refresh | fold-in (index #2956) || `user/go/govault/main.go:384` | `timerSetFn(d)` | D | TOTP next-code delay | fold-in || `user/go/goclock/main.go:325` | `if rc := vsys.TimerSet(uint64(d)); rc < 0 {` | D | arm-boundary delay | fold-in || `user/go/compose/main.go:107` | `if rc := vsys.TimerSet(blinkIntervalTicks); rc < 0 {` | D | ~500–1000 ms blink | fold-in || `user/go/compose/main.go:130` | `if rc := vsys.TimerSet(blinkIntervalTicks); rc < 0 {` | D | ~500–1000 ms blink | fold-in || `user/go/top/main.go:651` | `vsys.TimerSet(autoRefreshTicks)` | X | ~1 s refresh | fold-in || `user/go/top/main.go:735` | `vsys.TimerSet(autoRefreshTicks) // one timer in flight, never a ` | X | ~1 s refresh | fold-in || `user/go/shlib/jobctl.go:174` | `s.host.SleepTick()` | P | — | — || `user/go/shlib/jobctl.go:252` | `c.sh.host.SleepTick()` | P | — | — || `user/go/shlib/builtins.go:488` | `c.sh.host.SleepTick()` | P | — | — || `user/go/shlib/builtins.go:944` | `c.sh.host.SleepTick()` | D | n s interruptible | fold-in || `user/go/shlib/builtins.go:948` | `c.sh.host.SleepSeconds(n)` | D | n seconds | fold-in || `user/go/gputriangle/main.go:383` | `a.h.Sleep(1)` | P | — | — || `user/go/gputriangle/main.go:487` | `a.h.Sleep(1)` | P | — | — || `user/go/store/install.go:121` | `sleepFn(1)` | P | — | — || `user/go/store/install.go:165` | `sleepFn(execPaceTicks)` | S | ~100 ms pre-exec settle | fold-in || `user/go/store/install.go:168` | `sleepFn(execPaceTicks)` | S | ~100 ms post-exec settle | fold-in || `user/go/store/install.go:172` | `sleepFn(flintRetryTicks)` | P | — | — || `user/go/store/install.go:273` | `sleepFn(execPaceTicks)` | S | ~100 ms session settle | fold-in || `user/go/store/install.go:275` | `sleepFn(execPaceTicks)` | S | ~100 ms session settle | fold-in || `user/go/agentd/verbs.go:1111` | `sleepFn(1)` | P | — | — || `user/go/agentd/main.go:123` | `sleepFn(dampingTicks) // D2 brute-force damping` | D | 1 s auth damping | fold-in || `user/go/agentd/netio.go:235` | `sleepFn(1)` | P | — | — || `user/go/agentd/netio.go:269` | `sleepFn(1)` | P | — | — || `user/go/goassist/view.go:1202` | `sleepTicks(1)` | P | — | — || `user/go/gostore/app.go:302` | `sleepFn(600)` | S | indefinite park → event | fold-in || `user/go/selftest/selftest.go:959` | `s.sleep(1)` | H | 8-tick clock window | — || `user/go/pdfproof/pause.go:32` | `sleep(1)` | D | ~100 ms receipt wait | fold-in || `user/go/goirc/client.go:340` | `c.sleep(d)` | P | ns backoff (sleepNs) | — || `user/go/heap/publish.go:84` | `sleep(time.Second)` | P | 1 s retry (time.Sleep) | — || `user/go/heap/view.go:137` | `sleep(time.Second)` | P | 1 s retry (time.Sleep) | — || `user/go/appkit/loop.go:151` | `sleep(1)` | P | — | — |### Table C — seam bindings: sites that choose the unit for indirect callers (11)| Site | Binding | Class | Wants | Owner ||---|---|---|---|---|| `user/go/store/install.go:126` | `var sleepFn = vi.Sleep` | P | — | — || `user/go/agentd/verbs.go:41` | `sleepFn         = vi.Sleep` | P | — | — || `user/go/gsport/abi/abi.go:103` | `Sleep = vi.Sleep // slot 4 sys_sleep` | P | — | — || `user/go/govault/main.go:334` | `}, vi.Sleep)` | P | — | — || `user/go/gostore/app.go:22` | `sleepFn      = vi.Sleep` | P | — | — || `user/go/goemoji/main.go:186` | `}, vi.Sleep)` | P | — | — || `user/go/goassist/view.go:79` | `sleepTicks     = vi.Sleep` | P | — | — || `user/go/selftest/selftest.go:479` | `sleep:    vi.Sleep,` | P | — | — || `user/go/gosheet/main.go:266` | `}, vi.Sleep)` | P | — | — || `user/go/gomine/main.go:164` | `}, vi.Sleep)` | P | — | — || `user/go/appkit/loop.go:131` | `return l.RunWith(vi.PollEventRaw, vi.Sleep)` | P | — | — |### Table D — Zig `user/src` sites (28): helper calls, then slot-4 SVC emissions| Site | Call | Class | Wants | Owner ||---|---|---|---|---|| `user/src/devcons.zig:102` | `ui.sleep_ticks(5);` | S | ~250 ms compositor settle | fold-in || `user/src/tabhold.zig:108` | `if (!attached) ui.sleep_ticks(2);` | P | attach retry | — || `user/src/tabhold.zig:130` | `ui.sleep_ticks(60);` | S | ~30 s hold window | fold-in || `user/src/smpst_file.zig:66` | `st.sleep_ticks(1);` | H | heartbeat hammer | — || `user/src/chime.zig:166` | `if (ui.timer_set(1) < 0) {` | H | per-tick timer fixture | — || `user/src/ps.zig:42` | `_ = ui.timer_set(auto_refresh_ticks);` | X | 1 s refresh | fold-in || `user/src/ps.zig:56` | `_ = ui.timer_set(auto_refresh_ticks);` | X | 1 s refresh | fold-in || `user/src/smpst_ev.zig:44` | `if (st.timer_set(1) != 0) st.exit_process(141);` | H | timer-event hammer | — || `user/src/smpst_win.zig:61` | `st.sleep_ticks(1);` | H | heartbeat hammer | — || `user/src/sb6_wm.zig:167` | `_ = syscall1(sys_sleep, 1);` | P | sleep-paced wait | — || `user/src/sb6_new.zig:152` | `_ = syscall1(sys_sleep, 1);` | P | pid-scan backoff | — || `user/src/sb6_new.zig:222` | `_ = syscall1(sys_sleep, 1);` | H | tick-paced frame pacing | — || `user/src/sb6_new.zig:247` | `_ = syscall1(sys_sleep, 1);` | P | ack-wait backoff | — || `user/src/schedint.zig:54` | `st.sleep_ticks(sleep_ticks);` | H | tick-paced aging leg | — || `user/src/smpst_net.zig:62` | `st.sleep_ticks(1);` | H | heartbeat hammer | — || `user/src/resmon.zig:34` | `_ = ui.timer_set(refresh_ticks);` | X | 1 s refresh | fold-in || `user/src/resmon.zig:48` | `_ = ui.timer_set(refresh_ticks);` | X | 1 s refresh | fold-in || `user/src/sb6_old.zig:149` | `_ = syscall1(sys_sleep, 1);` | H | tick-paced frame pacing | — || `user/src/timertest.zig:63` | `if (ui.timer_set(2) < 0) {` | H | timer contract fixture | — || `user/src/timertest.zig:81` | `if (ui.timer_set(1) < 0) {` | H | timer contract fixture | — || `user/src/timertest.zig:92` | `if (ui.timer_set(5) < 0) {` | H | timer contract fixture | — || `user/src/wasm.zig:3335` | `return importRet(timer_set(argU64(args, 0)));` | H | tick-shaped WASM import | — || `user/src/main.zig:112` | `\\mov x8, #4` | H | sleep contract fixture | — || `user/src/zc.zig:1335` | `emit(enc_movz(8, 4, 0));` | H | zc.sleep builtin unit | — || `user/src/winmove.zig:327` | `\\mov x8, #4` | S | ~2 s hidden hold | fold-in || `user/src/schedring.zig:55` | `\\mov x8, #4 // sys_sleep(1 tick)` | H | ring-resume fixture | — || `user/src/smp1.zig:52` | `\\mov x8, #4` | H | core-1 park fixture | — || `user/src/status43.zig:55` | `\\mov x8, #4` | S | ~6 s alive window | fold-in |## Kernel tick consumersEvery reader of `timer.ticks`, `scheduler.tick_count`, `smp.core_ticks`and `timer.wall_epoch`, classified "stays on the heartbeat" or "moves toa deadline". The default is *stays*: D1 adds a parallel deadlinestructure; it does not re-time these.| Consumer | Site(s) | Verdict ||---|---|---|| `tick_count` — the slot-4/slot-40 deadline clock | `scheduler.zig:995`, `:1251` (reset), `:2124` (`sleep_current` deadline), `:2616` (`wake_expired` compare), `:2727` (`on_tick` advance), `:3841` (`current_tick` export) | stays || Task wake deadline field | `scheduler.zig:283` (`wakeup_tick`), `:1453` | stays || Scheduler aging window | `scheduler.zig:2669` (`tick_count -% since`) | stays || Preemption quantum + per-task/per-core accounting | `scheduler.zig:3220-3224` (`core_ticks[c]`, `run_ticks`), procs-v2 `machine_ticks` denominator `:2702-2708` (ADR 0047) | stays || `on_tick` housekeeping — app timers, kind-18, CPU-limit arming, exit diagnosis | `scheduler.zig:2726-2738`, `:3461`, `:3517`, `:2787` | stays || App-timer countdown (slot 40) | `app_timers.zig` (`on_tick` countdown; `max_delay_ticks` = 3600) | stays — slot 95 (X2) is the ns arm on the overlay || Kind-18 heartbeat + tick-rate meter | `wm_server.zig:202`,`:294-296`,`:641-657` | stays (damage ticks ride flags bit 0, X4, not a rate change) || `irq_ticks`/`poll_ticks`/`ticks` counters + heartbeat print | `timer.zig:46-70`, the `timer heartbeat`/`timer irq delivered` lines | stays — deadline IRQs get `deadline_irqs` || `wall_epoch` readers — `sys_time`, `sys_time_set`, `local_time_of_day`, VLFS mtime | `syscall.zig:3121`,`:3138`; `timer.zig:121-124`; `vlfs/disk.zig:76` | stays || `timer.ticks` readers — monitor prints/`cmd_time`/`Tick:` line, tombstones, socket_native `now()` fallback, terminal net `now()`, shell boot deadline and fg-wait bound, TCP/DHCP/NDP `now_ticks` stamps, `driving_award` splash bound | `monitor.zig:887,982,2221-2233,4615,4792,5496,5697,6112,6700,6819,6895`; `tombstone.zig:169`; `socket_native.zig:48`; `terminal.zig:4022`; `shell.zig:274,336,3654-3659,3944-3956,4109`; `driving_award.zig:6101` | stays || TCP connect deadline seed | `syscall.zig:4143` (`start_ticks` beside the CNTPCT deadline) | stays || Futex / op-74-2 deadline conversion | `syscall.zig:2598-2601` (`futex_deadline_tick`), `:2708` (`coarse_deadline`), `:2903` (`ConnectDeadline`) | **moves to the deadline overlay** — X3's 1 ms rounding is exactly this consumer re-based (card #3036) || `sys_sock_ready` park-until-deadline waits | `syscall.zig:2685-2721` region (op 76/1 deadline parks) | moves — the park wakes on the deadline, not the next tick || Profiler channel | `timer.zig:285-345` (CNTV PPI 27, `freq/100` periods, `profile_next_deadline` skips missed periods) | stays — already a deadline train; the precedent D1 generalizes || Forensics re-arm probe | `timer.zig:31`, forensics `.rearm` notes | stays — gains the deadline-arm observations || New: sorted ns deadline set + `deadline_irqs` counter | new (card #3033) | the overlay itself |## Spec timing censusSpec text that pins the heartbeat — all must stay byte-identical. Adeadline IRQ that advanced `irq_ticks` or retimed `gotabwm: tick` wouldturn these red without a code bug.| Pinned text | Specs | Count ||---|---|---|| `timer heartbeat ticks=N irq=N poll=N` (+ `--script2-after` gating on the same text) | `live-timer`, `live-sh-monitor`, `live-net-bridged`, `live-m21-max-fullscreen-aot`, `live-m21-minimize-ws`, `live-m21-notif-dialog-transient`, `live-m21-tile-master`, `live-win-close`, `live-win-move`, `live-win-syscall`, `live-sb4-damage-tracking`, `live-sb5-wm-compose-n`, `live-sb6-perf-payoff`, `live-sexiburger` | 14 || `gotabwm: tick` markers | `live-host-notify`, `go-wm-seat`, `go-dogfood`, `go-wm-default`, `live-gpu3d`, `live-hostint` | 6 || `tick_avg_ms` within 800–1200 ms | `live-wm-pacing.spec:116` | 1 |Also tick-contract (not heartbeat-text) but binding for X5: `live-sleep`pins the `user: sleeping 2 ticks` payload pair and the `4 sys_sleep` slotrow; `live-timers` pins the slot-40 arm/fire/cancel legs; the `smpst`hammer specs read `hb=` cadence lines produced by sleep-paced fixtures.## What the wave does with this- **card #3033** builds the overlay: the deadline set, the  `min(heartbeat, deadline)` comparator program, the `deadline_irqs`  counter, deadline-wake without rotation. Acceptance includes the K=3  WM-boot leg and `live-timer`/`live-sleep`/`live-timers` byte-identical.- **card #3036** lands slots 94/95 and the X3 rounding, plus the  `SleepNs`/`TimerSetNs` wrappers; every D row becomes expressible and  the 13 `time.Sleep` sites precise with no edit.- **card #3038** migrates the D/S/X rows in its eight files; the  fold-in rows go to whichever card next holds each file.- **card #3034** ships the damage tick (X4) and takes `seat.go:557`.- **card #3039** arms slot 95 per GIF frame (10–100 ms, D2-clamped).- **card #3040** measures the earned latency: keystroke→glyph, timer  jitter, the `wm-present-latency` re-pin.
+# ADR 0060: Time at human scale — the 1 Hz heartbeat plus a deadline overlay
+
+- Date: 2026-10-22
+- Status: **Accepted** — shipped by the wave-4 time arc (index #3021,
+  index #3022): the ABI rows are live (ADR 0007 X1–X3 :2881-2883) and
+  the bench is pinned (`tools/gate/bench/corpus.tsv:42`); this ADR is
+  the decision record for the wave-4 time arc plus its binding artefact,
+  the tick-unit audit below. The index-#3022 cards implemented in their
+  filed order: card #3033 the kernel overlay, card #3036 slots 94/95 +
+  wrappers, card #3038 the free-file site migration, card #3034 the
+  damage-driven seat tick, card #3039 GOVIEW playback, card #3040 the
+  bench.
+- Card: **#3027** (card 2 of 2 in #3021).
+- Related: ADR 0007 (syscall ABI; the wave-4 X1–X9 reservation rows land
+  in card #3026's amendment), ADR 0009 (kind-18 `COMPOSITE_TICK` — its
+  stale arg1 note is corrected by X4), ADR 0015 (the superseded "≤ 1 s
+  latency, accepted" line), ADR 0047 (procs v2 — the tick is the CPU
+  accounting sample), issues #1252/#1255/#1261/#1287 (the rejected
+  comparator-pull) and #1486 (the SMP reschedule seam that survived).
+
+> The 1 Hz tick is not a defect to be removed; it is three fixtures the
+> gates pin (wake clock, preemption quantum plus CPU accounting, wall
+> clock) and twenty spec files of byte-exact text. What the wave needs is
+> a *second* clock: sub-second deadlines that wake the sleeper without
+> touching the heartbeat. A deadline IRQ is not a tick — it advances no
+> counter the heartbeat text reads, and it forces no preemption.
+
+## Grounding (observed in tree `09d7458c`, 2026-10-22)
+
+- **The tick is three things.** `timer.period_ns = 1_000_000_000`
+  (`kernel/src/timer.zig:39`): a 1 Hz CNTP comparator. `tick()` consumes
+  it as the preemption quantum and CPU-accounting sample
+  (`kernel/src/scheduler.zig:3220-3224` — `smp.core_ticks[c]`,
+  `tasks[…].run_ticks`, then `cpu_ticks` via `on_tick`; ADR 0047). Core 0's
+  beat runs the housekeeping — `scheduler.on_tick`
+  (`scheduler.zig:2726-2738`) advances `tick_count` (:995), wakes
+  `sys_sleep` deadlines (`sleep_current` :2120, `wake_expired` :2598),
+  counts down app timers (`app_timers.on_tick`), and posts the kind-18
+  `COMPOSITE_TICK` heartbeat (`wm_server.on_tick` :641). `wall_epoch`
+  (`timer.zig:88-91`) derives Unix seconds as `boot_epoch_secs + ticks`.
+  A `timer heartbeat ticks=N irq=N poll=0` line prints per five ticks and
+  is asserted byte-exact by `live-timer.spec` (`:15`,`:22`: `irq=5` after
+  five ticks).
+- **EL0 already reads nanoseconds; it can only wait in seconds.**
+  `vi.Nanos()`/`vsys.Nanotime()` read the counter the kernel granted EL0
+  (`timer.zig` `allow_el0_counter`), and futex/sock-ready deadlines take
+  nanoseconds at the ABI (ADR 0007:1353-1355) — but `sys_sleep` (slot 4)
+  and `sys_timer_set` (slot 40) take *ticks*, so the kernel rounds every
+  sub-second wait UP to a whole second (`futex_deadline_tick`,
+  `syscall.zig:2598-2601`). Every millisecond-scale intent in userland
+  silently becomes ≤1 s — or worse, a guessed tick count becomes tens of
+  seconds (the X rows).
+- **A second timer channel already exists.** The profiler arms
+  `CNTV_CVAL_EL0` on `freq/100` (10 ms) deadlines on PPI 27
+  (`timer.zig:285-308` `profile_sync_local`/`profile_arm_local`,
+  `profile_next_deadline` :317-321 which *skips* missed periods rather
+  than flooding catch-up; IRQ dispatch at `exceptions.zig:1149-1154`,
+  `gic.profile_ppi` = 27 at `gic.zig:285`). A deadline overlay beside the
+  heartbeat is a pattern the tree already runs, not a novel mechanism.
+- **This was tried and rejected once — as a reschedule, not as a wake
+  clock.** WMP card 3 (#1252, draft PR #1255) pulled the comparator
+  forward ~2 ms on each wake funnel so a woken WM task preempted off the
+  period boundary: measured 815 ms → 2.5 ms input→present, and it kills
+  the SMP WM boot (`live-wnd5-gate2-policy` PASS → FAIL 0/4) with a
+  silent `VZVirtualMachine.State.error` — VZ aborts the VM, no `[EXC]`
+  block, no guest fault (#1261's instrumented bisection: the trigger is
+  the first `dui` burst under WM traffic, not the extra rotation in
+  general; #1287 closed out "make the VZ abort observable"). The
+  measurement scaffolding it left — the wake-funnel counters and the
+  IRQ-exit reschedule (`scheduler.zig:1068-1090`, `request_resched_on`
+  :1133, `irq_exit_reschedule` :1189) — is unchanged and does not move
+  the comparator. M70b (#1486) kept wake targeting + the RESCHEDULE SGI.
+- **The census is bigger than the index's grounding.** The index-#3021 row
+  estimated 172 EL0 sites. The commands below count **218** at this
+  tree: the delta is real growth since `ea41a50d` (the index-#2956 Bubble Tea
+  landings, GOSSHD, hostint) plus sites a shallow grep cannot see —
+  nine `svc1(SlotSleep, 1)` calls inside package `vi`, eighteen indirect
+  invocations through `sleepFn`/`sleepTicks`/`c.sleep` seams, eleven
+  `vi.Sleep` seam *bindings*, and six Zig sites that emit the slot-4 SVC
+  in naked asm or `zc` codegen rather than naming `sys_sleep`.
+
+## D1. The 1 Hz heartbeat stays; deadlines are an overlay on the same comparator
+
+**Unchanged:** `period_ns`, `ticks`, `irq_ticks`, `poll_ticks`, the
+`timer heartbeat` and `timer irq delivered` lines, `scheduler.tick_count`
+and every tick-counted consumer (sleep deadlines, app timers, kind-18,
+quantum, `cpu_ticks`/`run_ticks`, `wall_epoch`, aging, the CPU-limit
+bound). Slot 4 (`sys_sleep`), slots 40/41 (`sys_timer_set`/`cancel`) and
+slot 66 (`sys_time`) keep their contracts byte-for-byte (X5).
+
+**New:** a sorted set of nanosecond deadlines (per core where the request
+was made). After every arm/wake, the CNTP comparator is programmed to
+`min(next heartbeat boundary, earliest pending deadline)` — never earlier
+than the next period edge unless a deadline says so, never later. A
+comparator IRQ that is not the period boundary is a *deadline* IRQ: it
+wakes the due sleepers (the same `blocked → ready` flip `wake_expired`
+performs) and advances its own counter, `deadline_irqs` — it must not
+increment `ticks` or `irq_ticks`, because `live-timer.spec:15,22` pins
+`irq=5` after five ticks and the heartbeat text is asserted in 14 specs.
+This is the same instruction stream `arm()` already writes
+(`timer.zig:170-186`: `cntp_cval_el0` + enable + `isb`) — the overlay
+changes *what value* is programmed and *which counter* a fire advances,
+not the mechanism. The profiler's CNTV channel (10 ms, PPI 27) is the
+proof the hardware tolerates two cadences; the overlay does it on one
+comparator by picking the nearest of two reasons to fire.
+
+## D2. Deadline granularity is 1 ms
+
+Sub-tick deadlines quantize to 1 ms — the X1–X3 reservations (slot 94
+`sys_sleep_ns`, slot 95 `sys_timer_set_ns`, slot 74 futex/op-74-2 ns
+rounding) all round UP to it. 1 ms is three orders below the heartbeat
+and comfortably above the counter's own cost (CNTFRQ is tens of MHz; a
+1 ms deadline is tens of thousands of cycles). Finer would invite
+100 Hz-rate interrupt storms for no consumer: the audit below shows no
+site wanting finer than ~50 ms.
+
+## D3. No forced preemption on a deadline
+
+A deadline wake marks tasks ready; it does not rotate. On a busy core a
+woken task runs at the next yield, block, or heartbeat quantum — which is
+never later than today (today it would wait for the next tick anyway).
+This is the load-bearing difference from #1252: the nudge inserted an
+extra core-0 rotation off the period boundary and died under WM traffic;
+D3 does not create that path at all. The observed `resched_requested`
+funnel and `irq_exit_reschedule` are untouched — they remain the wake
+*measurement*, not a preemption trigger.
+
+## Why not 100 Hz or tickless
+
+- **100 Hz re-times three pinned contracts at once.** The tick is the
+  sleeper wake clock *and* the preemption/accounting quantum *and* the
+  wall clock. Moving it to 100 Hz would multiply quantum rotations ×100,
+  shrink `cpu_ticks` quanta to 10 ms (ADR 0047's "the tick is the
+  sample"), and force `wall_epoch` to stop counting ticks. Every spec
+  asserting `timer heartbeat` (14 files), `gotabwm: tick` (6 files) and
+  `live-wm-pacing`'s `tick_avg_ms` 800–1200 window would need re-timing —
+  for zero precision gain a deadline overlay doesn't already give.
+- **Tickless-idle throws away the heartbeat the system is built on.**
+  Removing the periodic tick removes the quantum, the accounting beat,
+  the wall clock's advance, and the `hb=`-paced fixture cadence — all to
+  be re-invented as on-demand deadlines. The overlay keeps the heartbeat
+  for everything that wants a beat and adds deadlines for everything that
+  wants a time.
+- **The rejected alternative was specifically a preemption change.** #1252
+  is not evidence against sub-second wakes; it is evidence against
+  *rotating core 0 off the period boundary*. The overlay's deadline IRQ
+  never rotates (D3), so the #1261 kill path is not exercised by this
+  design. card #3033 still carries a K=3 WM-boot leg per the index — prudence,
+  not a reopen.
+- **Catch-up stays bounded.** The overlay adds no catch-up loop: a missed
+  deadline fires once (the due set is flushed wholesale), like
+  `profile_next_deadline` skipping missed periods and the bounded drain
+  loops already in `tick()`'s tail (`scheduler.zig:3645-3657`).
+
+## Supersessions and amendments recorded
+
+- **ADR 0015:203** — "the WM serves them in its 1 Hz kind-18 wake (≤ 1 s
+  latency, accepted)". That acceptance is retired by the wave-4 contract:
+  the seat stops tolerating a 1 s input→present term. card #3034 adds
+  the damage-driven kind-18 tick (flags bit 0, X4 — at most one pending
+  per seat, cleared on the seat's REQUEST_PRESENT); card #3040 pins
+  the keystroke→glyph number. The heartbeat kind-18 stays 1 Hz and
+  flags-0; ADR 0015's text is not edited here (that file was in #3007's
+  Touches when this card was drafted).
+- **ADR 0007** — three rows are amended by the card #3026 wave-4
+  reservation amendment, not by this ADR: the slot-4 row's "1 tick ≈ 1 s"
+  phrasing gains the X1 sibling (`:298-300`), the futex `timeout_ns`
+  "rounding UP to whole scheduler ticks" note is superseded by X3's
+  1 ms rounding (`:1353-1355`), and op 74/2's `current_tick + timeout_ns /  1_000_000_000 + 1` deadline is superseded the same way (`:2116-2123`).
+  Slots 4/40/66 themselves are X5-frozen — unchanged.
+- **ADR 0009:70** — the kind-18 row says arg1 is reserved; arg1 has been
+  the damage mask since M33 SB4 (`wm_server.zig:650-656` region). X4
+  records both facts; recorded here as the audit's context, corrected in
+  the #3026 amendment.
+
+## The audit: every EL0 sleep/timer site, classified
+
+One row per call site in `user/go` and `user/src` — including indirect
+invocations through a `sleepFn`-family seam and the bindings that choose
+their unit — 218 sites at `09d7458c`. Classes:
+
+| Class | Meaning | Disposition |
+|---|---|---|
+| **H** | Heartbeat or tick-counted by design (fixtures, contract surfaces, deliberately heartbeat-paced) | stays |
+| **D** | Wants a duration | migrate to slot 94/95 ns or a named duration |
+| **S** | Settle guess — a sleep standing in for an event or a "wait a bit" | migrate to a named duration or an event |
+| **P** | Poll / retry backoff | stays, or migrate if user-visible |
+| **X** | Bug — the value does not deliver what the site says | fix |
+
+Owner column: the card that migrates the row — `card #3038` (card #3038, the eight free files), `card #3034` (the seat's refusal-path sleep),
+`card #3036` (`time.Sleep` and the `sleep_ns`/wrapper sites are
+precise once the kernel rounds futex waits to 1 ms, no site edit needed),
+or **fold-in** for a file another lane holds (the `user/go/files/*`
+chain #2989→#2994, the index-#2956 cards' `pulse`/`charmhello`/`btmath`/`sshd`
+families, `edit/*` #2987/#2991, and the remaining unheld sites). `—`
+means the row stays.
+
+Counts at `09d7458c`: **H 18, D 32, S 53, P 104, X 11 — 218 sites.**
+
+The two `vi.Sleep(50) // hundreds of ms` rows the card names — 50 s, not
+ms — are here, and the audit found four more of the same family:
+`ps`/`resmon`'s `timer_set(100)` commented "1 second", `top`'s
+`TimerSet(12)` "≈1 s", and `netstat`'s `refreshTicks = 4` "~1 Hz" (a
+refresh four times slower than its comment, twice over for the `Sleep`
+leg). All are X.
+
+Host-side notes outside the census: `*_test.go` sleeps run under `go
+test` on the host (excluded by glob); `browser/peer_watch.py` is a host
+script (excluded by the `*.go` glob); `pdfproof/pause.go:32` counts
+because its seam is *sleep-shaped* — the guest binds it to `vi.Yield`,
+and its own comment ("an acknowledgment near the deadline must not wait
+for another coarse tick") is evidence for D2. The Go runtime overlay is
+already duration-shaped: `semasleep` parks on a futex with an ns timeout
+(`os_virelai.go:261-288`), `usleep` busy-yields to an ns deadline
+(`os_virelai.go:134-139`), and netpoll re-probes at `virPollForeverNs`
+= 1 ms (`netpoll_virelai.go:76`). Only kernel-side rounding stands
+between those sites and their real values — X3's job, not site edits.
+
+### Census command
+
+Run from the repository root. Each line prints the size of one table
+below (row counts as written on `origin/main` @ `09d7458c`):
+
+```bash
+echo "vi.Sleep calls:    $(rg -n 'vi\.Sleep\(' user/go -g'!*_test.go' --no-heading | rg -v ':\s*//' | wc -l | tr -d ' ')"              # 122
+echo "svc1(SlotSleep):   $(rg -n 'svc1\(SlotSleep' user/go -g'!*_test.go' --no-heading | wc -l | tr -d ' ')"                              # 9
+echo "in-package Sleep:  $(rg -n '(^|[^.[:alnum:]_])Sleep\(' user/go/vi -g'!*_test.go' --no-heading | rg -v 'func ' | wc -l | tr -d ' ')" # 1
+echo "time.Sleep calls:  $(rg -n 'time\.Sleep\(' user/go -g'!*_test.go' --no-heading | wc -l | tr -d ' ')"                                 # 13
+echo "TimerSet calls:    $(rg -n 'vsys\.TimerSet\(|timerSetFn\(' user/go -g'!*_test.go' --no-heading | wc -l | tr -d ' ')"                # 9
+echo "wrapper virtuals:  $(rg -n '\.(SleepTick|SleepSeconds)\(' user/go -g'!*_test.go' --no-heading | wc -l | tr -d ' ')"                 # 5
+echo "other .Sleep:      $(rg -n '\.Sleep\(' user/go -g'!*_test.go' --no-heading | rg -v '(vi|vsys|abi|time)\.Sleep|:\s*//' | wc -l | tr -d ' ')" # 2
+echo "seam invocations:  $(rg -n 'sleepFn\(|sleepTicks\(|\.sleep\(|[^.[:alnum:]_]sleep\(' user/go -g'*.go' -g'!*_test.go' --no-heading | rg -v ':\s*//' | wc -l | tr -d ' ')" # 18
+echo "seam bindings:     $(rg -n 'vi\.Sleep\b' user/go -g'!*_test.go' --no-heading | rg -v 'vi\.Sleep\(|:\s*//' | wc -l | tr -d ' ')"      # 11
+echo "zig call sites:    $(rg -n 'sleep_ticks\(|timer_set\(|sys_sleep' user/src -g'!**/lib/**' --no-heading | rg -v ':\s*//|:\s*\\|const |fn timer_set|test ' | wc -l | tr -d ' ')" # 22
+echo "zig asm/codegen:   $(rg -n 'x8, #4|w8, #4|movz\(8, 4' user/src --no-heading | wc -l | tr -d ' ')"                                   # 6
+echo "heartbeat specs:   $(rg -l 'timer heartbeat' tools/gate/specs | wc -l | tr -d ' ')"                                               # 14
+echo "gotabwm specs:     $(rg -l 'gotabwm: tick' tools/gate/specs | wc -l | tr -d ' ')"                                                 # 6
+```
+
+`user/go` total 190 + `user/src` total 28 = **218**; spec census 14 + 6 +
+`live-wm-pacing`'s `tick_avg_ms` line (`live-wm-pacing.spec:116`).
+
+### Table A — `vi.Sleep(ticks)` call sites (122)
+
+| Site | Call | Class | Wants | Owner |
+|---|---|---|---|---|
+| `user/go/appkit/demo/main.go:203` | `vi.Sleep(1)` | P | — | — |
+| `user/go/browser/bookmarks.go:584` | `vi.Sleep(10)` | S | ~300 ms | card #3038 |
+| `user/go/browser/histmenu.go:69` | `vi.Sleep(10)` | S | ~300 ms | card #3038 |
+| `user/go/browser/main.go:507` | `vi.Sleep(30)` | S | ~300 ms | card #3038 |
+| `user/go/browser/main.go:514` | `vi.Sleep(5)` | S | ~300 ms | card #3038 |
+| `user/go/browser/main.go:651` | `vi.Sleep(1)` | P | — | — |
+| `user/go/browser/main.go:653` | `vi.Sleep(10)` | S | an event wait | card #3038 |
+| `user/go/browser/main.go:1549` | `vi.Sleep(10)` | S | ~300 ms | card #3038 |
+| `user/go/browser/main.go:1558` | `vi.Sleep(5)` | S | ~300 ms | card #3038 |
+| `user/go/browser/network.go:333` | `vi.Sleep(1)` | P | — | — |
+| `user/go/charmhello/main.go:55` | `vi.Sleep(4)` | S | ~250 ms paint settle | fold-in (index #2956) |
+| `user/go/compose/main.go:122` | `vi.Sleep(1)` | P | — | — |
+| `user/go/dns/main.go:174` | `vi.Sleep(cfg.gap)` | D | cfg.gap seconds | fold-in |
+| `user/go/edit/main.go:767` | `vi.Sleep(1)` | P | — | — |
+| `user/go/fetch/main.go:106` | `vi.Sleep(1)` | P | — | — |
+| `user/go/files/main.go:113` | `vi.Sleep(50) // hundreds of ms: the screenshot at the rename mar` | X | ~300 ms | fold-in (#2989→#2994) |
+| `user/go/files/main.go:130` | `vi.Sleep(1)` | S | ~100 ms | fold-in (files chain) |
+| `user/go/files/main.go:301` | `vi.Sleep(2)` | S | ~200 ms | fold-in (files chain) |
+| `user/go/files/main.go:360` | `vi.Sleep(2)` | S | ~200 ms | fold-in (files chain) |
+| `user/go/files/main.go:421` | `vi.Sleep(1)` | S | ~100 ms | fold-in (files chain) |
+| `user/go/files/main.go:442` | `vi.Sleep(1)` | S | ~100 ms | fold-in (files chain) |
+| `user/go/files/main.go:546` | `vi.Sleep(1)` | S | ~100 ms | fold-in (files chain) |
+| `user/go/files/main.go:582` | `vi.Sleep(1)` | S | ~100 ms | fold-in (files chain) |
+| `user/go/files/main.go:634` | `vi.Sleep(1)` | S | ~100 ms | fold-in (files chain) |
+| `user/go/files/main.go:656` | `vi.Sleep(1)` | S | ~100 ms | fold-in (files chain) |
+| `user/go/files/pickrun.go:24` | `vi.Sleep(2)` | S | ~200 ms | fold-in (files chain) |
+| `user/go/files/pickrun.go:62` | `vi.Sleep(1)` | S | ~100 ms | fold-in (files chain) |
+| `user/go/files/pickrun.go:91` | `vi.Sleep(1)` | P | — | — |
+| `user/go/flint/main.go:20` | `vi.Sleep(1)` | S | ~100 ms exit settle | fold-in |
+| `user/go/gitui/main.go:134` | `vi.Sleep(2)` | S | ~200 ms | card #3038 |
+| `user/go/gitui/main.go:150` | `vi.Sleep(1)` | S | ~100 ms | card #3038 |
+| `user/go/gitui/main.go:226` | `vi.Sleep(2)` | S | ~200 ms | card #3038 |
+| `user/go/gitui/main.go:260` | `vi.Sleep(1)` | P | — | — |
+| `user/go/gobuild/main.go:34` | `vi.Sleep(1)` | S | ~100 ms exit settle | fold-in |
+| `user/go/gobuild/spawn_guest.go:110` | `vi.Sleep(1) // one tick (~1s) between retries, gives the idle re` | P | — | — |
+| `user/go/gobuild/spawn_guest.go:182` | `vi.Sleep(1)` | P | — | — |
+| `user/go/goclock/main.go:311` | `vi.Sleep(1)` | P | — | — |
+| `user/go/godiff/main.go:193` | `vi.Sleep(2)` | S | ~200 ms | card #3038 |
+| `user/go/godiff/main.go:213` | `vi.Sleep(1)` | S | ~100 ms | card #3038 |
+| `user/go/godiff/main.go:241` | `vi.Sleep(1)` | P | — | — |
+| `user/go/goinfer/view.go:218` | `vi.Sleep(1)` | P | — | — |
+| `user/go/goirc/dial.go:77` | `vi.Sleep(1)` | P | — | — |
+| `user/go/goirc/main.go:387` | `vi.Sleep(1)` | P | — | — |
+| `user/go/goirc/ui.go:737` | `vi.Sleep(1)` | P | — | — |
+| `user/go/gopaint/main.go:249` | `vi.Sleep(1)` | P | — | — |
+| `user/go/goprogress/main.go:48` | `vi.Sleep(1)` | P | — | — |
+| `user/go/goreader/main.go:986` | `vi.Sleep(1)` | P | — | — |
+| `user/go/gorec/view.go:187` | `vi.Sleep(1)` | P | — | — |
+| `user/go/goset/main.go:203` | `vi.Sleep(1)` | P | — | — |
+| `user/go/gosnap/view.go:534` | `vi.Sleep(1)` | P | — | — |
+| `user/go/gosol/main.go:325` | `vi.Sleep(1)` | P | — | — |
+| `user/go/gostore/main.go:130` | `vi.Sleep(1)` | P | — | — |
+| `user/go/gotabwm/rfbserver.go:383` | `return &rfbStream{conn: conn, ready: vi.TCPReady, idle: func() {` | P | — | — |
+| `user/go/gotabwm/seat.go:557` | `vi.Sleep(1) // never spin on a refused wait` | D | ~50 ms refused-wait | card #3034 |
+| `user/go/gotabwm/windows.go:535` | `vi.Sleep(1)` | P | — | — |
+| `user/go/goupd/main.go:38` | `vi.Sleep(1)` | S | ~100 ms exit settle | fold-in |
+| `user/go/gputriangle/main.go:935` | `func (guestHost) Sleep(ticks uint64)   { vi.Sleep(ticks) }` | H | tick-shaped host iface | — |
+| `user/go/help/main.go:63` | `vi.Sleep(50) // hundreds of ms: the screenshot at the detail mar` | X | ~300 ms | card #3038 |
+| `user/go/help/main.go:99` | `vi.Sleep(2)` | S | ~250 ms | card #3038 |
+| `user/go/help/main.go:141` | `vi.Sleep(2)` | S | ~250 ms | card #3038 |
+| `user/go/help/main.go:150` | `vi.Sleep(1)` | P | — | — |
+| `user/go/help/main.go:231` | `vi.Sleep(1)` | S | ~200 ms | card #3038 |
+| `user/go/help/main.go:254` | `vi.Sleep(1)` | P | — | — |
+| `user/go/imgcat/main.go:94` | `vi.Sleep(1)` | P | — | — |
+| `user/go/init/main.go:65` | `vi.Sleep(1)` | P | — | — |
+| `user/go/init/main.go:80` | `vi.Sleep(1)` | P | — | — |
+| `user/go/netstat/main.go:289` | `vi.Sleep(1)` | P | — | — |
+| `user/go/netstat/main.go:336` | `vi.Sleep(refreshTicks)` | X | ~1 s refresh | fold-in |
+| `user/go/note/main.go:223` | `vi.Sleep(settleTicks)` | S | ~250 ms | card #3038 |
+| `user/go/note/main.go:234` | `vi.Sleep(1)` | P | — | — |
+| `user/go/observe/observe.go:153` | `vi.Sleep(pollTicks)` | P | — | — |
+| `user/go/observe/observe.go:218` | `vi.Sleep(pollTicks)` | P | — | — |
+| `user/go/observe/observe.go:316` | `vi.Sleep(1)` | S | ~100 ms measure settle | fold-in |
+| `user/go/ping/main.go:309` | `vi.Sleep(1)` | D | ~1 s probe cadence | fold-in |
+| `user/go/ping/main.go:333` | `vi.Sleep(1)` | D | ~1 s probe cadence | fold-in |
+| `user/go/ping/main.go:345` | `vi.Sleep(1)` | D | ~1 s probe cadence | fold-in |
+| `user/go/prof/capture.go:128` | `vi.Sleep(1)` | P | — | — |
+| `user/go/proffixture/main.go:84` | `vi.Sleep(12)` | D | 12 s profile window | fold-in |
+| `user/go/proffixture/main.go:100` | `vi.Sleep(1)` | D | 1 s profile window | fold-in |
+| `user/go/proffixture/main.go:141` | `vi.Sleep(1)` | S | ~100 ms measure settle | fold-in |
+| `user/go/proffixture/main.go:187` | `vi.Sleep(12)` | D | 12 s profile window | fold-in |
+| `user/go/pulse/main.go:84` | `vi.Sleep(2)` | S | ~200 ms marker barrier | fold-in (index #2956) |
+| `user/go/pulse/main.go:115` | `vi.Sleep(1)` | S | ~100 ms paint settle | fold-in (index #2956) |
+| `user/go/pulse/main.go:143` | `vi.Sleep(1)` | S | ~100 ms paint settle | fold-in (index #2956) |
+| `user/go/pulse/main.go:155` | `vi.Sleep(1)` | P | — | — |
+| `user/go/r3d/main.go:52` | `vi.Sleep(1)` | P | — | — |
+| `user/go/release/main.go:40` | `vi.Sleep(1)` | S | ~100 ms exit settle | fold-in |
+| `user/go/release/spawn_virelai.go:49` | `vi.Sleep(1)` | P | — | — |
+| `user/go/rss/main.go:144` | `vi.Sleep(2)` | S | ~200 ms | card #3038 |
+| `user/go/rss/main.go:159` | `vi.Sleep(1)` | S | ~100 ms | card #3038 |
+| `user/go/rss/main.go:174` | `vi.Sleep(1)` | P | — | — |
+| `user/go/selftest/main.go:156` | `vi.Sleep(1)` | P | — | — |
+| `user/go/sh/main.go:450` | `vi.Sleep(1)` | P | — | — |
+| `user/go/sh/main.go:461` | `vi.Sleep(1)` | P | — | — |
+| `user/go/sh/main.go:669` | `func (g *goshHost) SleepTick() { vi.Sleep(1) }` | P | — | — |
+| `user/go/sh/main.go:885` | `vi.Sleep(1)` | P | — | — |
+| `user/go/sh/main.go:901` | `vi.Sleep(uint64(n))` | D | n seconds | card #3036 |
+| `user/go/ssh/main.go:119` | `vi.Sleep(1)` | P | — | — |
+| `user/go/ssh/main.go:259` | `vi.Sleep(1)` | P | — | — |
+| `user/go/ssh/main.go:299` | `vi.Sleep(1)` | P | — | — |
+| `user/go/sshd/main.go:394` | `vi.Sleep(1)` | P | — | — |
+| `user/go/sshd/tui.go:371` | `vi.Sleep(1)` | P | — | — |
+| `user/go/store/main/main.go:37` | `vi.Sleep(2)` | S | ~250 ms exit settle | fold-in |
+| `user/go/stormfixture/main.go:124` | `vi.Sleep(10 + uint64(idx))` | S | ~50 ms × idx stagger | fold-in |
+| `user/go/stormfixture/main.go:140` | `vi.Sleep(1) // one tick — let a still-starting peer drain` | P | — | — |
+| `user/go/stormfixture/main.go:154` | `vi.Sleep(3600)` | S | indefinite park → event | fold-in |
+| `user/go/strace/cmd/main.go:92` | `vi.Sleep(1)` | P | — | — |
+| `user/go/strace/fixture/main.go:96` | `vi.Sleep(60)` | S | ~60 s hold window | fold-in |
+| `user/go/svfixture/main.go:29` | `vi.Sleep(1)` | S | indefinite park → event | fold-in |
+| `user/go/svfixture/main.go:101` | `vi.Sleep(1)` | P | — | — |
+| `user/go/tabapp/demo/main.go:76` | `vi.Sleep(1)` | P | — | — |
+| `user/go/teatty/teatty.go:158` | `vi.Sleep(1)` | P | — | — |
+| `user/go/term/main.go:429` | `vi.Sleep(1)` | P | — | — |
+| `user/go/term/main.go:546` | `vi.Sleep(1)` | P | — | — |
+| `user/go/term/main.go:736` | `func (g *termHost) SleepTick() { vi.Sleep(1) }` | P | — | — |
+| `user/go/term/main.go:901` | `vi.Sleep(1)` | P | — | — |
+| `user/go/term/main.go:917` | `vi.Sleep(uint64(n))` | D | n seconds | card #3036 |
+| `user/go/timesync/udp.go:82` | `vi.Sleep(1)` | P | — | — |
+| `user/go/tls/stream.go:176` | `vi.Sleep(1)` | P | — | — |
+| `user/go/top/main.go:243` | `vi.Sleep(1)` | P | — | — |
+| `user/go/view/main.go:466` | `vi.Sleep(1)` | P | — | — |
+| `user/go/wmrpcprobe/main.go:41` | `vi.Sleep(1)` | P | — | — |
+
+### Table B — other direct EL0 sleep/timer calls (57)
+
+| Site | Call | Class | Wants | Owner |
+|---|---|---|---|---|
+| `user/go/vi/conn.go:295` | `svc1(SlotSleep, 1)` | P | — | — |
+| `user/go/vi/conn.go:348` | `svc1(SlotSleep, 1)` | P | — | — |
+| `user/go/vi/conn.go:476` | `svc1(SlotSleep, 1)` | P | — | — |
+| `user/go/vi/conn.go:584` | `svc1(SlotSleep, 1)` | P | — | — |
+| `user/go/vi/conn.go:627` | `svc1(SlotSleep, 1)` | P | — | — |
+| `user/go/vi/wmclient.go:380` | `_ = svc1(SlotSleep, 1)` | P | — | — |
+| `user/go/vi/wmclient.go:405` | `_ = svc1(SlotSleep, 1)` | P | — | — |
+| `user/go/vi/wmquery.go:238` | `_ = svc1(SlotSleep, 1)` | P | — | — |
+| `user/go/vi/dns.go:274` | `svc1(SlotSleep, 1)` | P | — | — |
+| `user/go/vi/proc.go:104` | `Sleep(1)` | P | — | — |
+| `user/go/heapfixture/budget/main.go:29` | `time.Sleep(time.Second)` | D | 1 s (already ns) | card #3036 |
+| `user/go/heapfixture/main.go:49` | `time.Sleep(2 * time.Second)` | D | 2 s (already ns) | card #3036 |
+| `user/go/heapfixture/main.go:57` | `time.Sleep(60 * time.Second)` | D | 60 s (already ns) | card #3036 |
+| `user/go/btmath/model.go:414` | `time.Sleep(r.delay)` | D | r.delay (already ns) | card #3036 |
+| `user/go/logfixture/main.go:70` | `time.Sleep(time.Second)` | D | 1 s (already ns) | card #3036 |
+| `user/go/logfixture/main.go:74` | `time.Sleep(2 * time.Second)` | D | 2 s (already ns) | card #3036 |
+| `user/go/logview/main.go:104` | `time.Sleep(time.Second)` | D | 1 s (already ns) | card #3036 |
+| `user/go/logview/main.go:317` | `}, func(uint64) { time.Sleep(time.Second) })` | D | 1 s (already ns) | card #3036 |
+| `user/go/gsport/childfix/main.go:78` | `time.Sleep(time.Hour)` | D | 1 h park (already ns) | card #3036 |
+| `user/go/heap/publish.go:108` | `time.Sleep(time.Duration(every) * time.Second)` | D | every s (already ns) | card #3036 |
+| `user/go/heap/view.go:106` | `time.Sleep(time.Second)` | D | 1 s (already ns) | card #3036 |
+| `user/go/crashview/main.go:383` | `time.Sleep(time.Second)` | D | 1 s (already ns) | card #3036 |
+| `user/go/crashview/main.go:539` | `}, func(uint64) { time.Sleep(time.Second) })` | D | 1 s (already ns) | card #3036 |
+| `user/go/netstat/main.go:275` | `if vsys.TimerSet(refreshTicks) < 0 {` | X | ~1 s refresh | fold-in |
+| `user/go/netstat/main.go:308` | `if vsys.TimerSet(refreshTicks) < 0 {` | X | ~1 s refresh | fold-in |
+| `user/go/pulse/main.go:47` | `return vsys.TimerSet(1) >= 0 // 1 tick = 1 s on VZ: the 1 Hz ref` | D | 1 s refresh | fold-in (index #2956) |
+| `user/go/govault/main.go:384` | `timerSetFn(d)` | D | TOTP next-code delay | fold-in |
+| `user/go/goclock/main.go:325` | `if rc := vsys.TimerSet(uint64(d)); rc < 0 {` | D | arm-boundary delay | fold-in |
+| `user/go/compose/main.go:107` | `if rc := vsys.TimerSet(blinkIntervalTicks); rc < 0 {` | D | ~500–1000 ms blink | fold-in |
+| `user/go/compose/main.go:130` | `if rc := vsys.TimerSet(blinkIntervalTicks); rc < 0 {` | D | ~500–1000 ms blink | fold-in |
+| `user/go/top/main.go:651` | `vsys.TimerSet(autoRefreshTicks)` | X | ~1 s refresh | fold-in |
+| `user/go/top/main.go:735` | `vsys.TimerSet(autoRefreshTicks) // one timer in flight, never a ` | X | ~1 s refresh | fold-in |
+| `user/go/shlib/jobctl.go:174` | `s.host.SleepTick()` | P | — | — |
+| `user/go/shlib/jobctl.go:252` | `c.sh.host.SleepTick()` | P | — | — |
+| `user/go/shlib/builtins.go:488` | `c.sh.host.SleepTick()` | P | — | — |
+| `user/go/shlib/builtins.go:944` | `c.sh.host.SleepTick()` | D | n s interruptible | fold-in |
+| `user/go/shlib/builtins.go:948` | `c.sh.host.SleepSeconds(n)` | D | n seconds | fold-in |
+| `user/go/gputriangle/main.go:383` | `a.h.Sleep(1)` | P | — | — |
+| `user/go/gputriangle/main.go:487` | `a.h.Sleep(1)` | P | — | — |
+| `user/go/store/install.go:121` | `sleepFn(1)` | P | — | — |
+| `user/go/store/install.go:165` | `sleepFn(execPaceTicks)` | S | ~100 ms pre-exec settle | fold-in |
+| `user/go/store/install.go:168` | `sleepFn(execPaceTicks)` | S | ~100 ms post-exec settle | fold-in |
+| `user/go/store/install.go:172` | `sleepFn(flintRetryTicks)` | P | — | — |
+| `user/go/store/install.go:273` | `sleepFn(execPaceTicks)` | S | ~100 ms session settle | fold-in |
+| `user/go/store/install.go:275` | `sleepFn(execPaceTicks)` | S | ~100 ms session settle | fold-in |
+| `user/go/agentd/verbs.go:1111` | `sleepFn(1)` | P | — | — |
+| `user/go/agentd/main.go:123` | `sleepFn(dampingTicks) // D2 brute-force damping` | D | 1 s auth damping | fold-in |
+| `user/go/agentd/netio.go:235` | `sleepFn(1)` | P | — | — |
+| `user/go/agentd/netio.go:269` | `sleepFn(1)` | P | — | — |
+| `user/go/goassist/view.go:1202` | `sleepTicks(1)` | P | — | — |
+| `user/go/gostore/app.go:302` | `sleepFn(600)` | S | indefinite park → event | fold-in |
+| `user/go/selftest/selftest.go:959` | `s.sleep(1)` | H | 8-tick clock window | — |
+| `user/go/pdfproof/pause.go:32` | `sleep(1)` | D | ~100 ms receipt wait | fold-in |
+| `user/go/goirc/client.go:340` | `c.sleep(d)` | P | ns backoff (sleepNs) | — |
+| `user/go/heap/publish.go:84` | `sleep(time.Second)` | P | 1 s retry (time.Sleep) | — |
+| `user/go/heap/view.go:137` | `sleep(time.Second)` | P | 1 s retry (time.Sleep) | — |
+| `user/go/appkit/loop.go:151` | `sleep(1)` | P | — | — |
+
+### Table C — seam bindings: sites that choose the unit for indirect callers (11)
+
+| Site | Binding | Class | Wants | Owner |
+|---|---|---|---|---|
+| `user/go/store/install.go:126` | `var sleepFn = vi.Sleep` | P | — | — |
+| `user/go/agentd/verbs.go:41` | `sleepFn         = vi.Sleep` | P | — | — |
+| `user/go/gsport/abi/abi.go:103` | `Sleep = vi.Sleep // slot 4 sys_sleep` | P | — | — |
+| `user/go/govault/main.go:334` | `}, vi.Sleep)` | P | — | — |
+| `user/go/gostore/app.go:22` | `sleepFn      = vi.Sleep` | P | — | — |
+| `user/go/goemoji/main.go:186` | `}, vi.Sleep)` | P | — | — |
+| `user/go/goassist/view.go:79` | `sleepTicks     = vi.Sleep` | P | — | — |
+| `user/go/selftest/selftest.go:479` | `sleep:    vi.Sleep,` | P | — | — |
+| `user/go/gosheet/main.go:266` | `}, vi.Sleep)` | P | — | — |
+| `user/go/gomine/main.go:164` | `}, vi.Sleep)` | P | — | — |
+| `user/go/appkit/loop.go:131` | `return l.RunWith(vi.PollEventRaw, vi.Sleep)` | P | — | — |
+
+### Table D — Zig `user/src` sites (28): helper calls, then slot-4 SVC emissions
+
+| Site | Call | Class | Wants | Owner |
+|---|---|---|---|---|
+| `user/src/devcons.zig:102` | `ui.sleep_ticks(5);` | S | ~250 ms compositor settle | fold-in |
+| `user/src/tabhold.zig:108` | `if (!attached) ui.sleep_ticks(2);` | P | attach retry | — |
+| `user/src/tabhold.zig:130` | `ui.sleep_ticks(60);` | S | ~30 s hold window | fold-in |
+| `user/src/smpst_file.zig:66` | `st.sleep_ticks(1);` | H | heartbeat hammer | — |
+| `user/src/chime.zig:166` | `if (ui.timer_set(1) < 0) {` | H | per-tick timer fixture | — |
+| `user/src/ps.zig:42` | `_ = ui.timer_set(auto_refresh_ticks);` | X | 1 s refresh | fold-in |
+| `user/src/ps.zig:56` | `_ = ui.timer_set(auto_refresh_ticks);` | X | 1 s refresh | fold-in |
+| `user/src/smpst_ev.zig:44` | `if (st.timer_set(1) != 0) st.exit_process(141);` | H | timer-event hammer | — |
+| `user/src/smpst_win.zig:61` | `st.sleep_ticks(1);` | H | heartbeat hammer | — |
+| `user/src/sb6_wm.zig:167` | `_ = syscall1(sys_sleep, 1);` | P | sleep-paced wait | — |
+| `user/src/sb6_new.zig:152` | `_ = syscall1(sys_sleep, 1);` | P | pid-scan backoff | — |
+| `user/src/sb6_new.zig:222` | `_ = syscall1(sys_sleep, 1);` | H | tick-paced frame pacing | — |
+| `user/src/sb6_new.zig:247` | `_ = syscall1(sys_sleep, 1);` | P | ack-wait backoff | — |
+| `user/src/schedint.zig:54` | `st.sleep_ticks(sleep_ticks);` | H | tick-paced aging leg | — |
+| `user/src/smpst_net.zig:62` | `st.sleep_ticks(1);` | H | heartbeat hammer | — |
+| `user/src/resmon.zig:34` | `_ = ui.timer_set(refresh_ticks);` | X | 1 s refresh | fold-in |
+| `user/src/resmon.zig:48` | `_ = ui.timer_set(refresh_ticks);` | X | 1 s refresh | fold-in |
+| `user/src/sb6_old.zig:149` | `_ = syscall1(sys_sleep, 1);` | H | tick-paced frame pacing | — |
+| `user/src/timertest.zig:63` | `if (ui.timer_set(2) < 0) {` | H | timer contract fixture | — |
+| `user/src/timertest.zig:81` | `if (ui.timer_set(1) < 0) {` | H | timer contract fixture | — |
+| `user/src/timertest.zig:92` | `if (ui.timer_set(5) < 0) {` | H | timer contract fixture | — |
+| `user/src/wasm.zig:3335` | `return importRet(timer_set(argU64(args, 0)));` | H | tick-shaped WASM import | — |
+| `user/src/main.zig:112` | `\\mov x8, #4` | H | sleep contract fixture | — |
+| `user/src/zc.zig:1335` | `emit(enc_movz(8, 4, 0));` | H | zc.sleep builtin unit | — |
+| `user/src/winmove.zig:327` | `\\mov x8, #4` | S | ~2 s hidden hold | fold-in |
+| `user/src/schedring.zig:55` | `\\mov x8, #4 // sys_sleep(1 tick)` | H | ring-resume fixture | — |
+| `user/src/smp1.zig:52` | `\\mov x8, #4` | H | core-1 park fixture | — |
+| `user/src/status43.zig:55` | `\\mov x8, #4` | S | ~6 s alive window | fold-in |
+
+## Kernel tick consumers
+
+Every reader of `timer.ticks`, `scheduler.tick_count`, `smp.core_ticks`
+and `timer.wall_epoch`, classified "stays on the heartbeat" or "moves to
+a deadline". The default is *stays*: D1 adds a parallel deadline
+structure; it does not re-time these.
+
+| Consumer | Site(s) | Verdict |
+|---|---|---|
+| `tick_count` — the slot-4/slot-40 deadline clock | `scheduler.zig:995`, `:1251` (reset), `:2124` (`sleep_current` deadline), `:2616` (`wake_expired` compare), `:2727` (`on_tick` advance), `:3841` (`current_tick` export) | stays |
+| Task wake deadline field | `scheduler.zig:283` (`wakeup_tick`), `:1453` | stays |
+| Scheduler aging window | `scheduler.zig:2669` (`tick_count -% since`) | stays |
+| Preemption quantum + per-task/per-core accounting | `scheduler.zig:3220-3224` (`core_ticks[c]`, `run_ticks`), procs-v2 `machine_ticks` denominator `:2702-2708` (ADR 0047) | stays |
+| `on_tick` housekeeping — app timers, kind-18, CPU-limit arming, exit diagnosis | `scheduler.zig:2726-2738`, `:3461`, `:3517`, `:2787` | stays |
+| App-timer countdown (slot 40) | `app_timers.zig` (`on_tick` countdown; `max_delay_ticks` = 3600) | stays — slot 95 (X2) is the ns arm on the overlay |
+| Kind-18 heartbeat + tick-rate meter | `wm_server.zig:202`,`:294-296`,`:641-657` | stays (damage ticks ride flags bit 0, X4, not a rate change) |
+| `irq_ticks`/`poll_ticks`/`ticks` counters + heartbeat print | `timer.zig:46-70`, the `timer heartbeat`/`timer irq delivered` lines | stays — deadline IRQs get `deadline_irqs` |
+| `wall_epoch` readers — `sys_time`, `sys_time_set`, `local_time_of_day`, VLFS mtime | `syscall.zig:3121`,`:3138`; `timer.zig:121-124`; `vlfs/disk.zig:76` | stays |
+| `timer.ticks` readers — monitor prints/`cmd_time`/`Tick:` line, tombstones, socket_native `now()` fallback, terminal net `now()`, shell boot deadline and fg-wait bound, TCP/DHCP/NDP `now_ticks` stamps, `driving_award` splash bound | `monitor.zig:887,982,2221-2233,4615,4792,5496,5697,6112,6700,6819,6895`; `tombstone.zig:169`; `socket_native.zig:48`; `terminal.zig:4022`; `shell.zig:274,336,3654-3659,3944-3956,4109`; `driving_award.zig:6101` | stays |
+| TCP connect deadline seed | `syscall.zig:4143` (`start_ticks` beside the CNTPCT deadline) | stays |
+| Futex / op-74-2 deadline conversion | `syscall.zig:2598-2601` (`futex_deadline_tick`), `:2708` (`coarse_deadline`), `:2903` (`ConnectDeadline`) | **moves to the deadline overlay** — X3's 1 ms rounding is exactly this consumer re-based (card #3036) |
+| `sys_sock_ready` park-until-deadline waits | `syscall.zig:2685-2721` region (op 76/1 deadline parks) | moves — the park wakes on the deadline, not the next tick |
+| Profiler channel | `timer.zig:285-345` (CNTV PPI 27, `freq/100` periods, `profile_next_deadline` skips missed periods) | stays — already a deadline train; the precedent D1 generalizes |
+| Forensics re-arm probe | `timer.zig:31`, forensics `.rearm` notes | stays — gains the deadline-arm observations |
+| New: sorted ns deadline set + `deadline_irqs` counter | new (card #3033) | the overlay itself |
+
+## Spec timing census
+
+Spec text that pins the heartbeat — all must stay byte-identical. A
+deadline IRQ that advanced `irq_ticks` or retimed `gotabwm: tick` would
+turn these red without a code bug.
+
+| Pinned text | Specs | Count |
+|---|---|---|
+| `timer heartbeat ticks=N irq=N poll=N` (+ `--script2-after` gating on the same text) | `live-timer`, `live-sh-monitor`, `live-net-bridged`, `live-m21-max-fullscreen-aot`, `live-m21-minimize-ws`, `live-m21-notif-dialog-transient`, `live-m21-tile-master`, `live-win-close`, `live-win-move`, `live-win-syscall`, `live-sb4-damage-tracking`, `live-sb5-wm-compose-n`, `live-sb6-perf-payoff`, `live-sexiburger` | 14 |
+| `gotabwm: tick` markers | `live-host-notify`, `go-wm-seat`, `go-dogfood`, `go-wm-default`, `live-gpu3d`, `live-hostint` | 6 |
+| `tick_avg_ms` within 800–1200 ms | `live-wm-pacing.spec:116` | 1 |
+
+Also tick-contract (not heartbeat-text) but binding for X5: `live-sleep`
+pins the `user: sleeping 2 ticks` payload pair and the `4 sys_sleep` slot
+row; `live-timers` pins the slot-40 arm/fire/cancel legs; the `smpst`
+hammer specs read `hb=` cadence lines produced by sleep-paced fixtures.
+
+## What the wave does with this
+
+- **card #3033** builds the overlay: the deadline set, the
+  `min(heartbeat, deadline)` comparator program, the `deadline_irqs`
+  counter, deadline-wake without rotation. Acceptance includes the K=3
+  WM-boot leg and `live-timer`/`live-sleep`/`live-timers` byte-identical.
+- **card #3036** lands slots 94/95 and the X3 rounding, plus the
+  `SleepNs`/`TimerSetNs` wrappers; every D row becomes expressible and
+  the 13 `time.Sleep` sites precise with no edit.
+- **card #3038** migrates the D/S/X rows in its eight files; the
+  fold-in rows go to whichever card next holds each file.
+- **card #3034** ships the damage tick (X4) and takes `seat.go:557`.
+- **card #3039** arms slot 95 per GIF frame (10–100 ms, D2-clamped).
+- **card #3040** measures the earned latency: keystroke→glyph, timer
+  jitter, the `wm-present-latency` re-pin.

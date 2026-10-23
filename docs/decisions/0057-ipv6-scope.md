@@ -1,13 +1,14 @@
 # ADR 0057: IPv6 scope — SLAAC from RAs, NDP, ICMPv6 echo, bounded state everywhere
 
 - Date: 2026-10-17
-- Status: **Proposed** — awaiting owner review. No code lands here; this
-  ADR is the card (#2473) and, if approved, the M117 arc (#2450)
-  implements it in the filed order: M117b the v6 datapath + hermetic
-  responders + `live-net-v6`, M117c transport over v6, M117d the opt-in
-  bridged/vmnet attachments, M117e the grant-word scope qualifiers,
-  M117f acceptance. (Number 0057 is the next free at write time;
-  M115b's card holds 0056.)
+- Status: **Accepted** — shipped by the M117 arc (#2450, closed):
+  transport over v6 is live (`kernel/src/tcp.zig:467`,
+  `kernel/src/syscall.zig:121`, M117c); this ADR is the card (#2473),
+  and the M117 arc implemented it in the filed order: M117b the v6
+  datapath + hermetic responders + `live-net-v6`, M117c transport over
+  v6, M117d the opt-in bridged/vmnet attachments, M117e the grant-word
+  scope qualifiers, M117f acceptance. (Number 0057 is the next free at
+  write time; M115b's card holds 0056.)
 - Card: **#2473** (M117 index **#2450**) — card 1 of 6. This is the one
   doc for the arc (AGENTS.md: one doc per arc, not four).
 - Related: ADR 0007 (syscall ABI — no new slots here; the additive rule

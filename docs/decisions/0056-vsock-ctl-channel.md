@@ -1,8 +1,9 @@
 # ADR 0056: The guest→host control channel — `virelai-ctl/1` over virtio-vsock
 
 - Date: 2026-10-18
-- Status: **Proposed** — lands with this PR; the wire is live-verified by
-  `live-vsock-ctl`, the verbs are refused by name until M115d/e arm them.
+- Status: **Accepted** — shipped by M115d, which armed the verbs
+  (`kernel/src/syscall.zig:108,3636`); the wire is live-verified by
+  `live-vsock-ctl`.
 - Card: **#2461** (M115, index #2448) — card 2 of 7; depends on M115a
   (#2460), gates M115d (#2463) and M115e (#2464).
 - Related: ADR 0044 (the agent control channel — same handshake shape,

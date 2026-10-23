@@ -1,8 +1,9 @@
 # ADR 0048: sys_getpid — an unforgeable self-pid answer
 
 - Date: 2026-10-13
-- Status: **Proposed — owner review required.** Card #2158 is explicitly an
-  ABI decision; this ADR lands before the kernel code in the same PR.
+- Status: **Accepted** — shipped by card #2158: slot 87 is live
+  (`kernel/src/syscall.zig:185,1143`). Card #2158 was explicitly an ABI
+  decision; this ADR landed before the kernel code in the same PR.
 - Card: **#2158** (audit-verified: `WmPeers` resolves self-pid by first
   `sys_procs` name match, so a second instance of any app misroutes every
   WM_RPC ack to the first instance's mailbox).

@@ -1,8 +1,9 @@
 # ADR 0055: The release manifest — the release-stream convention and its signed catalog fields
 
 - Date: 2026-10-16
-- Status: **Proposed** — awaiting owner review. No code lands here; this
-  ADR is the card (#2403). M110b–e implement against it, and M113's
+- Status: **Accepted** — shipped by the M110 arc (#2383, closed): the
+  signed install path is live (`user/go/store/install.go:228,319`); this
+  ADR is the card (#2403). M110b–e implemented against it, and M113's
   ADR 0054 extends it (D6).
 - Card: **#2403** (M110, program index #2383) — card 1 of 5. The index's
   *Design direction* (2026-10-16, owner-delegated) is ratified here.

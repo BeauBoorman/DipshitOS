@@ -1,8 +1,9 @@
 # ADR 0053: The GPU compute surface — one queue, a three-kernel ABI, bounded buffers
 
 - Date: 2026-10-16
-- Status: **Proposed** — awaiting owner review. No code lands here; this
-  ADR is the card (#2408) and, if approved, the split in §D8 is the arc.
+- Status: **Accepted** — shipped by M111b (M111 closed, index #2384):
+  the GPU compute surface is live (`kernel/src/syscall.zig:201,1198`);
+  this ADR is the card (#2408), and the split in §D8 is the arc.
 - Card: **#2408** (M111a, arc index #2384) — card 1 of 5. The surface
   M111b implements and M111e accepts.
 - Related: ADR 0007 (syscall ABI — this ADR names one new slot, §D5),

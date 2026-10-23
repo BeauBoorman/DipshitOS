@@ -1,13 +1,13 @@
 # ADR 0059: Warm-checkpoint legs — boot once, checkpoint before any workload, restore per leg, nothing crosses
 
 - Date: 2026-10-18
-- Status: **Proposed** — awaiting owner review. No code lands here;
-  this ADR is the card (#2638) and, if approved, the M131 arc
-  implements it in the filed order: M131b the runner primitives
-  (#2639), M131c the `live-quickjs` pilot (#2640), M131d the fleet
-  census + sweep + budget row (#2641). (Number 0059 taken at write
-  time; 0058 is provisionally held by M130a #2618 — unclaimed, but
-  its filed card names that file.)
+- Status: **Accepted** — shipped by the M131 arc (#2637, closed;
+  `tools/gate/fleet-census.py:2`, `tools/gate/SPEC.md:29,39`); this ADR
+  is the card (#2638), and the M131 arc implemented it in the filed
+  order: M131b the runner primitives (#2639), M131c the `live-quickjs`
+  pilot (#2640), M131d the fleet census + sweep + budget row (#2641).
+  (Number 0059 taken at write time; 0058 is provisionally held by M130a
+  #2618 — unclaimed, but its filed card names that file.)
 - Card: **#2638** (M131 index **#2637**) — card 1 of 4. This is the
   one doc for the arc (AGENTS.md: one doc per arc, not four).
 - Related: ADR 0036 (VirtioFS — the only armed share a checkpoint may

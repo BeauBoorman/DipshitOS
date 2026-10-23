@@ -1,8 +1,9 @@
 # ADR 0047: sys_procs v2 — a self-describing, size-tagged snapshot row
 
 - Date: 2026-10-13
-- Status: **Proposed — owner review required.** Card #2198 is explicitly an
-  ABI decision; this ADR lands before the kernel code in the same PR.
+- Status: **Accepted** — shipped by card #2198 (`kernel/src/syscall.zig:562,1105`;
+  bench row `tools/gate/bench/corpus.tsv:33`). Card #2198 was explicitly
+  an ABI decision; this ADR landed before the kernel code in the same PR.
 - Card: **#2198** (real per-process CPU/mem in `sys_procs` → `vi.ProcRow` →
   GOTOP + PULSE). Index context: the Go-apps second pass.
 - Related: ADR 0007 (syscall ABI), ADR 0024 (principals — the frozen row

@@ -1,9 +1,10 @@
 # ADR 0061: Sealed VLFS — a passphrase-unlocked encrypted guest disk (format v2)
 
 - Date: 2026-10-22
-- Status: **Proposed** — awaiting owner review. No code lands here;
-  this ADR is the card (#3028) and, if approved, the sealed-VLFS arc (index #3024)
-  implements it in the filed order: card #3030 kernel ChaCha20-Poly1305 +
+- Status: **Accepted** — shipped by the sealed-VLFS arc (index #3024;
+  all five cards closed): the sealed-mount reservation is live (ADR 0007
+  X6 :2886); this ADR is the card (#3028), and the arc implemented it in
+  the filed order: card #3030 kernel ChaCha20-Poly1305 +
   PBKDF2-HMAC-SHA256 (card #3030), card #3031 `mkfs.vlfs --seal` and the
   v2 format (card #3031), card #3037 the sealed mount — boot prompt,
   unwrap, block AEAD, lockout (card #3037), card #3043 the canary gate

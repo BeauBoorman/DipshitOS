@@ -1,11 +1,12 @@
 # ADR 0054: Measurement is the trust key — verified+measured boot, measured exec, the grant table
 
 - Date: 2026-10-16
-- Status: **Proposed** — awaiting owner review. No code lands here; this
-  ADR is the card (#2417) and, if approved, the M113 arc (#2386) implements
-  it in the filed order: M113b verified+measured boot, M113c measured exec
-  + grant table + enforcement (audit), M113d `ReleaseCaps` + GOSET consent,
-  M113e trust viewer, M113f acceptance.
+- Status: **Accepted** — shipped by the M113 arc (#2386, closed):
+  handoff is live (`kernel/src/handoff.zig:39`) and the grant table
+  ships (`image/fleet-grants.txt:1`); this ADR is the card (#2417), and
+  the M113 arc implemented it in the filed order: M113b verified+measured
+  boot, M113c measured exec + grant table + enforcement (audit), M113d
+  `ReleaseCaps` + GOSET consent, M113e trust viewer, M113f acceptance.
 - Card: **#2417** (M113 index **#2386**) — card 1 of 6. This is the one doc
   for the arc (AGENTS.md: one doc per arc, not four).
 - Related: ADR 0007 (syscall ABI — the slot groups the words map to; D10's
