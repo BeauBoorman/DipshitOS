@@ -29,15 +29,21 @@
 //! offload is negotiated — see `tx_hdr_len`, a confirm-at-claim-time
 //! constant). Queue 0 = RX, queue 1 = TX per the virtio-net spec §5.2.
 //! N1 (claim 1373) proved the transport + TX; card N2 (claim 6076)
-//! adds the RX path: queue 0 is supplied with a fixed BSS buffer
-//! (one-request-at-a-time like TX), the used ring is drained POLLED
+//! adds the RX path: queue 0 is supplied with fixed BSS buffers
+//! (one per posted descriptor — every descriptor, since M179b), the used ring is drained POLLED
 //! (the proven N1/blk shape — the net device's used-buffer IRQ line is
 //! NOT yet observed on this platform; whether the device delivers one,
 //! and via what INTID, is a claim-time finding recorded in `net`/the
 //! claim, not assumed), accepted frames land in a bounded FIFO (no
 //! heap, the card-3d push/drain pattern, drop-oldest overflow), and
 //! `net recv` prints them. MAC filtering accepts own + broadcast and
-//! drops the rest (a counter in the `net` report). The RX buffer is
+//! drops the rest (a counter in the `net` report). M179b (#3148) grew
+//! the receive depth: every queue-0 descriptor stays posted with its
+//! own page-rounded buffer (queue_size rose 4→16; TX keeps its
+//! one-request-at-a-time contract), the drain consumes every
+//! outstanding completion and re-posts each descriptor it drains, and
+//! the FIFO holds a full ring of frames (16 slots) so a 16 KiB
+//! window's burst does not drop. The RX buffer is
 //! sized with a 12-byte virtio_net_hdr headroom (N1 observed the device
 //! CONSUMES one on TX; whether the device WRITES one into RX buffers is
 //! pinned from observation at claim time — `net: rx-obs` records the
@@ -60,6 +66,8 @@
 //! No libc, no POSIX, no allocation, no interrupts.
 
 const std = @import("std");
+const builtin = @import("builtin");
+const alloc = @import("alloc.zig");
 const mmio = @import("mmio.zig");
 const mmu = @import("mmu.zig");
 const pci = @import("pci.zig");
@@ -118,10 +126,13 @@ const VirtqUsed = extern struct {
     ring: [queue_size]VirtqUsedElem,
 };
 
-/// Split-ring size: 4 (power of two, Virtio 1.3 §4.1.4.3) — the blk/entropy
-/// proven size. One TX request outstanding at a time keeps the ring
-/// invariant (§2.7) trivially true.
-pub const queue_size: u16 = 4;
+/// Split-ring size: 16 (power of two, Virtio 1.3 §4.1.4.3). M179b
+/// (#3148) raised it 4→16: the RX queue posts EVERY descriptor with its
+/// own buffer, so a 16 KiB window's ~11-frame burst lands in
+/// driver-posted buffers instead of being dropped by the device before
+/// the polled drain can run. TX keeps its one-request-at-a-time contract
+/// (descriptor 0 only), so the larger ring costs it nothing.
+pub const queue_size: u16 = 16;
 
 const virtq_f_write: u16 = 0x2; // VIRTQ_DESC_F_WRITE
 
@@ -275,25 +286,76 @@ pub const rx_hdr_len: usize = 12;
 /// above the observed 1530 minimum).
 pub const rx_buf_len: usize = 4096;
 
-/// Fixed BSS RX buffer (ONE buffer, one-request-at-a-time like N1's TX).
-/// The device DMA-writes the frame into it; the driver invalidates before
-/// reading and re-arms after every drain.
-pub var rx_buf: [rx_buf_len]u8 align(16) = undefined;
+/// RX DMA targets — ONE per queue-0 descriptor (M179b, #3148): every
+/// descriptor stays posted with its own page-rounded buffer (the 4096 B
+/// size honours the observed 1530 B VZ floor). The buffers are pool
+/// pages armed by `arm_rx_storage` — 16 × 4 KiB of DMA target is pool
+/// memory, not kernel .bss (the flat array broke ADR 0013 D3.1's
+/// ceiling); scattered pages are legal since every descriptor names its
+/// own GPA. The device DMA-writes the frame into `rx_bufs[desc-id]`;
+/// the driver invalidates before reading and re-posts the descriptor
+/// once the drain consumes it. Host tests get static backing — they
+/// cannot dereference pool phys.
+var test_rx_backing: [queue_size][rx_buf_len]u8 align(16) = undefined;
+pub var rx_bufs: [queue_size]*[rx_buf_len]u8 = if (builtin.is_test) blk: {
+    var arr: [queue_size]*[rx_buf_len]u8 = undefined;
+    for (&arr, 0..) |*b, i| b.* = &test_rx_backing[i];
+    break :blk arr;
+} else undefined;
+/// Alias for `rx_bufs[0]` — kernel/tests/syscall_test.zig's
+/// `native_prime_rx` stages its injected frame in descriptor 0's buffer
+/// under the original one-buffer name.
+pub var rx_buf: *[rx_buf_len]u8 = if (builtin.is_test) &test_rx_backing[0] else undefined;
+var rx_bufs_armed: bool = false;
 
 /// Bounded frame FIFO capacity (fixed slots, no heap — the card-3d
-/// push-from-context + shell-idle-drain pattern). Each slot holds one RAW
-/// device-written buffer (header headroom included — the header question
-/// is pinned by observation, not stripped blindly).
-pub const fifo_slots: usize = 4;
+/// push-from-context + shell-idle-drain pattern). M179b (#3148) raised
+/// it 4→16: a 16 KiB TCP window invites ~11 back-to-back full frames,
+/// and 16 slots also hold a whole ring's worth of drained completions
+/// without overflow (drop-oldest stays the overflow rule). BSS price:
+/// fifo_slots × (rx_buf_len + len) = 16 × ~4 KiB = 64 KiB, up from
+/// 16 KiB at 4 slots. Each slot holds one RAW device-written buffer
+/// (header headroom included — the header question is pinned by
+/// observation, not stripped blindly).
+pub const fifo_slots: usize = 16;
 
 pub const FrameSlot = struct {
     len: usize = 0,
     data: [rx_buf_len]u8 = undefined,
 };
 
-pub var rx_fifo: [fifo_slots]FrameSlot = @as([fifo_slots]FrameSlot, @splat(@as(FrameSlot, .{})));
+/// The slot array itself is pool memory for the same reason — ~64 KiB
+/// at 16 slots armed by `arm_rx_storage`; `rx_fifo.len` is the honest
+/// bound, so a short page pool means the fifo admits nothing rather
+/// than writing out of bounds.
+var test_rx_fifo: [fifo_slots]FrameSlot = @splat(.{});
+pub var rx_fifo: []FrameSlot = if (builtin.is_test) test_rx_fifo[0..] else &.{};
+var rx_fifo_armed: bool = false;
 pub var rx_fifo_head: usize = 0; // oldest slot (next to pop)
 pub var rx_fifo_count: usize = 0;
+
+/// Arm the pool-backed RX storage once — 16 contiguous pages for the
+/// descriptor targets plus the fifo block. A short pool means no posts,
+/// not invented addresses; each half retries independently on the next
+/// `net_rx_arm` call.
+fn arm_rx_storage() void {
+    if (builtin.is_test) return; // static backing is comptime-armed
+    if (!rx_bufs_armed) {
+        if (alloc.alloc_pages(queue_size)) |pa| {
+            const base: [*][rx_buf_len]u8 = @ptrFromInt(pa);
+            for (&rx_bufs, 0..) |*b, i| b.* = &base[i];
+            rx_buf = rx_bufs[0];
+            rx_bufs_armed = true;
+        }
+    }
+    if (!rx_fifo_armed) {
+        const fifo_pages = (fifo_slots * @sizeOf(FrameSlot) + 4095) / 4096;
+        if (alloc.alloc_pages(fifo_pages)) |pa| {
+            rx_fifo = @as([*]FrameSlot, @ptrFromInt(pa))[0..fifo_slots];
+            rx_fifo_armed = true;
+        }
+    }
+}
 
 /// RX counters (the `net` report): frames accepted into the FIFO, bytes
 /// accepted (device-written length), frames dropped by the MAC filter,
@@ -305,8 +367,22 @@ pub var rx_filtered: u64 = 0;
 pub var rx_overflow: u64 = 0;
 pub var rx_last_len: u32 = 0;
 pub var rx_first16: [16]u8 = @splat(0);
-/// Whether the queue-0 buffer is currently supplied (armed + kicked).
+/// Whether queue 0 currently has any buffer supplied (armed + kicked).
 pub var rx_armed: bool = false;
+/// M179b (#3148): bit i = descriptor i is posted to the device (one
+/// outstanding buffer each — the card-3d one-request contract
+/// generalised to every descriptor). `rx_posted` counts every buffer
+/// supplied since the last init/re-arm: the posted-buffer counter a
+/// later card adds to the `net` report (monitor.zig is outside this
+/// card's Touches).
+var rx_posted_mask: u32 = 0;
+pub var rx_posted: u64 = 0;
+
+/// Live posted depth: descriptors supplied to the device but not yet
+/// drained (0..queue_size). Exposed for the later `net` report card.
+pub fn rx_posted_depth() u16 {
+    return @popCount(rx_posted_mask);
+}
 
 pub var net_dev: Device = .{};
 pub var net_ops: Ops = .{
@@ -468,11 +544,16 @@ pub const DrainReport = struct {
 };
 
 pub fn drain_delta(last_used: u16, used_idx: u16, used_ring: *const [queue_size]VirtqUsedElem) DrainReport {
-    // The device advances used.idx by one per completed buffer, so the
-    // delta is the (mod queue_size) difference — with at most `queue_size`
-    // requests outstanding the true delta is always < queue_size, and the
-    // modulo keeps the wrap (last_used near 0xffff) exact.
-    const completed: u16 = (used_idx +% queue_size -% last_used) % queue_size;
+    // The device advances used.idx by one per completed buffer; with at
+    // most `queue_size` requests outstanding the true delta lies in
+    // 0..=queue_size. The modulo alone maps queue_size back to 0, so a
+    // nonzero raw delta that mods to zero is the FULL ring draining —
+    // M179b posts every RX descriptor, making that case real (a 4-entry
+    // queue with one outstanding never hit it). The wrapping subtraction
+    // keeps the 16-bit index wrap (last_used near 0xffff) exact.
+    const raw = used_idx -% last_used;
+    var completed: u16 = raw % queue_size;
+    if (raw != 0 and completed == 0) completed = queue_size;
     var bytes: u64 = 0;
     var i: u16 = 0;
     while (i < completed) : (i += 1) {
@@ -754,6 +835,8 @@ fn transport_init(ops: *const Ops, dev: *Device, rearm: bool) bool {
     rx_last_len = 0;
     rx_fifo_head = 0;
     rx_fifo_count = 0;
+    rx_posted_mask = 0;
+    rx_posted = 0;
 
     // Queue 0 = RX (set up per spec; ZERO buffers supplied — RX is N2).
     if (!setup_queue(ops, 0, &dev.rx_desc, &dev.rx_avail, &dev.rx_used)) {
@@ -1044,27 +1127,40 @@ pub fn net_send_frame(requested: usize, out_len: *usize) SendResult {
 // RX path (queue 0, POLLED used-ring drain — the N1/blk shape)
 // ---------------------------------------------------------------------------
 
-/// Supply the queue-0 RX buffer (descriptor 0, device-WRITE) and kick so
-/// the device knows a buffer is available. ONE request outstanding at a
-/// time keeps the ring invariant trivial (mirror N1's TX). Called after
-/// the post-exit re-arm and again after every drain. Returns false when
-/// the transport is unarmed.
+/// Supply queue-0 RX buffers: post EVERY descriptor not already posted
+/// (M179b, #3148 — one device-WRITE buffer each, `rx_posted_mask` tracks
+/// which), then kick once so the device knows buffers are available.
+/// Called after the post-exit re-arm and again after every drain to
+/// re-post the descriptors the drain consumed. Returns false when the
+/// transport is unarmed.
 pub fn net_rx_arm() bool {
     if (!net_ready) return false;
+    arm_rx_storage();
+    if (!rx_bufs_armed and !builtin.is_test) return false; // no targets, no posts
     const ops = &net_ops;
     const dev = &net_dev;
-    dev.rx_desc[0] = .{
-        .addr = ops.to_phys(@intFromPtr(&rx_buf)),
-        .len = rx_buf_len,
-        .flags = virtq_f_write,
-        .next = 0xffff,
-    };
-    dev.rx_avail.ring[dev.rx_avail.idx % queue_size] = 0; // descriptor 0
-    dev.rx_avail.idx +%= 1;
-    ops.clean(@intFromPtr(&dev.rx_desc), @sizeOf([queue_size]VirtqDesc));
-    ops.clean(@intFromPtr(&dev.rx_avail), @sizeOf(VirtqAvail));
-    ops.notify(0);
-    rx_armed = true;
+    var posted: u16 = 0;
+    var i: u16 = 0;
+    while (i < queue_size) : (i += 1) {
+        if ((rx_posted_mask >> @intCast(i)) & 1 != 0) continue;
+        dev.rx_desc[i] = .{
+            .addr = ops.to_phys(@intFromPtr(rx_bufs[i])),
+            .len = rx_buf_len,
+            .flags = virtq_f_write,
+            .next = 0xffff,
+        };
+        dev.rx_avail.ring[dev.rx_avail.idx % queue_size] = i;
+        dev.rx_avail.idx +%= 1;
+        rx_posted_mask |= @as(u32, 1) << @intCast(i);
+        posted += 1;
+    }
+    if (posted != 0) {
+        ops.clean(@intFromPtr(&dev.rx_desc), @sizeOf([queue_size]VirtqDesc));
+        ops.clean(@intFromPtr(&dev.rx_avail), @sizeOf(VirtqAvail));
+        ops.notify(0);
+        rx_posted +%= posted;
+    }
+    rx_armed = rx_posted_mask != 0;
     // M117b (#2474, ADR 0057 D4): arming RX starts the bounded Router
     // Solicitation train — idempotent (the drain re-arms after every
     // completion).
@@ -1106,6 +1202,10 @@ pub fn mac_accept(off: usize, buf: []const u8, own: *const [6]u8) bool {
 /// frame exceeds a slot (should never happen — buffers are bounded).
 pub fn fifo_push(frame: []const u8) bool {
     if (frame.len > rx_buf_len) return false;
+    if (rx_fifo.len == 0) {
+        rx_overflow +%= 1; // no store armed — counted drop, never a wild write
+        return false;
+    }
     if (rx_fifo_count == fifo_slots) {
         rx_fifo_head = (rx_fifo_head + 1) % fifo_slots; // drop the oldest
         rx_fifo_count -= 1;
@@ -1143,49 +1243,60 @@ pub fn fifo_occupancy() usize {
 /// Drain the RX used ring (POLLED — the proven N1/blk shape; the net
 /// device's used-buffer IRQ is not yet observed on this platform, so
 /// there is no IRQ-context push in N2 — recorded honestly in the claim).
-/// On a completion: read the device-written frame out of `rx_buf`
-/// (invalidating the cache line first — the device DMA-wrote it), MAC-
-/// filter it (own + broadcast), push accepted frames into the bounded
-/// FIFO, re-arm the buffer. Idempotent; called from the shell idle loop
-/// and before the `net`/`net recv` reports.
+/// On EVERY completion (M179b: the device may have filled several of the
+/// posted buffers since the last poll): read the device-written frame
+/// out of the used element's own `rx_bufs[id]` (invalidating the cache
+/// line first — the device DMA-wrote it), MAC-filter it (own +
+/// broadcast), push accepted frames into the bounded FIFO, then re-post
+/// every consumed descriptor. Idempotent; called from the shell idle
+/// loop and before the `net`/`net recv` reports.
 pub fn net_rx_drain() void {
     if (!net_ready or !rx_armed) return;
     const ops = &net_ops;
     const dev = &net_dev;
     ops.invalidate(@intFromPtr(&dev.rx_used), @sizeOf(VirtqUsed));
     if (dev.rx_used.idx == dev.rx_last_used) return;
-    const report = drain_delta(dev.rx_last_used, dev.rx_used.idx, &dev.rx_used.ring);
+    const last = dev.rx_last_used;
+    const report = drain_delta(last, dev.rx_used.idx, &dev.rx_used.ring);
     dev.rx_last_used = dev.rx_used.idx;
     if (report.completed == 0) return;
 
-    // The device wrote into rx_buf — invalidate before reading. The RX
-    // used-element `len` is the DEVICE-WRITTEN length (N1's TX `len` was
-    // ~0); one request outstanding means one completion per drain.
-    ops.invalidate(@intFromPtr(&rx_buf), rx_buf_len);
-    const dev_len: usize = @intCast(report.bytes);
-    if (dev_len > rx_buf_len) {
-        // Device overran the bound — honest record, drop, re-arm.
-        rx_filtered +%= 1;
-        rx_last_len = rx_buf_len;
-        _ = net_rx_arm();
-        return;
-    }
-    rx_last_len = @intCast(dev_len);
-    // The claim-time rx-obs record: the first 16 device-written bytes pin
-    // the RX-header question (12 zero bytes + dst MAC = header present;
-    // dst MAC at 0 = none). Recorded even when the filter drops, so a
-    // drop is distinguishable from a failed delivery.
-    const n16 = @min(dev_len, 16);
-    var i: usize = 0;
-    while (i < n16) : (i += 1) rx_first16[i] = rx_buf[i];
+    var c: u16 = 0;
+    while (c < report.completed) : (c += 1) {
+        const elem = dev.rx_used.ring[(last +% c) % queue_size];
+        // The used element's id names the descriptor the device filled —
+        // its buffer is rx_bufs[id] (the observed per-descriptor write).
+        const id: usize = elem.id;
+        if (id >= queue_size) continue; // non-conforming device; skip honestly
+        rx_posted_mask &= ~(@as(u32, 1) << @intCast(id));
+        const buf = rx_bufs[id];
+        ops.invalidate(@intFromPtr(buf), rx_buf_len);
+        // The RX used-element `len` is the DEVICE-WRITTEN length (N1's TX
+        // `len` was ~0).
+        const dev_len: usize = @intCast(elem.len);
+        if (dev_len > rx_buf_len) {
+            // Device overran the bound — honest record, drop, re-arm.
+            rx_filtered +%= 1;
+            rx_last_len = rx_buf_len;
+            continue;
+        }
+        rx_last_len = @intCast(dev_len);
+        // The claim-time rx-obs record: the first 16 device-written bytes
+        // pin the RX-header question (12 zero bytes + dst MAC = header
+        // present; dst MAC at 0 = none). Recorded even when the filter
+        // drops, so a drop is distinguishable from a failed delivery.
+        const n16 = @min(dev_len, 16);
+        var i: usize = 0;
+        while (i < n16) : (i += 1) rx_first16[i] = buf[i];
 
-    // MAC filter: the frame starts at `rx_hdr_len` (the claim-time
-    // constant — a wrong guess shows as filtered=1 + a distinctive
-    // rx-obs, and is corrected like tx_hdr_len was).
-    if (!mac_accept(rx_hdr_len, rx_buf[0..dev_len], &net_mac)) {
-        rx_filtered +%= 1;
-    } else {
-        _ = fifo_push(rx_buf[0..dev_len]);
+        // MAC filter: the frame starts at `rx_hdr_len` (the claim-time
+        // constant — a wrong guess shows as filtered=1 + a distinctive
+        // rx-obs, and is corrected like tx_hdr_len was).
+        if (!mac_accept(rx_hdr_len, buf[0..dev_len], &net_mac)) {
+            rx_filtered +%= 1;
+            continue;
+        }
+        _ = fifo_push(buf[0..dev_len]);
         rx_frames +%= 1;
         rx_bytes +%= dev_len;
         // Card N3 (claim 7293): ARP dispatch — the frame's Ethernet
@@ -1195,27 +1306,28 @@ pub fn net_rx_drain() void {
         // one-request-at-a-time); a reply is learned into the bounded
         // table. The raw frame ALSO stays in the FIFO for `net recv`
         // observation — the N2 seam is unchanged.
-        rx_arp(rx_buf[rx_hdr_len..dev_len]);
+        rx_arp(buf[rx_hdr_len..dev_len]);
         // Card N4 (claim 0148): IPv4/ICMP dispatch — an echo request
         // for our static IP is answered byte-exact; an echo reply is
         // observed (`pongs_observed`); fragments / bad checksums /
         // foreign addresses are counted and dropped (N4 does NOT
         // reassemble — honest bound). The raw frame stays in the FIFO
         // for `net recv` observation, same seam.
-        rx_ipv4(rx_buf[rx_hdr_len..dev_len]);
+        rx_ipv4(buf[rx_hdr_len..dev_len]);
         // M117b (#2474, ADR 0057 D1): the 0x86dd leaf on the same demux
         // seam — self-filters on ethertype like the ARP/IPv4 handlers;
         // NDP answers (NA) and ICMPv6 echo replies are built into
         // tx_staging and transmitted on the same TX path. The raw frame
         // stays in the FIFO for `net recv` observation.
-        rx_ipv6(rx_buf[rx_hdr_len..dev_len]);
+        rx_ipv6(buf[rx_hdr_len..dev_len]);
     }
+    // Re-post every descriptor this drain consumed (one kick covers all).
     _ = net_rx_arm();
 }
 
 /// Card N3 (claim 7293): dispatch one accepted Ethernet frame to the ARP
 /// layer. `frame` starts at the Ethernet header (the RX virtio_net_hdr
-/// already skipped — the caller passed `rx_buf[rx_hdr_len..]`). A request
+/// already skipped — the caller passed `rx_bufs[id][rx_hdr_len..]`). A request
 /// for our protocol address is answered: the reply is built into
 /// `tx_staging` (after the zeroed virtio_net_hdr) and transmitted on the
 /// N1 TX path; a reply is learned by `arp.handle_rx`; malformed /
@@ -1883,20 +1995,36 @@ test "virtio_net: staging bounds — payload truncation is honest" {
 test "virtio_net: used-ring drain accounting is exact" {
     const E = VirtqUsedElem;
     // One completion: used.idx advanced by 1 past the drain point.
-    var ring: [queue_size]E = .{ .{ .id = 0, .len = 46 }, .{ .id = 0, .len = 0 }, .{ .id = 0, .len = 0 }, .{ .id = 0, .len = 0 } };
+    var ring: [queue_size]E = @splat(@as(E, .{ .id = 0, .len = 0 }));
+    ring[0] = .{ .id = 0, .len = 46 };
     var r = drain_delta(0, 1, &ring);
     try std.testing.expectEqual(@as(u16, 1), r.completed);
     try std.testing.expectEqual(@as(u64, 46), r.bytes);
     // Two completions sum both element lengths at slots 0 and 1.
-    ring = .{ .{ .id = 0, .len = 46 }, .{ .id = 0, .len = 60 }, .{ .id = 0, .len = 0 }, .{ .id = 0, .len = 0 } };
+    ring[1] = .{ .id = 1, .len = 60 };
     r = drain_delta(0, 2, &ring);
     try std.testing.expectEqual(@as(u16, 2), r.completed);
     try std.testing.expectEqual(@as(u64, 106), r.bytes);
-    // A ring wrap: last_used=3, used=1 (2 completions at slots 3 and 0).
-    ring = .{ .{ .id = 0, .len = 46 }, .{ .id = 0, .len = 0 }, .{ .id = 0, .len = 0 }, .{ .id = 0, .len = 60 } };
-    r = drain_delta(3, 1, &ring);
-    try std.testing.expectEqual(@as(u16, 2), r.completed);
+    // A ring wrap at the 16-bit index bound (M179b: used.idx is an
+    // ABSOLUTE counter, not a slot index — it wraps at 0xffff, and the
+    // slots are (last + i) % queue_size). last_used=0xfffe, used_idx=3:
+    // 5 completions at slots 14, 15, 0, 1, 2.
+    ring = @splat(@as(E, .{ .id = 0, .len = 0 }));
+    ring[14] = .{ .id = 0, .len = 10 };
+    ring[15] = .{ .id = 0, .len = 20 };
+    ring[0] = .{ .id = 0, .len = 30 };
+    ring[1] = .{ .id = 0, .len = 40 };
+    ring[2] = .{ .id = 0, .len = 6 };
+    r = drain_delta(0xfffe, 3, &ring);
+    try std.testing.expectEqual(@as(u16, 5), r.completed);
     try std.testing.expectEqual(@as(u64, 106), r.bytes);
+    // The FULL ring draining: exactly queue_size completions mods to 0,
+    // which must read as queue_size, not as no advance (M179b posts every
+    // RX descriptor — a burst can complete the whole ring in one poll).
+    ring = @splat(@as(E, .{ .id = 0, .len = 4 }));
+    r = drain_delta(5, 5 +% queue_size, &ring);
+    try std.testing.expectEqual(@as(u16, queue_size), r.completed);
+    try std.testing.expectEqual(@as(u64, 4 * queue_size), r.bytes);
     // No advance: zero completions.
     r = drain_delta(4, 4, &ring);
     try std.testing.expectEqual(@as(u16, 0), r.completed);
@@ -1970,34 +2098,31 @@ test "virtio_net: bounded frame FIFO — push, pop, occupancy, drop-oldest" {
     rx_fifo_head = 0;
     rx_fifo_count = 0;
     rx_overflow = 0;
-    const a = @as([10]u8, @splat(@as(u8, 0xaa)));
-    const b = @as([20]u8, @splat(@as(u8, 0xbb)));
-    const c = @as([30]u8, @splat(@as(u8, 0xcc)));
-    const d = @as([40]u8, @splat(@as(u8, 0xdd)));
-    const e = @as([50]u8, @splat(@as(u8, 0xee))); // the overflow frame (drops `a`)
-    try std.testing.expect(fifo_push(&a));
-    try std.testing.expect(fifo_push(&b));
-    try std.testing.expect(fifo_push(&c));
-    try std.testing.expect(fifo_push(&d));
-    try std.testing.expectEqual(@as(usize, 4), fifo_occupancy());
-    // The 5th push overflows: drop-oldest (`a`), newest wins.
-    try std.testing.expect(fifo_push(&e));
-    try std.testing.expectEqual(@as(usize, 4), fifo_occupancy());
+    // Fill all fifo_slots with distinct frames (frame i splat-filled
+    // with byte i), then overflow once: drop-oldest discards frame 0,
+    // the newest wins, and the counter moves.
+    var i: usize = 0;
+    while (i < fifo_slots) : (i += 1) {
+        const f = @as([64]u8, @splat(@as(u8, @intCast(i))));
+        try std.testing.expect(fifo_push(&f));
+    }
+    try std.testing.expectEqual(fifo_slots, fifo_occupancy());
+    const over = @as([64]u8, @splat(@as(u8, 0xee))); // the overflow frame
+    try std.testing.expect(fifo_push(&over));
+    try std.testing.expectEqual(fifo_slots, fifo_occupancy());
     try std.testing.expectEqual(@as(u64, 1), rx_overflow);
-    // Drain order: b, c, d, e (a was dropped).
+    // Drain order: frames 1..fifo_slots-1, then the overflow frame (0 was
+    // dropped). Order and contents are exact.
     var out: [rx_buf_len]u8 = undefined;
-    const lb = fifo_pop_for_test(&out);
-    try std.testing.expectEqual(@as(usize, 20), lb);
-    try std.testing.expectEqualSlices(u8, &b, out[0..lb]);
-    const lc = fifo_pop_for_test(&out);
-    try std.testing.expectEqual(@as(usize, 30), lc);
-    try std.testing.expectEqualSlices(u8, &c, out[0..lc]);
-    const ld = fifo_pop_for_test(&out);
-    try std.testing.expectEqual(@as(usize, 40), ld);
-    try std.testing.expectEqualSlices(u8, &d, out[0..ld]);
-    const le = fifo_pop_for_test(&out);
-    try std.testing.expectEqual(@as(usize, 50), le);
-    try std.testing.expectEqualSlices(u8, &e, out[0..le]);
+    i = 1;
+    while (i < fifo_slots) : (i += 1) {
+        const len = fifo_pop_for_test(&out);
+        try std.testing.expectEqual(@as(usize, 64), len);
+        try std.testing.expectEqualSlices(u8, &@as([64]u8, @splat(@as(u8, @intCast(i)))), out[0..len]);
+    }
+    const lo = fifo_pop_for_test(&out);
+    try std.testing.expectEqual(@as(usize, 64), lo);
+    try std.testing.expectEqualSlices(u8, &over, out[0..lo]);
     try std.testing.expectEqual(@as(usize, 0), fifo_occupancy());
     // An over-size frame is refused (never stored).
     var big: [rx_buf_len + 1]u8 = undefined;
@@ -2021,10 +2146,14 @@ test "virtio_net: RX supply + used-ring drain + filter + FIFO over a mock" {
     rx_bytes = 0;
     rx_filtered = 0;
     rx_overflow = 0;
+    rx_posted_mask = 0;
+    rx_posted = 0;
     rx_armed = false;
     mock_used_idx = 0;
     mock_tx_used_idx = 0;
-    mock_used_len = 0;
+    mock_rx_head = 0;
+    mock_rx_n = 0;
+    mock_rx_seen = 0;
     mock_kicks = 0;
 
     // A delivered frame: the OBSERVED 12-byte virtio_net_hdr (all zero
@@ -2042,19 +2171,23 @@ test "virtio_net: RX supply + used-ring drain + filter + FIFO over a mock" {
     delivered[rx_hdr_len + 13] = 0x00;
     var i: usize = 0;
     while (i < 32) : (i += 1) delivered[rx_hdr_len + 14 + i] = @truncate(i);
-    mock_rx_frame = delivered[0 .. rx_hdr_len + 46]; // header + 46-byte frame
+    mock_rx_enqueue(delivered[0 .. rx_hdr_len + 46]); // header + 46-byte frame
 
-    // Arm: the kick delivers the pending frame into rx_buf and advances
-    // the used ring (device-written len = 58).
+    // Arm: EVERY queue-0 descriptor is posted with its own buffer (M179b)
+    // and the kick delivers the pending frame into rx_bufs[0] — the used
+    // ring advances one element (device-written len = 58).
     try std.testing.expect(net_rx_arm());
     try std.testing.expect(rx_armed);
     try std.testing.expectEqual(@as(u16, 1), mock_kicks);
-    try std.testing.expectEqual(@as(u16, 1), net_dev.rx_avail.idx);
+    try std.testing.expectEqual(@as(u16, queue_size), net_dev.rx_avail.idx);
+    try std.testing.expectEqual(@as(u16, queue_size), rx_posted_depth());
+    try std.testing.expectEqual(@as(u64, queue_size), rx_posted);
 
     // Drain: the completion is accounted, the frame passes the broadcast
     // filter, and lands in the FIFO (raw device-written bytes — header
-    // included). The drain's re-arm re-delivers the same mock frame, so
-    // the FIFO holds one frame and the buffer is re-supplied.
+    // included). The drain's re-arm re-posts descriptor 0, so all
+    // queue_size buffers stay supplied (the pending list is empty — the
+    // re-delivered avail entry is held by the device, not completed).
     net_rx_drain();
     try std.testing.expectEqual(@as(u64, 1), rx_frames);
     try std.testing.expectEqual(@as(u64, 58), rx_bytes);
@@ -2062,12 +2195,14 @@ test "virtio_net: RX supply + used-ring drain + filter + FIFO over a mock" {
     try std.testing.expectEqual(@as(u64, 0), rx_overflow);
     try std.testing.expectEqual(@as(u32, 58), rx_last_len);
     try std.testing.expectEqual(@as(usize, 1), fifo_occupancy());
-    try std.testing.expectEqual(@as(u16, 2), net_dev.rx_avail.idx); // re-armed
+    try std.testing.expectEqual(@as(u16, queue_size + 1), net_dev.rx_avail.idx); // re-armed
+    try std.testing.expectEqual(@as(u16, queue_size), rx_posted_depth());
+    try std.testing.expectEqual(@as(u64, queue_size + 1), rx_posted);
 
     // net recv consumes the FIFO frame: the exact device-written bytes.
     const frame = fifo_peek().?;
     try std.testing.expectEqual(@as(usize, 58), frame.len);
-    try std.testing.expectEqualSlices(u8, mock_rx_frame, frame);
+    try std.testing.expectEqualSlices(u8, delivered[0..58], frame);
     fifo_pop_advance();
     try std.testing.expectEqual(@as(usize, 0), fifo_occupancy());
 
@@ -2095,10 +2230,14 @@ test "virtio_net: RX MAC filter drops a foreign frame (counter, not FIFO)" {
     rx_bytes = 0;
     rx_filtered = 0;
     rx_overflow = 0;
+    rx_posted_mask = 0;
+    rx_posted = 0;
     rx_armed = false;
     mock_used_idx = 0;
     mock_tx_used_idx = 0;
-    mock_used_len = 0;
+    mock_rx_head = 0;
+    mock_rx_n = 0;
+    mock_rx_seen = 0;
     mock_kicks = 0;
 
     // A frame addressed to ANOTHER host (dst 02:00:00:00:00:04): the
@@ -2115,7 +2254,7 @@ test "virtio_net: RX MAC filter drops a foreign frame (counter, not FIFO)" {
     delivered[rx_hdr_len + 13] = 0x00;
     var i: usize = 0;
     while (i < 32) : (i += 1) delivered[rx_hdr_len + 14 + i] = @truncate(i);
-    mock_rx_frame = delivered[0 .. rx_hdr_len + 46];
+    mock_rx_enqueue(delivered[0 .. rx_hdr_len + 46]);
 
     try std.testing.expect(net_rx_arm());
     net_rx_drain();
@@ -2124,6 +2263,82 @@ test "virtio_net: RX MAC filter drops a foreign frame (counter, not FIFO)" {
     try std.testing.expectEqual(@as(usize, 0), fifo_occupancy());
     try std.testing.expectEqual(@as(u32, 58), rx_last_len);
     try std.testing.expectEqualSlices(u8, dst[0..4], rx_first16[12..16]);
+}
+
+test "virtio_net: RX burst — 12 back-to-back frames drain in order, every descriptor re-armed" {
+    const saved_ops = net_ops;
+    net_ops = mock_ops();
+    net_ready = true;
+    defer {
+        net_ops = saved_ops;
+        net_ready = false;
+    }
+    net_dev = .{};
+    net_mac = fallback_mac;
+    rx_fifo_head = 0;
+    rx_fifo_count = 0;
+    rx_frames = 0;
+    rx_bytes = 0;
+    rx_filtered = 0;
+    rx_overflow = 0;
+    rx_posted_mask = 0;
+    rx_posted = 0;
+    rx_armed = false;
+    mock_used_idx = 0;
+    mock_tx_used_idx = 0;
+    mock_rx_head = 0;
+    mock_rx_n = 0;
+    mock_rx_seen = 0;
+    mock_kicks = 0;
+
+    // A 16 KiB window's burst: 12 distinct broadcast frames arrive
+    // back-to-back — the OBSERVED 12-byte virtio_net_hdr + a 46-byte
+    // Ethernet frame each, tagged by index in the first payload byte so
+    // drain order is provable.
+    var backing: [12][rx_hdr_len + 46]u8 = undefined;
+    const dst = [6]u8{ 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
+    const src = [6]u8{ 0x02, 0x00, 0x00, 0x00, 0x00, 0x03 };
+    for (&backing, 0..) |*b, i| {
+        @memset(b, 0);
+        b[10] = 0x01; // virtio_net_hdr num_buffers = 1 (observed)
+        @memcpy(b[rx_hdr_len .. rx_hdr_len + 6], &dst);
+        @memcpy(b[rx_hdr_len + 6 .. rx_hdr_len + 12], &src);
+        b[rx_hdr_len + 12] = 0x08;
+        b[rx_hdr_len + 13] = 0x00;
+        b[rx_hdr_len + 14] = @intCast(i); // the order tag
+        mock_rx_enqueue(b[0..]);
+    }
+
+    // Arm: all queue_size descriptors post with their own buffer; the
+    // single kick fills 12 of them — the device holds the other 4.
+    try std.testing.expect(net_rx_arm());
+    try std.testing.expectEqual(@as(u16, queue_size), net_dev.rx_avail.idx);
+    try std.testing.expectEqual(@as(u16, queue_size), rx_posted_depth());
+    try std.testing.expectEqual(@as(u16, 1), mock_kicks);
+
+    // ONE drain consumes all 12 completions, in used-ring order: every
+    // frame lands in the FIFO (no drop — the M179b bet) and every
+    // consumed descriptor is re-posted.
+    net_rx_drain();
+    try std.testing.expectEqual(@as(u64, 12), rx_frames);
+    try std.testing.expectEqual(@as(u64, 12 * 58), rx_bytes);
+    try std.testing.expectEqual(@as(u64, 0), rx_filtered);
+    try std.testing.expectEqual(@as(u64, 0), rx_overflow);
+    try std.testing.expectEqual(@as(usize, 12), fifo_occupancy());
+    try std.testing.expectEqual(@as(u16, queue_size), rx_posted_depth()); // all re-armed
+    try std.testing.expectEqual(@as(u16, queue_size + 12), net_dev.rx_avail.idx);
+    try std.testing.expectEqual(@as(u64, queue_size + 12), rx_posted);
+
+    // In-order and byte-exact: pop all 12, checking the tag each time.
+    var i: usize = 0;
+    while (i < 12) : (i += 1) {
+        const frame = fifo_peek().?;
+        try std.testing.expectEqual(@as(usize, rx_hdr_len + 46), frame.len);
+        try std.testing.expectEqualSlices(u8, backing[i][0..], frame);
+        try std.testing.expectEqual(@as(u8, @intCast(i)), frame[rx_hdr_len + 14]);
+        fifo_pop_advance();
+    }
+    try std.testing.expectEqual(@as(usize, 0), fifo_occupancy());
 }
 
 test "virtio_net: RX ARP request is answered — byte-exact reply on TX over a mock" {
@@ -2150,10 +2365,14 @@ test "virtio_net: RX ARP request is answered — byte-exact reply on TX over a m
     rx_bytes = 0;
     rx_filtered = 0;
     rx_overflow = 0;
+    rx_posted_mask = 0;
+    rx_posted = 0;
     rx_armed = false;
     mock_used_idx = 0;
     mock_tx_used_idx = 0;
-    mock_used_len = 0;
+    mock_rx_head = 0;
+    mock_rx_n = 0;
+    mock_rx_seen = 0;
     mock_kicks = 0;
 
     // The delivered frame: the OBSERVED 12-byte virtio_net_hdr
@@ -2167,7 +2386,7 @@ test "virtio_net: RX ARP request is answered — byte-exact reply on TX over a m
     var delivered: [rx_buf_len]u8 = @splat(0);
     delivered[10] = 0x01; // virtio_net_hdr num_buffers = 1 (observed)
     @memcpy(delivered[rx_hdr_len .. rx_hdr_len + request.len], &request);
-    mock_rx_frame = delivered[0 .. rx_hdr_len + request.len];
+    mock_rx_enqueue(delivered[0 .. rx_hdr_len + request.len]);
     // Dirty the TX staging header so the reply path's ZEROING is proven
     // (a stale virtio_net_hdr would corrupt the delivered reply).
     @memset(tx_staging[0..tx_hdr_len], 0xab);
@@ -2220,10 +2439,14 @@ test "virtio_net: RX ARP reply is learned into the bounded table" {
     rx_bytes = 0;
     rx_filtered = 0;
     rx_overflow = 0;
+    rx_posted_mask = 0;
+    rx_posted = 0;
     rx_armed = false;
     mock_used_idx = 0;
     mock_tx_used_idx = 0;
-    mock_used_len = 0;
+    mock_rx_head = 0;
+    mock_rx_n = 0;
+    mock_rx_seen = 0;
     mock_kicks = 0;
 
     // M97e-F3 (#2102): an UNSOLICITED reply arrives first — dropped, not
@@ -2235,7 +2458,7 @@ test "virtio_net: RX ARP reply is learned into the bounded table" {
     var delivered: [rx_buf_len]u8 = @splat(0);
     delivered[10] = 0x01;
     @memcpy(delivered[rx_hdr_len .. rx_hdr_len + reply.len], &reply);
-    mock_rx_frame = delivered[0 .. rx_hdr_len + reply.len];
+    mock_rx_enqueue(delivered[0 .. rx_hdr_len + reply.len]);
 
     try std.testing.expect(net_rx_arm());
     net_rx_drain();
@@ -2251,7 +2474,11 @@ test "virtio_net: RX ARP reply is learned into the bounded table" {
     try std.testing.expectEqual(SendResult.ok, net_arp_request(host_ip, &out_len));
     try std.testing.expectEqualSlices(u8, &host_ip, &arp.pending_reply.?);
 
-    try std.testing.expect(net_rx_arm());
+    // M179b: the descriptors all stay posted, so the reply's arrival is
+    // an ASYNC device fill of an already-posted buffer — the mock's
+    // queue-0 kick models it (no new arm is needed or posted).
+    mock_rx_enqueue(delivered[0 .. rx_hdr_len + reply.len]);
+    mock_notify(0);
     net_rx_drain();
 
     try std.testing.expectEqual(@as(u64, 2), rx_frames);
@@ -2282,7 +2509,9 @@ test "virtio_net: net_arp_request resolves the NEXT HOP for an off-subnet target
     }
     mock_used_idx = 0;
     mock_tx_used_idx = 0;
-    mock_used_len = 0;
+    mock_rx_head = 0;
+    mock_rx_n = 0;
+    mock_rx_seen = 0;
     mock_kicks = 0;
 
     // An off-subnet resolve (a public resolver): the wire request asks
@@ -2340,12 +2569,23 @@ var mock_kicks: u16 = 0;
 var mock_used_idx: u16 = 0;
 /// TX used-ring index (queue 1 — the N1 TX completions).
 var mock_tx_used_idx: u16 = 0;
-/// Device-written length of the last RX completion (RX: the frame length —
-/// the TX used-element len was ~0 on VZ; the RX one is the real one).
-var mock_used_len: u32 = 0;
-/// The pending RX frame the fake device "delivers" into `rx_buf` on the
-/// queue-0 kick (host→guest injection over the mock transport).
-var mock_rx_frame: []const u8 = &.{};
+/// The pending RX frames the fake device "delivers" (M179b: one per
+/// posted buffer, a bounded host→guest injection queue over the mock
+/// transport). `mock_rx_seen` counts the queue-0 avail entries the fake
+/// device has already consumed — entries past it are filled on the next
+/// kick while pending frames remain, or stay posted (the real device
+/// holds unconsumed buffers too).
+var mock_rx_pending: [queue_size][]const u8 = undefined;
+var mock_rx_head: usize = 0;
+var mock_rx_n: usize = 0;
+var mock_rx_seen: u16 = 0;
+
+/// Enqueue a frame the fake device delivers to the next posted buffer it
+/// consumes (the bounded host→guest injection queue).
+fn mock_rx_enqueue(frame: []const u8) void {
+    mock_rx_pending[(mock_rx_head + mock_rx_n) % mock_rx_pending.len] = frame;
+    mock_rx_n += 1;
+}
 
 fn mock_dev_read32(off: u32) u32 {
     _ = off;
@@ -2383,25 +2623,24 @@ fn mock_clean(_: usize, _: usize) void {}
 /// real BSS ring.
 fn mock_invalidate(ptr: usize, len: usize) void {
     _ = len;
-    // The driver also invalidates the RX buffer after a device write; the
+    // The driver also invalidates an RX buffer after a device write; the
     // mock has nothing to replay there (mock_notify already copied the
-    // frame in) — and must NOT treat the buffer's bytes as a used ring.
-    if (ptr == @intFromPtr(&rx_buf)) return;
+    // frames in) — and must NOT treat the buffers' bytes as a used ring.
+    for (rx_bufs) |b| {
+        const p = @intFromPtr(b);
+        if (ptr >= p and ptr < p + rx_buf_len) return;
+    }
     const used = @as(*VirtqUsed, @ptrFromInt(ptr));
     // Per-queue used rings, like the real device. The RX ring (the module
     // global — the RX path only ever drains net_dev.rx_used) replays the
-    // RX index + written length; every other used ring (net_dev.tx_used,
-    // or a LOCAL Device in the pure TX test) replays the TX index — the
-    // mock's TX side only ever advances its own index (the ARP reply path
+    // RX index (the used elements themselves were written by mock_notify
+    // at fill time); every other used ring (net_dev.tx_used, or a LOCAL
+    // Device in the pure TX test) replays the TX index — the mock's TX
+    // side only ever advances its own index (the ARP reply path
     // transmits while the RX ring holds a completion, so the two rings
     // must not share an index).
     if (ptr == @intFromPtr(&net_dev.rx_used)) {
-        if (used.idx != mock_used_idx) {
-            used.idx = mock_used_idx;
-            if (mock_used_idx != 0) {
-                used.ring[(used.idx -% 1) % queue_size].len = mock_used_len;
-            }
-        }
+        used.idx = mock_used_idx;
         return;
     }
     if (used.idx != mock_tx_used_idx) used.idx = mock_tx_used_idx;
@@ -2409,12 +2648,22 @@ fn mock_invalidate(ptr: usize, len: usize) void {
 fn mock_notify(q: u16) void {
     mock_kicks +%= 1;
     if (q == 0) {
-        // RX (card N2): the fake device writes the pending frame into the
-        // real `rx_buf` and completes the buffer (used.idx advances with
-        // the WRITTEN length).
-        @memcpy(rx_buf[0..mock_rx_frame.len], mock_rx_frame);
-        mock_used_len = @intCast(mock_rx_frame.len);
-        mock_used_idx +%= 1;
+        // RX (card N2, M179b): the fake device consumes newly-posted
+        // avail entries in order, writing one pending frame into each
+        // buffer's own rx_bufs[desc] and completing it (used.idx advances
+        // with the WRITTEN length + the consumed descriptor's id). An
+        // empty pending list leaves the rest posted — the real device
+        // holds unconsumed buffers the same way.
+        while (mock_rx_seen != net_dev.rx_avail.idx and mock_rx_n > 0) {
+            const desc = net_dev.rx_avail.ring[mock_rx_seen % queue_size];
+            mock_rx_seen +%= 1;
+            const frame = mock_rx_pending[mock_rx_head];
+            mock_rx_head = (mock_rx_head + 1) % mock_rx_pending.len;
+            mock_rx_n -= 1;
+            @memcpy(rx_bufs[desc][0..frame.len], frame);
+            net_dev.rx_used.ring[mock_used_idx % queue_size] = .{ .id = desc, .len = @intCast(frame.len) };
+            mock_used_idx +%= 1;
+        }
     } else {
         // TX: the device writes nothing (the N1 observation); the TX used
         // index advances on the kick (the device consumed the request).
