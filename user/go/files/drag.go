@@ -8,6 +8,8 @@
 package main
 
 import (
+	"strings"
+
 	"virelai/mime"
 	"virelai/vi"
 )
@@ -69,6 +71,17 @@ func (m *model) dragOffer() (mt string, blob []byte, ok bool) {
 func fileMime(name string, head []byte) string {
 	switch mime.Sniff(name, head) {
 	case mime.Text:
+		// M187d (#3185): the two text subtypes the opens= vocabulary
+		// routes by name — a calendar feeds GOCLOCK's import, a
+		// contact card opens in this app. Both are extension-named
+		// (the formats carry no magic bytes), exactly like the exts
+		// table's own fallback.
+		switch extOf(name) {
+		case "ics":
+			return "text/calendar"
+		case "vcf":
+			return "text/vcard"
+		}
 		return "text/plain"
 	case mime.Image:
 		switch {
@@ -90,4 +103,15 @@ func fileMime(name string, head []byte) string {
 		return "binary"
 	}
 	return "application/octet-stream"
+}
+
+// extOf is the lower-case extension a subtype spelling routes on — the
+// same rule mime's own byExt applies (no dot, or a leading dot only, is
+// no extension).
+func extOf(name string) string {
+	i := strings.LastIndexByte(name, '.')
+	if i <= 0 || i == len(name)-1 {
+		return ""
+	}
+	return strings.ToLower(name[i+1:])
 }

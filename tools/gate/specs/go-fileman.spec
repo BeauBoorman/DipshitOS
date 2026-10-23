@@ -89,7 +89,7 @@
 # app's own marker; an app that never ran, never renamed, never settled or
 # never refused cannot pass.
 
-vgate_name go-fileman "M74a + M81a #1761 + M125c #2588 + M124b #2581 + M124d #2583 + M134b #2760 + M149a #2806 + M155a #2929 + M155b #2930 + M155c #2931 + M155d #2932 + M167a #2989 + M167b #2992 + M167c #2993 + M160c #2994: GOFILES navigates, previews, renames, trashes, restores, opens files, picks paths, resumes its session, opens with the right-click menu, lists the kernel mount table, spacebar-QuickLooks image and text, answers file properties with its ctime, birth, on-disk bytes and volume free facts, batch-moves and batch-deletes a marked set, and content-searches a seeded subtree within bounds, and runs the props + batch-move + search journey three times over, and toggles a thumbnail grid of cell-mosaic tiles with the focused image as a real sixel, and pins folders into FILES.FAV favorites that list with gone pins named missing, and browses a .tar in place as a read-only virtual directory with QuickLook on its members"
+vgate_name go-fileman "M74a + M81a #1761 + M125c #2588 + M124b #2581 + M124d #2583 + M134b #2760 + M149a #2806 + M155a #2929 + M155b #2930 + M155c #2931 + M155d #2932 + M167a #2989 + M167b #2992 + M167c #2993 + M160c #2994: GOFILES navigates, previews, renames, trashes, restores, opens files, picks paths, resumes its session, opens with the right-click menu, lists the kernel mount table, spacebar-QuickLooks image and text, answers file properties with its ctime, birth, on-disk bytes and volume free facts, batch-moves and batch-deletes a marked set, and content-searches a seeded subtree within bounds, and runs the props + batch-move + search journey three times over, and toggles a thumbnail grid of cell-mosaic tiles with the focused image as a real sixel, and pins folders into FILES.FAV favorites that list with gone pins named missing, and browses a .tar in place as a read-only virtual directory with QuickLook on its members, and (M187d #3185) routes a .vcf through the opens=text/vcard manifest row into the contact-card face"
 vgate_share seed
 vgate_runner_flags -Xswiftc -DSPIKE
 
@@ -2313,3 +2313,78 @@ print("FMD3 verified: M1..M3 moved into INTO byte-exact; " +
       "props facts ctime=" + m.group(1) +
       " alloc=" + m.group(2) + " free=" + m.group(3))
 PY
+
+# --- M187d (#3185): run 21 — the .vcf contact card via Open With ----------
+# GOFILES in /host/FMV on the kernel desktop (the run 01–10 shape),
+# right-click CONTACT.VCF, descend "Open With…". The manifest's opens=
+# rows decide the submenu: text/vcard is accepted by the bare text
+# family (NOTE, GOEDIT, GOSHEET) AND by GOFILES's own opens=text/vcard
+# subtype row — four candidates, the manager itself at row 2. Picking it
+# execs the opens= route's line (`GOFILES.ELF <path>.vcf`), whose argv
+# face parses the VCARD and prints the contact rows on serial — a
+# details face like `vol`, never a window. The pointer clicks mirror
+# run 10's: same window origin, same list row, the submenu row one step
+# deeper (GOFILES sits under GOEDIT in manifest order).
+vgate_setup_python <<'PY'
+import os
+share = os.environ.get("VG_SHARE") or os.path.join(os.environ["RUN_DIR"], "share")
+fmv = os.path.join(share, "FMV")
+os.makedirs(fmv, exist_ok=True)
+with open(os.path.join(fmv, "CONTACT.VCF"), "w", newline="") as f:
+    f.write("\r\n".join([
+        "BEGIN:VCARD",
+        "VERSION:4.0",
+        "FN:Grace Hopper",
+        "ORG:Cognition",
+        "TEL;TYPE=cell:+1-555-0100",
+        "EMAIL:grace@example.com",
+        "END:VCARD",
+        ""]))
+print("staged FMV/CONTACT.VCF")
+PY
+
+vgate_file script-21.txt <<'EOF'
+exec GOFILES.ELF /host/FMV
+EOF
+
+vgate_file script3-21.txt <<'EOF'
+dui close 2
+echo rx-go-fileman-contact-ok
+EOF
+
+vgate_run 21 -- \
+    --screen '$RUN_DIR/fileman-contact-screen' \
+    --via-virtio \
+    --script '$RUN_DIR/script-21.txt' \
+    --pointer-virtio '40,88,rc;68,104,c;172,136,c' \
+    --pointer-virtio-after 'gofiles: ready' \
+    --script3 '$RUN_DIR/script3-21.txt' \
+    --script3-after 'gofiles: contact done cards=1' \
+    --script-expect 'rx-go-fileman-contact-ok' --timeout 300
+
+vgate_assert 21 serial-contains 'exec: loaded GOFILES.ELF'
+vgate_assert 21 serial-contains 'gofiles: list /host/FMV n=1'
+vgate_assert 21 serial-contains 'gofiles: entry CONTACT.VCF file'
+
+# The menu read the subtype spelling and the manifest rows: the bare
+# text family plus the new text/vcard row — four candidates.
+vgate_assert 21 serial-contains 'gofiles: menu CONTACT.VCF mime=text/vcard apps=4'
+vgate_assert 21 serial-contains 'gofiles: menu openwith CONTACT.VCF mime=text/vcard candidates=4'
+
+# The pick and the launch: the decision/outcome marker pair, and the
+# launched GOFILES's own argv face printing the card's fields.
+vgate_assert 21 serial-contains 'gofiles: open chose CONTACT.VCF type=text handler=GOFILES.ELF'
+vgate_assert 21 serial-contains 'gofiles: open launched CONTACT.VCF handler=GOFILES.ELF pid='
+vgate_assert 21 serial-contains 'gofiles: contact fn=Grace Hopper'
+vgate_assert 21 serial-contains 'gofiles: contact org=Cognition'
+vgate_assert 21 serial-contains 'gofiles: contact tel=+1-555-0100'
+vgate_assert 21 serial-contains 'gofiles: contact email=grace@example.com'
+vgate_assert 21 serial-contains 'gofiles: contact done cards=1'
+
+vgate_assert 21 serial-contains 'dui close: closed=2'
+vgate_assert 21 serial-contains 'rx-go-fileman-contact-ok'
+vgate_assert 21 serial-absent 'gofiles: open launch refused'
+vgate_assert 21 serial-absent 'gofiles: menu closed'
+vgate_assert 21 serial-absent 'gofiles: contact refused'
+vgate_assert 21 serial-absent '[EXC] parking:'
+vgate_assert 21 serial-absent 'exited status=139'

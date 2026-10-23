@@ -22,6 +22,7 @@ import (
 
 	"virelai/rss/keys"
 	"virelai/tabapp"
+	"virelai/vcard"
 	"virelai/vi"
 )
 
@@ -32,6 +33,10 @@ const (
 	natH     = 384
 
 	ttyPath = "/dev/tty"
+
+	// markerContact is the M187d (#3185) contact-card face's marker
+	// family — `gofiles: contact fn=…` rows, one per honoured field.
+	markerContact = "gofiles: contact "
 )
 
 // paint writes one frame into the bound tty. A tty write marks the window
@@ -198,6 +203,13 @@ func main() {
 			return
 		}
 	}
+	// M187d (#3185): the opens=text/vcard exec line hands the .vcf path
+	// itself — the contact card is a serial face like `vol`, not a
+	// window. A directory arg still opens the TUI; a .vcf arg never
+	// reaches the model.
+	if isVCFPath(arg.dir) {
+		runContact(arg.dir)
+	}
 	// M125c (#2588): the state hooks. SaveState reads the live model (the
 	// closure captures the variable, so an ask always serializes the
 	// current session) and prints its own marker — a save is an action,
@@ -216,10 +228,17 @@ func main() {
 		},
 		// M124a-2 (#2677): the drag source. A held move off a pressed row
 		// calls BeginDrag; the seat calls DragSource for the payload and
-		// reports the outcome back through DragEnd. GOFILES is a source
-		// only — nothing opens= it, so DropTarget stays nil.
+		// reports the outcome back through DragEnd.
 		DragSource: func() (string, []byte, bool) {
 			return m.dragOffer()
+		},
+		// M187d (#3185): the target half of opens=text/vcard — a .vcf
+		// dropped on the window parses where it lands and prints the
+		// same contact rows the argv face does. The repaint rides
+		// dropFresh: PollDrag runs mid-loop, so the frame + flush are
+		// the loop's to order.
+		DropTarget: func(offer tabapp.DragOffer) {
+			m.dropContact(offer)
 		},
 		DragEnd: func(delivered bool, peer uint32) {
 			m.dragOn = false
@@ -347,7 +366,18 @@ func main() {
 	for {
 		// M124a-2: seat drag frames for this window — the DragEnd receipt
 		// or cancel lands here, one poll per loop turn like StateAsk.
+		// M187d: a delivered .vcf runs DropTarget — its markers flush
+		// behind the one repaint the landing earns (dropFresh).
 		ta.PollDrag()
+		if dropFresh {
+			dropFresh = false
+			if !paint(fd, m) {
+				shutdown(ta, fd, 4)
+			}
+			vi.Sleep(1)
+			flush(&m, ta)
+			vi.ConsoleLine(markerRepaint)
+		}
 
 		// Keys and mouse reports: the tty read is non-blocking (0 when
 		// the queue is empty).
@@ -790,4 +820,130 @@ func runVol() {
 	}
 	vi.ConsoleLine("gofiles: vol create=mkfs.vlfs--seal unlock=boot-passphrase-prompt")
 	vi.Exit(0)
+}
+
+// --- .vcf contact card (M187d #3185) ----------------------------------------
+//
+// One face, two doors. The argv face (`exec GOFILES.ELF <path>.vcf` —
+// the opens=text/vcard exec line the Open-With submenu and the seat's
+// drop admission both produce) prints the card's honoured fields and
+// exits, the `vol` precedent; a drop delivered mid-session prints the
+// same rows through the model's pending queue so they flush behind a
+// painted frame like every other receipt. vcard.Parse owns the bound —
+// this file owns only the serial shape.
+//
+// Field values pass sanitizePreview so a hostile FN cannot smuggle
+// escape bytes into a serial line (the preview pane's own rule); a
+// literal newline in a field would read as '·' noise, so it maps to a
+// space first.
+
+// dropFresh latches "a .vcf landed this pass" — the loop repaints and
+// flushes once after PollDrag rather than per field row.
+var dropFresh bool
+
+// maxContactBytes bounds the .vcf read — one contact file is a few
+// hundred bytes; the cap is the honest too-large boundary.
+const maxContactBytes = 64 * 1024
+
+// isVCFPath is the argv face's admission: the opens= route hands a
+// .vcf path, and the extension is what the route matched on. A
+// directory named *.vcf reads as a parse refusal, not a listing — the
+// same refusal any non-vcard file gets.
+func isVCFPath(p string) bool {
+	return strings.HasSuffix(strings.ToLower(p), ".vcf")
+}
+
+// runContact is the verb's whole life: read, parse, print the card's
+// rows, exit — the markers ARE the face.
+func runContact(path string) {
+	b, rc := readHead(path, maxContactBytes)
+	if rc < 0 {
+		vi.ConsoleLine(markerContact + "refused read rc=" + vi.Itoa64(rc))
+		vi.Exit(2)
+	}
+	res, ok := vcard.Parse(b)
+	if !ok {
+		vi.ConsoleLine(markerContact + "refused not-vcard")
+		vi.Exit(2)
+	}
+	printContactResult(res)
+	if len(res.Cards) == 0 {
+		vi.Exit(2)
+	}
+	vi.Exit(0)
+}
+
+// printContactResult emits one card's worth of rows per honoured
+// VCARD, then the refusals and the receipt. The caller decides the
+// exit: the verb exits non-zero when nothing landed, the drop face
+// just reports.
+func printContactResult(res vcard.Result) {
+	for _, c := range res.Cards {
+		vi.ConsoleLine(markerContact + "fn=" + contactField(c.FN))
+		if c.ORG != "" {
+			vi.ConsoleLine(markerContact + "org=" + contactField(c.ORG))
+		}
+		for _, t := range c.TEL {
+			vi.ConsoleLine(markerContact + "tel=" + contactField(t))
+		}
+		for _, e := range c.EMAIL {
+			vi.ConsoleLine(markerContact + "email=" + contactField(e))
+		}
+	}
+	for _, rf := range res.Refusals {
+		vi.ConsoleLine(markerContact + "refused " + rf.Why)
+	}
+	if over := res.Total - len(res.Cards) - len(res.Refusals); over > 0 {
+		vi.ConsoleLine(markerContact + "truncated n=" + vi.Itoa64(int64(over)))
+	}
+	vi.ConsoleLine(markerContact + "done cards=" + vi.Itoa64(int64(len(res.Cards))))
+}
+
+// dropContact is the DropTarget hook: the seat's opens= admission
+// already filtered the mime to text/vcard, so the payload parses where
+// it lands. The rows ride pending so they flush behind the repaint
+// dropFresh earns.
+func (m *model) dropContact(offer tabapp.DragOffer) {
+	dropFresh = true
+	if offer.Blob == nil {
+		m.emit(markerContact + "refused no-payload")
+		m.status = "drop: no payload"
+		return
+	}
+	res, ok := vcard.Parse(offer.Blob)
+	if !ok {
+		m.emit(markerContact + "refused not-vcard")
+		m.status = "drop: not a vcard"
+		return
+	}
+	for _, c := range res.Cards {
+		m.emit(markerContact + "fn=" + contactField(c.FN))
+		if c.ORG != "" {
+			m.emit(markerContact + "org=" + contactField(c.ORG))
+		}
+		for _, t := range c.TEL {
+			m.emit(markerContact + "tel=" + contactField(t))
+		}
+		for _, e := range c.EMAIL {
+			m.emit(markerContact + "email=" + contactField(e))
+		}
+	}
+	for _, rf := range res.Refusals {
+		m.emit(markerContact + "refused " + rf.Why)
+	}
+	if over := res.Total - len(res.Cards) - len(res.Refusals); over > 0 {
+		m.emit(markerContact + "truncated n=" + vi.Itoa64(int64(over)))
+	}
+	m.emit(markerContact + "done cards=" + vi.Itoa64(int64(len(res.Cards))))
+	if len(res.Cards) > 0 {
+		m.status = "contact: " + contactField(res.Cards[0].FN)
+	} else {
+		m.status = "contact: no card landed"
+	}
+}
+
+// contactField is the marker-safe form of one card field: sanitized
+// like a preview line, flattened to one line.
+func contactField(s string) string {
+	return strings.ReplaceAll(sanitizePreview([]byte(s)), "\n", " ")
 }

@@ -32,7 +32,7 @@
 GOCALC.ELF | 64-bit Calc | c | dock=true
 NOTE.ELF | Text Editor | n | dock=true | v=2 | opens=text
 GOEDIT.ELF | Code Editor | e | dock=true | v=2 | opens=text,binary | selection=primary
-GOFILES.ELF | Files | f | dock=true | v=2 | caps=file,window
+GOFILES.ELF | Files | f | dock=true | v=2 | caps=file,window | opens=text/vcard
 GOTERM.ELF | Terminal | t | dock=true | v=2 | selection=primary
 WEB.ELF | Web | w | dock=true | v=2 | caps=net | opens=http,https
 PULSE.ELF | Pulse | u | dock=true
@@ -52,7 +52,7 @@ GOSNAP.ELF | Snapshots | b | dock=false | v=2 | caps=file
 GOASSIST.ELF | Assistant | y | dock=false | v=2 | caps=file,window
 GOSHEET.ELF | Sheet | x | dock=false | v=2 | caps=file,window | opens=text
 GOREADER.ELF | Reader | d | dock=false | v=2 | caps=file,window | opens=document
-GOCLOCK.ELF | Clock | k | dock=false | v=2 | caps=window,timer
+GOCLOCK.ELF | Clock | k | dock=false | v=2 | caps=file,window,timer | opens=text/calendar
 GOMINE.ELF | Mines | j | dock=false | v=2 | caps=window,audio
 GOSOL.ELF | Solitaire | q | dock=false | v=2 | caps=window,audio
 GOEMOJI.ELF | Emoji | : | dock=false | v=2 | caps=window

@@ -65,6 +65,12 @@
 #           GOCLOCK — both rows come back (`goclock: alarm restored
 #           HH:MM daily|once`), the daily one armed to ring again. Tail
 #           cleanup leaves the share empty for the next iteration.
+#   run 11  M187d (#3185) import leg: `exec GOCLOCK.ELF import
+#           /host/MEET.ICS` runs the headless verb — two VEVENTs land as
+#           gocal2 rows (a once 14:30 and a FREQ=DAILY 09:00), an
+#           all-day and a FREQ=WEEKLY event name their refusals, then a
+#           plain `exec GOCLOCK.ELF` reopens the app and the `alarm
+#           restored` markers prove the rows survived reopen.
 #
 # HOST PREREQUISITES (the gate fails honestly when missing):
 #   bash tools/go/build-goclock.sh  ->  .build/go/GOCLOCK.ELF
@@ -74,7 +80,7 @@
 # exec-order: assert-proven -- each run ends on a marker only its own
 # stage chain can produce.
 
-vgate_name go-clock "issue #2794 M144a + #2795 M144b + #2916 M152b: GOCLOCK.ELF — world clock, stopwatch, timer, alarm->toast over one multiplexed kernel timer; the gocal2 alarm list (up to 7, once/daily, toggled) persists through save_state + its own share file, gocal1 still reads, late-fire on start"
+vgate_name go-clock "issue #2794 M144a + #2795 M144b + #2916 M152b + #3185 M187d: GOCLOCK.ELF — world clock, stopwatch, timer, alarm->toast over one multiplexed kernel timer; the gocal2 alarm list (up to 7, once/daily, toggled) persists through save_state + its own share file, gocal1 still reads, late-fire on start; the .ics import verb lands VEVENTs into the same store"
 vgate_share seed
 vgate_runner_flags -Xswiftc -DSPIKE
 vgate_repeat 3 BOOTS
@@ -1183,3 +1189,101 @@ if not matched:
              % (len(frames), epoch, decoded, expected(epoch)))
 print("world row 0 = %r (epoch ~%d, %s)" % (want or decoded, epoch, "matched"))
 PY
+
+# --- run 11 (M187d #3185): the .ics import verb + reopen ---------------------
+# The headless half of opens=text/calendar: `exec GOCLOCK.ELF import
+# <path>` merges a VCALENDAR into the persisted gocal2 store and exits
+# before a window exists — the markers ARE the face. MEET.ICS is staged
+# at setup with four VEVENTs across the bound: two land (a UTC-stamped
+# once and a FREQ=DAILY), and two name their refusals (VALUE=DATE
+# all-day, FREQ=WEEKLY — recurring-beyond-daily). A second exec opens
+# the app windowed: the `alarm restored` markers prove the merged rows
+# survived reopen — the file is the always-current half, so a fresh
+# process reads exactly what the verb wrote. The boot script cleans
+# GOCLOCK.ALARM + SESSION.TABS first, which is what makes the leg
+# vgate_repeat-safe.
+vgate_setup_python <<'PY'
+import os, sys
+share = os.environ.get("VG_SHARE") or os.path.join(os.environ["RUN_DIR"], "share")
+ics = "\r\n".join([
+    "BEGIN:VCALENDAR",
+    "VERSION:2.0",
+    "PRODID:-//VirelaiOS//M187d//EN",
+    "BEGIN:VEVENT",
+    "UID:meet-1@virelai",
+    "DTSTAMP:20261022T120000Z",
+    "DTSTART:20270615T143000Z",
+    "DTEND:20270615T153000Z",
+    "SUMMARY:Quarterly sync",
+    "END:VEVENT",
+    "BEGIN:VEVENT",
+    "UID:standup@virelai",
+    "DTSTAMP:20261022T120000Z",
+    "DTSTART:20270616T090000Z",
+    "SUMMARY:Daily standup",
+    "RRULE:FREQ=DAILY",
+    "END:VEVENT",
+    "BEGIN:VEVENT",
+    "UID:allday@virelai",
+    "DTSTART;VALUE=DATE:20270617",
+    "SUMMARY:All-day thing",
+    "END:VEVENT",
+    "BEGIN:VEVENT",
+    "UID:weekly@virelai",
+    "DTSTART:20270618T100000Z",
+    "SUMMARY:Weekly sync",
+    "RRULE:FREQ=WEEKLY",
+    "END:VEVENT",
+    "END:VCALENDAR",
+    ""])
+p = os.path.join(share, "MEET.ICS")
+with open(p, "w", newline="") as f:
+    f.write(ics)
+print("staged MEET.ICS (%d bytes)" % os.path.getsize(p))
+PY
+
+vgate_file script-11.txt <<'EOF'
+vf rm SESSION.TABS
+vf rm GOCLOCK.ALARM
+echo rx-goclock-11-boot
+EOF
+
+vgate_file script2-11.txt <<'EOF'
+exec GOCLOCK.ELF import /host/MEET.ICS
+EOF
+
+vgate_file script3-11.txt <<'EOF'
+exec GOCLOCK.ELF
+EOF
+
+vgate_run 11 -- \
+    --screen '$RUN_DIR/screen-11' \
+    --via-virtio \
+    --script '$RUN_DIR/script-11.txt' \
+    --script2 '$RUN_DIR/script2-11.txt' \
+    --script2-after 'gotabwm: mode live' \
+    --script3 '$RUN_DIR/script3-11.txt' \
+    --script3-after 'goclock: import done' \
+    --script-expect 'goclock: alarm restored 09:00 daily' --timeout 300
+
+vgate_assert 11 serial-contains 'exec: loaded GOCLOCK.ELF'
+# The verb's verdicts, in file order: two rows landed, two named
+# refusals — all-day (VALUE=DATE) and recurring-beyond-daily (WEEKLY).
+vgate_assert 11 serial-contains 'goclock: import 14:30 once Quarterly sync'
+vgate_assert 11 serial-contains 'goclock: import 09:00 daily Daily standup'
+vgate_assert 11 serial-contains 'goclock: import refused all-day'
+vgate_assert 11 serial-contains 'goclock: import refused rrule'
+vgate_assert 11 serial-contains 'goclock: alarm saved'
+vgate_assert 11 serial-contains 'goclock: import done added=2 refused=2'
+# The reopened app restored both imported rows from the share file —
+# the "survives reopen" half of the card's leg.
+vgate_assert 11 serial-contains 'goclock: alarm restored 14:30 once'
+vgate_assert 11 serial-contains 'goclock: alarm restored 09:00 daily'
+# Byte-level on the share: the gocal2 list IS the two imported events —
+# the Z stamps resolved to their UTC epochs, the civil fields are UTC.
+vgate_assert 11 share-contains 'GOCLOCK.ALARM' 'gocal2 2 1813069800 1430 o+ 1813136400 0900 d+'
+# No imported deadline fires inside the leg — both instants are 2027.
+vgate_assert 11 serial-absent 'goclock: fired alarm'
+vgate_assert 11 serial-absent 'goclock: alarm file bad'
+vgate_assert 11 serial-absent '[EXC] parking:'
+vgate_assert 11 serial-absent 'exited status=139'
