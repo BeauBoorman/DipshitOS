@@ -14,8 +14,8 @@ test_component_registry.py) it fails when:
     row;
   * a `date` cell is not ISO-8601 `YYYY-MM-DD` (`—` is allowed, but only
     when `last refresh` is `—` too — an untracked row);
-  * a `last refresh` cell is neither `—` nor card tokens (`MnnnX`,
-    `#issue`).
+  * a `last refresh` cell is neither `—` nor whitespace-separated card
+    tokens (`Mnnnx` or `#issue` each).
 
 As a script — `python3 tools/tests/test_app_refresh.py --stale` — it
 prints the table oldest-first for wave filers (`—` dates sort oldest).
@@ -32,7 +32,7 @@ ROOT = Path(__file__).resolve().parents[2]
 LEDGER = ROOT / "docs/app-refresh.md"
 APPS_TXT = ROOT / "image/apps.txt"
 
-REF_TOKEN_RE = re.compile(r"^(?:M[0-9A-Za-z]+|#\d+)$")
+REF_TOKEN_RE = re.compile(r"^(?:M\d+[a-z]|#\d+)$")
 EPOCH = date.min
 
 
@@ -98,7 +98,7 @@ class TestAppRefresh(unittest.TestCase):
                 if bad:
                     fails.append(
                         f"{where}: last-refresh token(s) {bad} not in "
-                        "grammar (MnnnX or #issue)"
+                        "grammar (Mnnnx or #issue)"
                     )
             d = parse_date(dt)
             if d is None:
