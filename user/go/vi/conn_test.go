@@ -33,19 +33,21 @@ type connFake struct {
 	sendRC       int64
 
 	// slot-80 table.
-	mu           sync.Mutex // serializes op calls for concurrent dials
-	opLog        []int      // every op seen, in order
-	sockGen      uint64     // handle allocator (gen<<4|slot)
-	socks        map[uint64]*fSock
-	connectErr   int64 // fixed op-10 refusal when set
-	listenErr    int64 // op-0 refusal
-	readyScript  func(h uint64, call int) int64
-	readyCalls   int
-	readScript   func(h uint64, call int) ([]byte, int64)
-	sockSendRC   int64
-	sockSendErr  map[uint64]int64 // per-handle send refusal
-	op10Calls    int
-	op12Rows     []SocketRow
+	mu          sync.Mutex // serializes op calls for concurrent dials
+	opLog       []int      // every op seen, in order
+	sockGen     uint64     // handle allocator (gen<<4|slot)
+	socks       map[uint64]*fSock
+	connectErr  int64 // fixed op-10 refusal when set
+	listenErr   int64 // op-0 refusal
+	readyScript func(h uint64, call int) int64
+	readyCalls  int
+	readScript  func(h uint64, call int) ([]byte, int64)
+	sockSendRC  int64
+	sockSendErr map[uint64]int64 // per-handle send refusal
+	op10Calls   int
+	op10A1      uintptr  // the last connect's args[1] (ipv4Word or familyV6Tag)
+	op10Addr    [16]byte // the last connect's copy-in target when tagged v6
+	op12Rows    []SocketRow
 }
 
 // fSock is one scripted table socket.
@@ -92,6 +94,10 @@ func (f *connFake) sock(op int, a1, a2, a3 uintptr) int64 {
 		return int64(f.mintListener())
 	case SockOpConnect:
 		f.op10Calls++
+		f.op10A1 = a1
+		if a1 == familyV6Tag {
+			copy(f.op10Addr[:], hookBytes(a3, 16))
+		}
 		if f.connectErr != 0 {
 			return f.connectErr
 		}
@@ -344,13 +350,12 @@ func TestDial_ZeroGuards(t *testing.T) {
 	}
 }
 
-func TestDial_NameResolvesThenConnects(t *testing.T) {
-	// A name dials the RESOLVED address: the DNS seam runs first (the fake
-	// answers myhost.local -> 10.0.0.2), then op 10 carries the octets.
+// dialNameFakes wires a dnsFake and a connFake under one hook pair —
+// the name path's two seams (the DNS transaction on the UDP slots, the
+// connect marshal on slot 80).
+func dialNameFakes(t *testing.T) (*dnsFake, *connFake) {
+	t.Helper()
 	dns := &dnsFake{bound: map[uint16]bool{}, recvPer: map[uint16]int{}}
-	dns.recvScript = func(port uint16, call int) []byte {
-		return dgram(dns, dnsReplyFor(dns.sentQuery, [4]byte{10, 0, 0, 2}))
-	}
 	f := &connFake{}
 	prev := SetSyscallHookForTest(func(num uintptr, a0, a1, a2, a3 uintptr) int64 {
 		if num == SlotSocket {
@@ -359,10 +364,19 @@ func TestDial_NameResolvesThenConnects(t *testing.T) {
 		return dns.hook(num, a0, a1, a2, a3)
 	})
 	prev6 := SetSyscallHook6ForTest(dns.hook6)
-	defer SetSyscallHookForTest(prev)
-	defer SetSyscallHook6ForTest(prev6)
+	t.Cleanup(func() { SetSyscallHookForTest(prev) })
+	t.Cleanup(func() { SetSyscallHook6ForTest(prev6) })
 	t.Cleanup(resetDNSCacheForTest)
+	return dns, f
+}
 
+func TestDial_NameResolvesThenConnects(t *testing.T) {
+	// A name dials the RESOLVED address: the DNS seam runs first (the fake
+	// answers myhost.local -> 10.0.0.2), then op 10 carries the octets.
+	dns, f := dialNameFakes(t)
+	dns.recvScript = func(port uint16, call int) []byte {
+		return dgram(dns, dnsReplyFor(dns.sentQuery, [4]byte{10, 0, 0, 2}))
+	}
 	c, err := Dial("myhost.local", 8080)
 	if err != nil {
 		t.Fatalf("Dial by name: %v", err)
@@ -370,30 +384,152 @@ func TestDial_NameResolvesThenConnects(t *testing.T) {
 	if f.op10Calls != 1 || c.IP() != [4]byte{10, 0, 0, 2} {
 		t.Fatalf("resolved dial = %d calls, peer %v", f.op10Calls, c.IP())
 	}
+	// v4-first ordering: one A question, no AAAA question — an
+	// A-answering name behaves exactly as before.
+	if len(dns.sentQTypes) != 1 || dns.sentQTypes[0] != DNSQueryA {
+		t.Fatalf("queries = %v, want exactly one A", dns.sentQTypes)
+	}
 }
 
 func TestDial_DNSResolvingToZeroRefused(t *testing.T) {
-	dns := &dnsFake{bound: map[uint16]bool{}, recvPer: map[uint16]int{}}
+	// The passive-open answer is undialable, so the name earns its AAAA
+	// question first (M184a); the fake answers that with an A record —
+	// nothing dialable in either family — and the refusal stays named.
+	dns, f := dialNameFakes(t)
 	dns.recvScript = func(port uint16, call int) []byte {
 		return dgram(dns, dnsReplyFor(dns.sentQuery, [4]byte{0, 0, 0, 0}))
 	}
-	f := &connFake{}
-	prev := SetSyscallHookForTest(func(num uintptr, a0, a1, a2, a3 uintptr) int64 {
-		if num == SlotSocket {
-			return f.hook(num, a0, a1, a2, a3)
-		}
-		return dns.hook(num, a0, a1, a2, a3)
-	})
-	prev6 := SetSyscallHook6ForTest(dns.hook6)
-	defer SetSyscallHookForTest(prev)
-	defer SetSyscallHook6ForTest(prev6)
-	t.Cleanup(resetDNSCacheForTest)
-
 	if _, err := Dial("zero.host", 8080); !errors.Is(err, ErrServerDial) {
 		t.Fatalf("Dial of a name resolving to 0.0.0.0 = %v, want ErrServerDial", err)
 	}
 	if f.op10Calls != 0 {
 		t.Fatal("the resolved zero address reached op 10")
+	}
+	if len(dns.sentQTypes) != 2 || dns.sentQTypes[0] != DNSQueryA || dns.sentQTypes[1] != DNSQueryAAAA {
+		t.Fatalf("queries = %v, want A then AAAA", dns.sentQTypes)
+	}
+}
+
+func TestDial_NameAAAAOnlyDialsV6(t *testing.T) {
+	// The card's bet: a name whose only record is AAAA. A comes back
+	// NODATA, AAAA carries the peer, and op 10 gets the tagged marshal
+	// the literal v6 path uses.
+	dns, f := dialNameFakes(t)
+	want := [16]byte{0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0xff, 0xfe, 0x00, 0x02}
+	dns.recvScript = func(port uint16, call int) []byte {
+		if queryQType(dns.sentQuery) == DNSQueryAAAA {
+			return dgram(dns, dnsReplyAAAA(dns.sentQuery, want))
+		}
+		return dgram(dns, dnsNODATA(dns.sentQuery))
+	}
+	c, err := Dial("v6only.example", 8080)
+	if err != nil {
+		t.Fatalf("Dial AAAA-only name: %v", err)
+	}
+	if !c.IsV6() || c.IP6() != want || c.Port() != 8080 {
+		t.Fatalf("conn = v6:%v ip6:%v port:%d, want v6 %v:8080", c.IsV6(), c.IP6(), c.Port(), want)
+	}
+	if f.op10Calls != 1 || f.op10A1 != familyV6Tag || f.op10Addr != want {
+		t.Fatalf("op10 = %d calls a1=%#x addr=%v, want the tagged v6 marshal",
+			f.op10Calls, f.op10A1, f.op10Addr)
+	}
+	if len(dns.sentQTypes) != 2 || dns.sentQTypes[0] != DNSQueryA || dns.sentQTypes[1] != DNSQueryAAAA {
+		t.Fatalf("queries = %v, want A then AAAA", dns.sentQTypes)
+	}
+}
+
+func TestDial_NameZeroAFallsToAAAA(t *testing.T) {
+	// An A answer of nothing but the passive-open zero is NODATA's
+	// practical twin: the name gets its AAAA question before the
+	// refusal — and here the AAAA answer dials.
+	dns, f := dialNameFakes(t)
+	want := [16]byte{0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x53}
+	dns.recvScript = func(port uint16, call int) []byte {
+		if queryQType(dns.sentQuery) == DNSQueryAAAA {
+			return dgram(dns, dnsReplyAAAA(dns.sentQuery, want))
+		}
+		return dgram(dns, dnsReplyFor(dns.sentQuery, [4]byte{0, 0, 0, 0}))
+	}
+	c, err := Dial("zeroa.example", 8080)
+	if err != nil || !c.IsV6() || c.IP6() != want {
+		t.Fatalf("Dial zero-A name = (%v, %v), want v6 %v", c, err, want)
+	}
+	if f.op10Calls != 1 || f.op10A1 != familyV6Tag {
+		t.Fatalf("op10 = %d calls a1=%#x, want the tagged marshal", f.op10Calls, f.op10A1)
+	}
+}
+
+func TestDial_NameNXDOMAINKeepsItsRefusal(t *testing.T) {
+	// NXDOMAIN is name-level — the AAAA question would meet the same
+	// answer, so it is never asked: one query, ErrNameNotFound.
+	dns, _ := dialNameFakes(t)
+	dns.recvScript = func(port uint16, call int) []byte {
+		r := dnsReplyFor(dns.sentQuery, [4]byte{1, 2, 3, 4})
+		r[3] = 0x83
+		return dgram(dns, r)
+	}
+	if _, err := Dial("nosuch.name", 8080); !errors.Is(err, ErrNameNotFound) {
+		t.Fatalf("NXDOMAIN dial = %v, want ErrNameNotFound", err)
+	}
+	if len(dns.sentQTypes) != 1 || dns.sentQTypes[0] != DNSQueryA {
+		t.Fatalf("queries = %v, want exactly one A", dns.sentQTypes)
+	}
+}
+
+func TestDial_NameBothFamiliesEmptyRefused(t *testing.T) {
+	// NODATA in both directions: the refusal names the pair, never a
+	// bare resolution failure.
+	dns, f := dialNameFakes(t)
+	dns.recvScript = func(port uint16, call int) []byte {
+		return dgram(dns, dnsNODATA(dns.sentQuery))
+	}
+	if _, err := Dial("empty.example", 8080); !errors.Is(err, ErrNameNoAddr) {
+		t.Fatalf("empty name dial = %v, want ErrNameNoAddr", err)
+	}
+	if len(dns.sentQTypes) != 2 || dns.sentQTypes[0] != DNSQueryA || dns.sentQTypes[1] != DNSQueryAAAA {
+		t.Fatalf("queries = %v, want A then AAAA", dns.sentQTypes)
+	}
+	if f.op10Calls != 0 {
+		t.Fatal("an empty name reached op 10")
+	}
+}
+
+func TestDial_NameUndialableAnswersRefused(t *testing.T) {
+	// Every record the name gave is undialable — A=0.0.0.0, then
+	// AAAA=:: — the refusal names the passive-open answer and no
+	// socket op is spent on it.
+	dns, f := dialNameFakes(t)
+	dns.recvScript = func(port uint16, call int) []byte {
+		if queryQType(dns.sentQuery) == DNSQueryAAAA {
+			return dgram(dns, dnsReplyAAAA(dns.sentQuery, [16]byte{}))
+		}
+		return dgram(dns, dnsReplyFor(dns.sentQuery, [4]byte{0, 0, 0, 0}))
+	}
+	if _, err := Dial("zeros.example", 8080); !errors.Is(err, ErrServerDial) {
+		t.Fatalf("all-zeros dial = %v, want ErrServerDial", err)
+	}
+	if f.op10Calls != 0 {
+		t.Fatal("an undialable answer reached op 10")
+	}
+}
+
+func TestDial_NameAAAAOnlyBadDstRefused(t *testing.T) {
+	// The v6 half of the same guard: a multicast AAAA answer is a bad
+	// destination the kernel would refuse EINVAL — the resolver names
+	// it first, without spending a socket op.
+	dns, f := dialNameFakes(t)
+	bad := [16]byte{0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}
+	dns.recvScript = func(port uint16, call int) []byte {
+		if queryQType(dns.sentQuery) == DNSQueryAAAA {
+			return dgram(dns, dnsReplyAAAA(dns.sentQuery, bad))
+		}
+		return dgram(dns, dnsNODATA(dns.sentQuery))
+	}
+	if _, err := Dial("multicast.example", 8080); !errors.Is(err, ErrServerDial) {
+		t.Fatalf("bad-dst dial = %v, want ErrServerDial", err)
+	}
+	if f.op10Calls != 0 {
+		t.Fatal("a bad-dst answer reached op 10")
 	}
 }
 

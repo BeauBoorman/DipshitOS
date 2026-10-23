@@ -32,7 +32,7 @@ func resetDNSCacheForTest() {
 // send_from arrives on the six-arg hook; every other slot on the four-arg
 // one — both are installed by startDNSFake.
 type dnsFake struct {
-	bound      map[uint16]bool // ports the listen table holds
+	bound       map[uint16]bool // ports the listen table holds
 	listenCalls int
 	sendCalls   int
 	recvCalls   int
@@ -46,6 +46,7 @@ type dnsFake struct {
 	sentDstPort uintptr
 	sentSrcPort uintptr
 	sentQuery   []byte
+	sentQTypes  []uint16 // the QTYPE of every query sent, in order
 	randSeq     uint32
 	// now stamps every seam event with a sequence number so a test can pin
 	// ORDER (e.g. the reply port is bound before the query goes out), not
@@ -58,8 +59,8 @@ type dnsFake struct {
 	// refuseBinds makes the next N binds return EINVAL (an ephemeral
 	// collision) before honoring them; refuseENOSPC makes every bind a
 	// full table.
-	refuseBinds   int
-	refuseENOSPC  bool
+	refuseBinds  int
+	refuseENOSPC bool
 	// recvScript maps (port, 1-based recv call on that port) to the
 	// datagram to deliver — the slot-85 shape, 4-byte src-IP prefix +
 	// 8-byte UDP header + payload. A nil script always returns 0.
@@ -144,6 +145,7 @@ func (f *dnsFake) hook6(num uintptr, a0, a1, a2, a3, a4, a5 uintptr) int64 {
 		f.sentDstPort = a1
 		f.sentSrcPort = a2
 		f.sentQuery = hookBytes(a3, a4)
+		f.sentQTypes = append(f.sentQTypes, queryQType(f.sentQuery))
 		f.now++
 		f.sendSeq = f.now
 		// The kernel requires src_port to be bound by the caller — the
@@ -206,6 +208,22 @@ func dnsReplyFor(query []byte, ip [4]byte) []byte {
 	msg = append(msg, query[12:]...) // the echoed question
 	msg = append(msg, 0xC0, 0x0C, 0x00, 0x01, 0x00, 0x01,
 		0x00, 0x00, 0x01, 0x2C, 0x00, 0x04, ip[0], ip[1], ip[2], ip[3])
+	return msg
+}
+
+// queryQType is the QTYPE a captured query asked — the two bytes
+// before the trailing QCLASS.
+func queryQType(query []byte) uint16 {
+	return uint16(query[len(query)-4])<<8 | uint16(query[len(query)-3])
+}
+
+// dnsNODATA is the empty answer: header + echoed question, ANCOUNT=0 —
+// the reply an AAAA-only name gives an A query (and vice versa).
+func dnsNODATA(query []byte) []byte {
+	msg := make([]byte, 0, len(query))
+	msg = append(msg, query[0], query[1], 0x81, 0x80,
+		0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00)
+	msg = append(msg, query[12:]...)
 	return msg
 }
 
@@ -635,6 +653,45 @@ func TestResolveDNS_LegacyWrapper(t *testing.T) {
 	}
 }
 
+func TestResolveDNS6_LegacyWrapper(t *testing.T) {
+	// M184a (#3174): the AAAA twin of ResolveDNS — the same first-record
+	// pick on the v6 answers.
+	f := startDNSFake(t)
+	want := [16]byte{0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x53}
+	f.recvScript = func(port uint16, call int) []byte {
+		return dgram(f, dnsReplyAAAA(f.sentQuery, want))
+	}
+	ip, err := ResolveDNS6("v6.example", dnsTestServer, 0)
+	if err != nil || ip != want {
+		t.Fatalf("ResolveDNS6 = (%v, %v), want %v", ip, err, want)
+	}
+}
+
+func TestResolve_NoRecordNamesTheFamily(t *testing.T) {
+	// A NOERROR answer carrying nothing of the asked family names the
+	// family (M184a): ErrNoARecord / ErrNoAAAARecord, not the generic
+	// failure — the NODATA the fallback ordering keys on and the name
+	// an app's error line can print.
+	f := startDNSFake(t)
+	f.recvScript = func(port uint16, call int) []byte {
+		return dgram(f, dnsNODATA(f.sentQuery))
+	}
+	if _, err := Resolve("empty.example", dnsTestServer, DNSQueryA, 0); !errors.Is(err, ErrNoARecord) {
+		t.Fatalf("A NODATA = %v, want ErrNoARecord", err)
+	}
+	if _, err := Resolve("empty.example", dnsTestServer, DNSQueryAAAA, 0); !errors.Is(err, ErrNoAAAARecord) {
+		t.Fatalf("AAAA NODATA = %v, want ErrNoAAAARecord", err)
+	}
+	// An answer of the WRONG family is NODATA for the one asked: an A
+	// reply to an AAAA question (and back) still names the family.
+	f.recvScript = func(port uint16, call int) []byte {
+		return dgram(f, dnsReplyFor(f.sentQuery, [4]byte{10, 0, 0, 2}))
+	}
+	if _, err := Resolve("onlya.example", dnsTestServer, DNSQueryAAAA, 0); !errors.Is(err, ErrNoAAAARecord) {
+		t.Fatalf("AAAA asked, A answered = %v, want ErrNoAAAARecord", err)
+	}
+}
+
 func TestParseDNSReply_MalformedAndUnanswered(t *testing.T) {
 	startDNSFake(t) // the query ID draws on getrandom
 	query, id, err := buildDNSQuery("myhost.local", DNSQueryA)
@@ -652,11 +709,12 @@ func TestParseDNSReply_MalformedAndUnanswered(t *testing.T) {
 	if _, err := parse(truncated); !errors.Is(err, ErrDNSFailed) {
 		t.Fatalf("truncated reply = %v, want ErrDNSFailed", err)
 	}
-	// A response with no A record is an honest failure.
+	// A response with no A record is the family's named NODATA — not
+	// the generic failure, so the caller can ask the other family.
 	noAnswer := append([]byte(nil), full[:len(query)]...)
 	noAnswer[6], noAnswer[7] = 0x00, 0x00 // ANCOUNT = 0
-	if _, err := parse(noAnswer); !errors.Is(err, ErrDNSFailed) {
-		t.Fatalf("empty answer = %v, want ErrDNSFailed", err)
+	if _, err := parse(noAnswer); !errors.Is(err, ErrNoARecord) {
+		t.Fatalf("empty answer = %v, want ErrNoARecord", err)
 	}
 	// A query (QR = 0) is not our reply.
 	if _, err := parse(query); !errors.Is(err, errNotOurs) {
@@ -711,7 +769,7 @@ func TestParseDNSReply_HostileVectors(t *testing.T) {
 	// bytes without following it, so the parse terminates.
 	selfPtr := append([]byte(nil), full[:12]...)
 	selfPtr = append(selfPtr, query[12:]...)
-	selfPtr[6], selfPtr[7] = 0x00, 0x01 // ANCOUNT = 1
+	selfPtr[6], selfPtr[7] = 0x00, 0x01   // ANCOUNT = 1
 	selfPtr = append(selfPtr, 0xC0, 0x0C, // a name pointer at offset 12: itself
 		0x00, 0x01, 0x00, 0x01, 0, 0, 1, 0x2C, 0, 4, 1, 2, 3, 4)
 	res, err := parse(selfPtr)

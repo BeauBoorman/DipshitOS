@@ -95,9 +95,17 @@ var (
 	// fit one datagram. There is no TCP fallback (M99i deferral): the
 	// refusal is honest, never a guess from a partial message.
 	ErrDNSTruncated = errString("dns: reply truncated (TC=1) — no TCP fallback")
-	// ErrDNSFailed: any other rcode, a malformed reply, or a response
-	// with no record of the asked family.
+	// ErrDNSFailed: any other rcode or a malformed reply.
 	ErrDNSFailed = errString("dns: resolution failed")
+	// ErrNoARecord / ErrNoAAAARecord: a NOERROR answer (rcode 0) that
+	// carried no usable record of the asked family — the name exists,
+	// this family is empty for it (an AAAA-only host answers A with
+	// NODATA). Named apart from ErrNameNotFound (NXDOMAIN — the name
+	// itself is absent) and ErrDNSFailed (rcodes and malformed wire)
+	// so a Dial caller asks the other family on exactly this answer
+	// and an app's error names the missing family.
+	ErrNoARecord    = errString("dns: name has no A record")
+	ErrNoAAAARecord = errString("dns: name has no AAAA record")
 	// ErrDNSRefused: the transport refused the send (EINVAL — the seam's
 	// .no_peer/.not_ready mapping, usually the server's MAC missing from
 	// ARP). The caller resolves (monitor `net arp <ip>`) and retries.
@@ -288,7 +296,24 @@ func ResolveDNS(name string, server [4]byte, budgetNs int64) ([4]byte, error) {
 			return a.IPv4, nil
 		}
 	}
-	return [4]byte{}, ErrDNSFailed
+	return [4]byte{}, ErrNoARecord
+}
+
+// ResolveDNS6 resolves name to its first IPv6 AAAA record via server —
+// the v6 twin of ResolveDNS (M184a, #3174). An AAAA-only name is
+// exactly this call's case; a name with no AAAA record comes back
+// ErrNoAAAARecord by name.
+func ResolveDNS6(name string, server [4]byte, budgetNs int64) ([16]byte, error) {
+	r, err := Resolve(name, server, DNSQueryAAAA, budgetNs)
+	if err != nil {
+		return [16]byte{}, err
+	}
+	for _, a := range r.Addrs {
+		if a.V6 {
+			return a.IPv6, nil
+		}
+	}
+	return [16]byte{}, ErrNoAAAARecord
 }
 
 // dnsBindEphemeral binds a CSPRNG-drawn ephemeral port for this
@@ -453,7 +478,12 @@ func parseDNSReply(dgram []byte, server [4]byte, id uint16, question []byte, qty
 		off += rdlen // a record of another family (e.g. CNAME): skip it
 	}
 	if len(res.Addrs) == 0 {
-		return res, ErrDNSFailed // answered, but nothing of the asked family
+		// Answered, but nothing of the asked family — the NODATA case
+		// an AAAA-only name produces for A, named per family.
+		if qtype == DNSQueryAAAA {
+			return res, ErrNoAAAARecord
+		}
+		return res, ErrNoARecord
 	}
 	res.TTLNs = dnsClampTTL(minTTL)
 	return res, nil

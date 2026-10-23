@@ -1,6 +1,7 @@
 package vi
 
 import (
+	"errors"
 	"time"
 	"unsafe"
 
@@ -97,6 +98,13 @@ var (
 // listener; Listen is the inbound path (M70g G1, #1491).
 var ErrServerDial = errString("vi: 0.0.0.0 is the passive-open address — Dial refuses it; use Listen")
 
+// ErrNameNoAddr: the name both families answered empty — the A query
+// came back NODATA and the AAAA query had no usable record either
+// (dialName's last stop). Distinct from ErrNameNotFound (NXDOMAIN
+// propagates before the second question is asked) and from
+// ErrServerDial (records existed; every one was undialable).
+var ErrNameNoAddr = errString("vi: name has no A or AAAA record")
+
 // errString is a constant error carried as a string (the mirror of vsys's
 // sentinel style; the errno type covers kernel codes, these cover the
 // userland contract).
@@ -156,11 +164,13 @@ func sockErr(rc int64) error {
 // Dial connects to host:port. host may be a dotted-quad IPv4 literal
 // (dialed directly), a v6 literal — bare `x::y` or bracketed `[x::y]`,
 // M117c's tagged marshal (ADR 0057 D8/D10: never an IPv4-mapped
-// translation) — or a name (resolved via ResolveDNS against
-// DefaultDNSServer first; the resolver is the v4 surface, so a name is
-// always a v4 answer). The kernel's connect blocks until the handshake
-// lands or its 30 s timeout expires; a refusal maps to the kernel's
-// errno (ENOSPC -> ErrConnBusy by name).
+// translation) — or a name. A name resolves against DefaultDNSServer
+// v4-first (dialName): an A answer dials v4 as it always has, and only
+// an A answer with nothing dialable sends the AAAA question whose
+// answer opens the same familyV6Tag socket a v6 literal does (M184a).
+// The kernel's connect blocks until the handshake lands or its 30 s
+// timeout expires; a refusal maps to the kernel's errno (ENOSPC ->
+// ErrConnBusy by name).
 func Dial(host string, port uint16) (*Conn, error) {
 	return dial(host, port, 0)
 }
@@ -192,28 +202,115 @@ func dial(host string, port uint16, timeoutMs uint32) (*Conn, error) {
 		if err != nil {
 			return nil, errno(ErrEINVAL)
 		}
-		rc := sock(SockOpConnect, familyV6Tag, uintptr(port)|uintptr(timeoutMs)<<16, bytePtr(addr[:]))
-		if rc < 0 {
-			return nil, sockErr(rc)
-		}
-		return &Conn{handle: uint64(rc), v6: true, ip6: addr, port: port, open: true}, nil
+		return dial6(addr, port, timeoutMs)
 	}
 	ip, perr := vsys.ParseIPv4(host)
 	if perr != nil {
-		resolved, err := ResolveDNS(host, DefaultDNSServer, 0)
-		if err != nil {
-			return nil, err
-		}
-		ip = resolved
+		return dialName(host, port, timeoutMs)
 	}
 	if ip == ([4]byte{}) {
 		return nil, ErrServerDial
 	}
+	return dial4(ip, port, timeoutMs)
+}
+
+// dialName is the hostname path, v4-first (M184a, #3174): the A
+// question goes out first and a usable answer dials v4 exactly as it
+// always has, so an A-only or dual-family name never pays a second
+// question — no silent behavior change. Only when the A answer carries
+// nothing a connect may use — the NODATA answer (ErrNoARecord) or an
+// answer of nothing but the passive-open 0.0.0.0 — is the AAAA
+// question sent; a usable answer then opens the same familyV6Tag
+// socket the literal path uses. Server ordering is authoritative in
+// both families: the FIRST record decides, and a leading undialable
+// record is refused by name, never skipped for a later one. NXDOMAIN,
+// refused sends, truncation and timeouts propagate from the A query
+// unchanged: the name is absent or the wire is, and a second question
+// would meet the same answer. When every answer was empty the refusal
+// names the pair (ErrNameNoAddr); answers of nothing but undialable
+// addresses stay refused by name (ErrServerDial).
+//
+// M184a app audit — what each networked app does with a v6-only host
+// (a name whose only record is AAAA):
+//   - fetch (user/go/fetch legacy.go dialPlain): rides vi.Dial — the
+//     name now resolves AAAA and the conn goes out familyV6Tag.
+//   - goirc (user/go/goirc dial.go dialGuest): plaintext rides vi.Dial
+//     the same way; the TLS path is tls.Dial, which is vi.Dial plus
+//     the handshake — reaches v6 identically.
+//   - ssh (user/go/ssh main.go): rides vi.Dial — reaches v6; a refusal
+//     prints its stage=connect line and exits the connect code.
+//   - browser (user/go/browser network.go connectPage): ResolveDNS +
+//     DialTimeout on the v4 literal — a v6-only host stops at
+//     'web: dns-error dns: name has no A record': it cannot reach the
+//     host, but the refusal names the missing family instead of a bare
+//     resolution failure.
+//   - httpd and the other vi.Listen/SocketListen servers: passive
+//     opens — family-agnostic inbound, untouched by this path.
+func dialName(host string, port uint16, timeoutMs uint32) (*Conn, error) {
+	zeroA := false
+	if res, err := Resolve(host, DefaultDNSServer, DNSQueryA, 0); err == nil {
+		if v4 := firstAAddr(res); v4 != ([4]byte{}) {
+			return dial4(v4, port, timeoutMs)
+		}
+		zeroA = true // answered, only the undialable zero address
+	} else if !errors.Is(err, ErrNoARecord) {
+		return nil, err
+	}
+	res6, err := Resolve(host, DefaultDNSServer, DNSQueryAAAA, 0)
+	if err == nil {
+		if v6 := firstAAAAAddr(res6); !isBadV6Dst(v6) {
+			return dial6(v6, port, timeoutMs)
+		}
+		// Answered, only undialable destinations — the same refusal
+		// family as the v4 passive-open zero.
+		return nil, ErrServerDial
+	}
+	if !errors.Is(err, ErrNoAAAARecord) {
+		return nil, err
+	}
+	if zeroA {
+		return nil, ErrServerDial
+	}
+	return nil, ErrNameNoAddr
+}
+
+// firstAAddr is the first A record of an A-query result — the same
+// pick ResolveDNS has always made. firstAAAAAddr is its v6 twin. (A
+// result's Addrs are all of the asked family by construction.)
+func firstAAddr(res DNSResult) [4]byte {
+	for _, a := range res.Addrs {
+		if !a.V6 {
+			return a.IPv4
+		}
+	}
+	return [4]byte{}
+}
+
+func firstAAAAAddr(res DNSResult) [16]byte {
+	for _, a := range res.Addrs {
+		if a.V6 {
+			return a.IPv6
+		}
+	}
+	return [16]byte{}
+}
+
+// dial4 / dial6 are the two family marshals of op 10: v4 rides the
+// register word, v6 the family tag plus the 16-byte copy-in seam.
+func dial4(ip [4]byte, port uint16, timeoutMs uint32) (*Conn, error) {
 	rc := sock(SockOpConnect, ipv4Word(ip), uintptr(port)|uintptr(timeoutMs)<<16, 0)
 	if rc < 0 {
 		return nil, sockErr(rc)
 	}
 	return &Conn{handle: uint64(rc), ip: ip, port: port, open: true}, nil
+}
+
+func dial6(addr [16]byte, port uint16, timeoutMs uint32) (*Conn, error) {
+	rc := sock(SockOpConnect, familyV6Tag, uintptr(port)|uintptr(timeoutMs)<<16, bytePtr(addr[:]))
+	if rc < 0 {
+		return nil, sockErr(rc)
+	}
+	return &Conn{handle: uint64(rc), v6: true, ip6: addr, port: port, open: true}, nil
 }
 
 // Listen passively opens port on the LEGACY slot-30 view (ip==0): the

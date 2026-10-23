@@ -15,6 +15,27 @@ import (
 // ErrBadV6 is the parse refusal every malformed literal shares.
 var ErrBadV6 = errString("vi: malformed IPv6 literal")
 
+// isBadV6Dst reports whether a v6 destination is one the guest never
+// originates — the kernel's `is_bad_dst` set (kernel/src/ipv6.zig):
+// multicast (ff00::/8), the unspecified address (:: — the v6
+// passive-open zero), loopback (::1), and the IPv4-mapped form. The
+// kernel refuses these EINVAL at connect; the resolver checks earlier
+// so an AAAA answer of nothing but undialable records earns the named
+// refusal instead of a socket op (M184a, #3174).
+func isBadV6Dst(a [16]byte) bool {
+	if a[0] == 0xff {
+		return true // multicast
+	}
+	if a == ([16]byte{}) {
+		return true // unspecified
+	}
+	if a == [16]byte{15: 1} {
+		return true // ::1 loopback
+	}
+	// ::ffff:a.b.c.d — the mapped form, refused never translated.
+	return a[10] == 0xff && a[11] == 0xff && [10]byte(a[:10]) == [10]byte{}
+}
+
 // IsV6Literal reports whether s names a v6 address — a bracketed
 // `[x::y]` form or a bare literal containing ':'. A dotted quad never
 // qualifies, so this is safe to run before ParseIPv4.
