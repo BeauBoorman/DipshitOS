@@ -73,12 +73,33 @@ func Label(z Zone) string {
 	return string(b[:])
 }
 
+// offsetLabels is the vocabulary spelling of Offsets — Label(z) for each
+// entry, written out rather than computed. Names must not reach for Label:
+// settings' timezone row stores `Vocab: clockfmt.Names()` in a package-level
+// initializer, so Names runs in EVERY binary that links settings, and
+// Label's named branch would keep isNamed -> ianaZones reachable — dragging
+// the whole IANA table and the DST engine into apps that never resolve a
+// named zone. TestNamesAreTheCuratedVocabulary pins each spelling against
+// Label(Offsets[i]), so the two can never drift silently.
+var offsetLabels = []string{
+	"UTC-08:00", // US Pacific standard
+	"UTC-05:00", // US Eastern standard
+	"UTC-03:00",
+	"UTC",
+	"UTC+01:00", // Central Europe standard
+	"UTC+02:00", // Eastern Europe standard
+	"UTC+03:00",
+	"UTC+05:30", // India
+	"UTC+08:00",
+	"UTC+09:00",
+	"UTC+10:00",
+	"UTC+12:00",
+}
+
 // Names returns the curated labels, the vocabulary a `timezone` row cycles.
 func Names() []string {
-	out := make([]string, 0, len(Offsets))
-	for _, z := range Offsets {
-		out = append(out, Label(z))
-	}
+	out := make([]string, len(offsetLabels))
+	copy(out, offsetLabels)
 	return out
 }
 
@@ -152,13 +173,13 @@ type tzRule struct {
 // and daylight offsets in seconds east, their abbreviations, and the two
 // yearly transitions. hasDST=false is a named fixed offset.
 type ianaZone struct {
-	name           string
-	stdOff         int32 // seconds east of UTC in the standard state
-	dstOff         int32 // seconds east of UTC in the daylight state
-	stdAbbr        string
-	dstAbbr        string
-	start, end     tzRule // std -> dst, dst -> std
-	hasDST         bool
+	name       string
+	stdOff     int32 // seconds east of UTC in the standard state
+	dstOff     int32 // seconds east of UTC in the daylight state
+	stdAbbr    string
+	dstAbbr    string
+	start, end tzRule // std -> dst, dst -> std
+	hasDST     bool
 }
 
 // isNamed reports whether z encodes a named zone rather than an offset.
@@ -343,7 +364,7 @@ func floorDiv(a, b int64) int64 {
 func civilFromDays(z int64) (year, month, day int) {
 	z += 719468 // shift the era origin to 0000-03-01
 	era := floorDiv(z, 146097)
-	doe := z - era*146097 // [0, 146096]
+	doe := z - era*146097                                  // [0, 146096]
 	yoe := (doe - doe/1460 + doe/36524 - doe/146096) / 365 // [0, 399]
 	y := yoe + era*400
 	doy := doe - (365*yoe + yoe/4 - yoe/100) // [0, 365]
