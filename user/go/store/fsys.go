@@ -152,6 +152,57 @@ func (GuestFS) Exists(path string) bool {
 	return drc >= 0
 }
 
+// mkdirFS is the optional directory-creation seam publish uses for the
+// workspace's release/ dir and the channel's <stream>/ dir. FS keeps its
+// five verbs; implementations that can create directories carry this.
+type mkdirFS interface {
+	Mkdir(path string) error
+}
+
+// Mkdir creates one directory — the same slot-20 open shape flint's
+// guestFS.Mkdir uses (ModeDir|ModeCreate); an existing dir is success.
+func (GuestFS) Mkdir(path string) error {
+	h, rc := vi.FileOpen(path, vi.ModeWrite|vi.ModeCreate|vi.ModeDir)
+	if rc == vi.ErrFileExists {
+		return nil
+	}
+	if rc < 0 {
+		return newFSErr("mkdir", path, rc)
+	}
+	vi.FileClose(uint32(h))
+	return nil
+}
+
+// ensureDirAll creates path and every parent under /host — the same walk
+// flint/fsys.go's helper runs (the two packages cannot share it; see FS).
+// An FS without the mkdir seam refuses ENOSYS rather than silently
+// dropping a write its WriteFileSafe could not reach.
+func ensureDirAll(fs FS, path string) error {
+	path = cleanMemPath(path)
+	if path == "" || path == "/host" {
+		return nil
+	}
+	mk, ok := fs.(mkdirFS)
+	if !ok {
+		return newFSErr("mkdir", path, -vi.ErrENOSYS)
+	}
+	if !strings.HasPrefix(path, "/host/") {
+		return mk.Mkdir(path)
+	}
+	rel := path[len("/host/"):]
+	cur := "/host"
+	for _, p := range strings.Split(rel, "/") {
+		if p == "" {
+			continue
+		}
+		cur += "/" + p
+		if err := mk.Mkdir(cur); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // memFS is an in-memory FS implementation for host unit tests.
 type memFS struct {
 	files       map[string][]byte
@@ -304,4 +355,22 @@ func (m *memFS) Exists(path string) bool {
 		}
 	}
 	return false
+}
+
+func (m *memFS) Mkdir(path string) error {
+	path = cleanMemPath(path)
+	if path == "" {
+		return newFSErr("mkdir", path, -vi.ErrEINVAL)
+	}
+	if m.beforeWrite != nil {
+		if err := m.beforeWrite("mkdir", path); err != nil {
+			return err
+		}
+	}
+	if _, isFile := m.files[path]; isFile {
+		return newFSErr("mkdir", path, vi.ErrFileIsDir)
+	}
+	m.markParents(path)
+	m.dirs[path] = true
+	return nil
 }
