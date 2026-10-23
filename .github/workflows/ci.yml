@@ -79,9 +79,23 @@ jobs:
         run: command -v just >/dev/null || brew install just
 
       - name: Run the portable gate set (class A — just verify-portable)
+        id: portable
         run: just verify-portable
         env:
           GH_TOKEN: ${{ github.token }}
+
+      - name: Summarize test suite durations
+        if: always() && steps.portable.outcome != 'skipped'
+        run: python3 tools/test-timing.py summary >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Retain test-duration history
+        if: always() && steps.portable.outcome != 'skipped'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: test-timings-macos-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/test-timings/
+          retention-days: 90
+          if-no-files-found: error
 
       # --- Class B: Apple-silicon VZ hardware gates run in vz-gates.yml ---
 

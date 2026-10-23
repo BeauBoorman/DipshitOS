@@ -34,6 +34,35 @@ Every verification command belongs to exactly one class (canonical inventory:
   platform capability is unavailable, everything else still runs and the
   blocked step is reported precisely.
 
+## Test duration tracking
+
+`just verify-portable` measures the Zig, console-transcript, Swift, Go and
+test-tooling suites with a monotonic clock. It writes
+`artifacts/test-timings/report.json` (versioned schema, commit, CI run/attempt,
+runner platform, command, start time, elapsed seconds and exit code) and
+`summary.md` (combined suite time and a slowest-first table). Each invocation
+starts a fresh report. Go tests use `-count=1` so cached pass results cannot
+masquerade as test execution.
+
+CI publishes the table in its job summary and retains the dedicated
+`test-timings-macos-<run-id>-<attempt>` artifact for 90 days, including failed
+and cancelled runs that reached the portable step. Review the slowest suites
+when CI gets slower; download reports from the affected and earlier `main`
+runs and compare matching suite names on the same runner platform. These are
+suite wall times, including runner startup/compilation, not per-test CPU
+benchmarks. Separate build-only steps and class-B VM gates are excluded.
+There is no automatic regression threshold.
+
+The wrapper streams the original test output and propagates failures, so
+the recipe remains fail-fast. Reports are saved before and after each suite;
+an abruptly stopped suite is marked unfinished, not passed or zero seconds.
+Only a successful end of the recipe marks the report complete. For a failed
+local run, print the partial table with:
+
+```bash
+python3 tools/test-timing.py summary
+```
+
 ## Local host front door (M91a)
 
 The supported launch is `source tools/env-check.sh && just session` on

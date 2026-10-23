@@ -19,19 +19,21 @@ alias verify := verify-portable
 # Run the full portable/build gate set (class A; mirrors CI). Does NOT run
 # the Apple-silicon VZ hardware gates (class B) — that is `just verify-vz`.
 verify-portable:
+    python3 tools/test-timing.py init
     zig fmt --check boot/src/*.zig kernel/src/*.zig user/src/*.zig build.zig
-    bash tools/verify-unit-tests.sh
-    zig build test-console
+    python3 tools/test-timing.py run timing-reporter -- python3 -m unittest discover -s tools/tests -p test_test_timing.py
+    python3 tools/test-timing.py run zig-unit -- bash tools/verify-unit-tests.sh
+    python3 tools/test-timing.py run console-transcript -- zig build test-console
     zig build
     zig build image
     zig build inspect
     swift build --package-path host/vm-runner
-    swift test --package-path host/vm-runner
-    go -C user/go test ./...
-    go -C tools/go/vlfs test ./...
+    python3 tools/test-timing.py run swift-host -- swift test --package-path host/vm-runner
+    python3 tools/test-timing.py run go-user -- go -C user/go test -count=1 ./...
+    python3 tools/test-timing.py run go-vlfs -- go -C tools/go/vlfs test -count=1 ./...
     zig build context
     bash tools/status/verify-issue-coordination.sh
-    bash tools/status/test-coordination.sh
+    python3 tools/test-timing.py run coordination -- bash tools/status/test-coordination.sh
     bash tools/inventory-gates.sh --check
     bash tools/lint-workflows.sh
     bash tools/verify-mmu-debt.sh
@@ -40,9 +42,10 @@ verify-portable:
     bash tools/verify-mutations.sh
     bash tools/verify-bss-budget.sh
     bash tools/verify-vf-class-a.sh
-    bash tools/gate/test-gate-run.sh
-    python3 tools/gate/bench-check.py
-    bash tools/go/test-ensure-guest-elf.sh
+    python3 tools/test-timing.py run gate-runner -- bash tools/gate/test-gate-run.sh
+    python3 tools/test-timing.py run benchmark-checker -- python3 tools/gate/bench-check.py
+    python3 tools/test-timing.py run guest-elf -- bash tools/go/test-ensure-guest-elf.sh
+    python3 tools/test-timing.py finish
 
 # The class-B fleet is DISCOVERED, not listed (M40 GF5): every spec in
 # tools/gate/specs/ plus the four legacy class-B scripts (bad-handoff,
