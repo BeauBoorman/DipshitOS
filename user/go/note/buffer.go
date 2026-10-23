@@ -242,6 +242,27 @@ func (b *Buffer) LineCount() int {
 	return n
 }
 
+// Words counts whitespace-separated runs — the status line's word count.
+// Whitespace is what this app's text can actually carry: ' ', '\t' and '\n'
+// (load strips '\r' and NUL, and the key path never inserts a tab — but a
+// file from a host editor can). Everything else, including every multibyte
+// rune, is word text: the count is byte-local, so a UTF-8 continuation can
+// never be mistaken for a space.
+func (b *Buffer) Words() int {
+	words, in := 0, false
+	for _, c := range b.buf {
+		if c == ' ' || c == '\t' || c == '\n' {
+			in = false
+			continue
+		}
+		if !in {
+			words++
+			in = true
+		}
+	}
+	return words
+}
+
 // lineBounds returns the start and end (exclusive) offsets of 1-based line n.
 // Past the last line it returns an empty line at the end of the text, which is
 // the same thing the frame draws there.

@@ -44,6 +44,7 @@
 package main
 
 import (
+	"bytes"
 	"unicode/utf8"
 
 	"virelai/appkit"
@@ -121,6 +122,9 @@ const (
 	markerPresents    = "note: presents n="
 	markerOK          = "note OK"
 	markerOpenErr     = "note: error open "
+	// markerState prefixes the M125a envelope report: "restored cur=" /
+	// "stale <why>" — same vocabulary GOEDIT and GOPAINT print for theirs.
+	markerState = "note: state "
 )
 
 // settleNs is how long the app lets the compositor run before it declares
@@ -173,7 +177,9 @@ const (
 )
 
 // app is the whole state: the window, the buffer, the scroll top and the dirty
-// bit (which the chrome bar shows and the close path acts on).
+// bit (which the chrome bar shows and the close path acts on). pend/pendBad
+// hold the seat's restored envelope between Init (where noteState runs, before
+// the buffer's file is read) and applyRestored (which applies it after load).
 type app struct {
 	ta    *tabapp.TabApp
 	buf   *Buffer
@@ -190,6 +196,8 @@ type app struct {
 	find    appkit.Find
 	hits    []int
 	findLog string
+	pend    *noteState
+	pendBad bool
 
 	// presents counts the frames this app has put on the scanout. Draw and
 	// present are separate calls, so the only way a gate can tell a filled frame
@@ -221,7 +229,20 @@ func main() {
 	a.find.Scan = a.findScan
 	a.find.Show = a.findShow
 	a.find.Miss = a.findMiss
-	ta := tabapp.Init(tabapp.Config{Name: appName, Title: appTitle, X: natX, Y: natY, W: natW, H: natH})
+	// The M125a hooks: noteState runs inside Init (a re-exec'd NOTE gets no
+	// argv — the blob's path must land before load() reads it), and the
+	// loop answers the seat's save asks through PollStateAsk.
+	ta := tabapp.Init(tabapp.Config{
+		Name:         appName,
+		Title:        appTitle,
+		X:            natX,
+		Y:            natY,
+		W:            natW,
+		H:            natH,
+		StateVersion: stateAppVer,
+		SaveState:    a.saveState,
+		RestoreState: a.noteState,
+	})
 	if ta == nil {
 		vi.ConsoleLine(markerOpenErr + "-1")
 		vi.Exit(1)
@@ -241,6 +262,12 @@ func main() {
 	}
 
 	vi.ConsoleLine(a.load())
+	// A stored envelope decides over the startup defaults: the blob's path
+	// already replaced a.path inside noteState, so the load just performed
+	// IS the staleness witness; cursor and dirty apply here.
+	if line := a.applyRestored(); line != "" {
+		vi.ConsoleLine(line)
+	}
 	// NOTE owns one startup document. Once the open attempt has returned,
 	// name the rail for that document; the initial Notepad declaration still
 	// supplied NOTE.ELF to the seat's reopen/session bin field.
@@ -259,6 +286,10 @@ func main() {
 	vi.ConsoleLine(a.cursorMarker())
 
 	for {
+		// The seat's save ask (snapshot, tab close) is a notice in the
+		// mailbox nothing wakes; answering it is once per pass, the same
+		// discipline PollDrag/PollSelPaste keep.
+		a.ta.PollStateAsk()
 		ev, r, ok := vi.PollEventRaw()
 		if !ok {
 			if r < 0 {
@@ -428,6 +459,173 @@ func (a *app) flushFindLog() {
 		vi.ConsoleLine(a.findLog)
 		a.findLog = ""
 	}
+}
+
+// --- the M125a state envelope (M192b #3247) ---------------------------------
+//
+// NOTE's half of the per-app state protocol, the same shape GOEDIT's
+// state.go and GOPAINT's keep: the seat stores the blob verbatim on the
+// tab's session row (kind-20 save, kind-21 restore) and hands it back on a
+// reopen — a re-exec'd NOTE.ELF gets no argv, so the open file lives only
+// here. The format is the app's own; stateFmtVer is the refusal check for
+// a stale serialization and stateAppVer the seat-stored twin — a torn or
+// foreign blob decodes to nothing and the restore degrades to the plain
+// open of defaultPath, never a crash.
+//
+// Wire v1 (little-endian):
+//
+//	u8  fmtVer (=1)
+//	u8  flags (bit 0: dirty)
+//	u32 cur                the caret's byte offset
+//	u16 pathLen | path     the open file
+//	u32 bufLen | buf       ONLY when dirty — the unsaved text itself
+//
+// Carrying the unsaved text is what makes the dirty flag honest: the blob
+// bound (64 KiB) is twice the buffer bound (32 KiB), so the whole document
+// always fits and a session restore does not drop typed work the way
+// GOPAINT's envelope drops pixels. On apply, the snapshot text is compared
+// against what load() just read: equal means the close-time save already
+// published it (the flag goes back clean), different means the snapshot
+// caught unsaved work and the buffer takes the blob's bytes back dirty.
+
+const (
+	stateFmtVer = 1
+	stateAppVer = 1
+
+	flagDirty = 1 << 0
+)
+
+// noteState is the decoded blob.
+type noteState struct {
+	cur   int
+	path  string
+	dirty bool
+	buf   []byte // the unsaved text; present iff dirty
+}
+
+func appendU16(out []byte, v int) []byte { return append(out, byte(v), byte(v>>8)) }
+
+func appendU32(out []byte, v int) []byte {
+	return append(out, byte(v), byte(v>>8), byte(v>>16), byte(v>>24))
+}
+
+func readU16(b []byte) int { return int(b[0]) | int(b[1])<<8 }
+
+func readU32(b []byte) int {
+	return int(b[0]) | int(b[1])<<8 | int(b[2])<<16 | int(b[3])<<24
+}
+
+// encode renders the blob. Writers are infallible; the seat's own bound
+// check (EncodeAppState) runs on the finished length.
+func (s *noteState) encode() []byte {
+	out := make([]byte, 0, 12+len(s.path)+len(s.buf))
+	flags := byte(0)
+	if s.dirty {
+		flags |= flagDirty
+	}
+	out = append(out, stateFmtVer, flags)
+	out = appendU32(out, max(0, s.cur))
+	out = appendU16(out, len(s.path))
+	out = append(out, s.path...)
+	if s.dirty {
+		out = appendU32(out, len(s.buf))
+		out = append(out, s.buf...)
+	}
+	return out
+}
+
+// decodeState parses a blob; ok=false means stale/foreign and the caller
+// degrades to a plain open. Every declared length is re-verified and the
+// blob must be consumed exactly — the seat carries bytes, it does not
+// vouch for them.
+func decodeState(b []byte) (noteState, bool) {
+	var s noteState
+	if len(b) < 8 || b[0] != stateFmtVer {
+		return s, false
+	}
+	if b[1]&^flagDirty != 0 {
+		return s, false
+	}
+	s.dirty = b[1]&flagDirty != 0
+	s.cur = readU32(b[2:6])
+	pl := readU16(b[6:8])
+	if len(b) < 8+pl {
+		return s, false
+	}
+	s.path = string(b[8 : 8+pl])
+	rest := b[8+pl:]
+	if !s.dirty {
+		return s, len(rest) == 0
+	}
+	if len(rest) < 4 {
+		return s, false
+	}
+	n := readU32(rest[:4])
+	if len(rest) != 4+n {
+		return s, false
+	}
+	s.buf = rest[4:]
+	return s, true
+}
+
+// saveState is the tabapp.SaveState hook — the seat's ask (snapshot or tab
+// close) lands once per loop pass and gets this blob staged.
+func (a *app) saveState() []byte {
+	st := noteState{cur: a.buf.Cursor(), path: a.path, dirty: a.dirty}
+	if a.dirty {
+		st.buf = a.buf.Bytes()
+	}
+	return st.encode()
+}
+
+// noteState is the tabapp.RestoreState hook, run inside Init before the
+// first paint. It only decodes and stashes: the path applies immediately so
+// the load() below opens the blob's file, the rest waits in pend for the
+// buffer's staleness witness.
+func (a *app) noteState(b []byte) {
+	s, ok := decodeState(b)
+	if !ok {
+		a.pendBad = true
+		return
+	}
+	a.pend = &s
+	if s.path != "" {
+		a.path = s.path
+	}
+}
+
+// applyRestored runs right after load(): the file just read is the blob's
+// staleness witness. A dirty snapshot whose text the close-time save already
+// published restores clean; one the disk does not have takes the blob's
+// bytes back as the dirty buffer. The caret clamps into range either way.
+// It returns the marker to print ("" when no blob was waiting) — the same
+// convention load/save/closeSave keep, so the decision stays host-testable.
+func (a *app) applyRestored() string {
+	if a.pendBad {
+		a.pendBad = false
+		return markerState + "stale bad"
+	}
+	st := a.pend
+	if st == nil {
+		return ""
+	}
+	a.pend = nil
+	// The envelope's appver is the seat-visible tag; RestoredVersion is the
+	// app's check for a stale serialization — a foreign version is refused
+	// even though the blob itself decoded.
+	if a.ta != nil && a.ta.RestoredVersion != stateAppVer {
+		return markerState + "stale version"
+	}
+	tag := ""
+	if st.dirty && !bytes.Equal(st.buf, a.buf.Bytes()) {
+		a.buf.Load(st.buf)
+		a.dirty = true
+		tag = " dirty"
+	}
+	a.buf.SetCursor(st.cur)
+	a.top = a.buf.Follow(a.top, a.rowsIn())
+	return markerState + "restored cur=" + vi.Itoa64(int64(a.buf.Cursor())) +
+		" path=" + a.path + tag
 }
 
 // rowsIn is how many text rows the canvas holds at the current size. A canvas
@@ -663,6 +861,7 @@ func (a *app) draw() {
 	}
 
 	status := "line " + vi.Itoa64(int64(a.buf.Line())) + ":" + vi.Itoa64(int64(a.buf.Col())) +
+		"  words " + vi.Itoa64(int64(a.buf.Words())) +
 		"  bytes " + vi.Itoa64(int64(a.buf.Len())) + "/" + vi.Itoa64(int64(MaxBytes))
 	a.drawText(textOrigin, h-statusH-a.bottomChrome(), status, tok.Muted)
 	if a.find.Open {

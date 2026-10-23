@@ -475,3 +475,163 @@ func TestLoadOutcomeMarkers(t *testing.T) {
 		t.Fatalf("an absent load left %d bytes in the buffer", a.buf.Len())
 	}
 }
+
+// The M125a envelope (M192b #3247): path + caret + dirty round-trip on the
+// wire format itself. A dirty snapshot carries the unsaved text — the blob
+// bound is twice the buffer bound, so the document always fits — and the
+// codec must consume the blob exactly: anything torn or foreign refuses
+// whole rather than restoring halfway.
+func TestStateEnvelopeRoundTrip(t *testing.T) {
+	// Clean: path + caret only.
+	a := &app{buf: NewBuffer(), path: defaultPath, top: 1}
+	a.buf.InsertText("hello")
+	blob := a.saveState()
+	s, ok := decodeState(blob)
+	if !ok {
+		t.Fatalf("clean blob refused: %x", blob)
+	}
+	if s.dirty || s.buf != nil || s.cur != 5 || s.path != defaultPath {
+		t.Fatalf("clean decode = %+v", s)
+	}
+	// Dirty: the unsaved text rides the blob.
+	a.dirty = true
+	blob = a.saveState()
+	s, ok = decodeState(blob)
+	if !ok {
+		t.Fatalf("dirty blob refused: %x", blob)
+	}
+	if !s.dirty || string(s.buf) != "hello" || s.cur != 5 || s.path != defaultPath {
+		t.Fatalf("dirty decode = %+v", s)
+	}
+	// Re-encoding the decode is byte-identical — the format is stable.
+	if got := s.encode(); !bytes.Equal(got, blob) {
+		t.Fatalf("re-encode drifted: %x != %x", got, blob)
+	}
+}
+
+// Every malformed shape refuses: a foreign fmtVer, unknown flag bits, a torn
+// length, trailing junk, a dirty blob that ends before its bufLen. The seat
+// stores bytes verbatim; the check is the codec's.
+func TestStateDecodeRefusals(t *testing.T) {
+	good := (&noteState{cur: 3, path: defaultPath}).encode()
+	cases := []struct {
+		name string
+		blob []byte
+	}{
+		{"empty", nil},
+		{"short", good[:4]},
+		{"foreign ver", append([]byte{9}, good[1:]...)},
+		{"unknown flag", append([]byte{good[0], 0x40}, good[2:]...)},
+		{"path overruns", append(append([]byte{}, good[:7]...), 0xff, 0xff)},
+		{"trailing junk", append(append([]byte{}, good...), 0)},
+		{"dirty no bufLen", append([]byte{good[0], flagDirty}, good[2:]...)},
+	}
+	for _, c := range cases {
+		if _, ok := decodeState(c.blob); ok {
+			t.Fatalf("%s: decode accepted %x", c.name, c.blob)
+		}
+	}
+	// A dirty blob whose declared bufLen overruns what remains refuses too —
+	// bufLen sits at offset 9 in the {path:"p"} encoding below.
+	dirty := (&noteState{cur: 0, path: "p", dirty: true, buf: []byte("ab")}).encode()
+	dirty[9] = 0xff
+	if _, ok := decodeState(dirty); ok {
+		t.Fatalf("an overrun bufLen decoded: %x", dirty)
+	}
+}
+
+// The app-level round trip. noteState lands the path before load (a re-exec
+// gets no argv); applyRestored then decides against what load left in the
+// buffer — the host cannot read /host, so the test loads the "file" itself.
+func TestStateRestoreApplies(t *testing.T) {
+	// Snapshot while dirty, before any save: the text the disk does not have
+	// rides the blob and comes back dirty.
+	src := &app{buf: NewBuffer(), path: defaultPath, top: 1}
+	src.buf.InsertText("ab\ncd")
+	src.dirty = true
+	src.buf.SetCursor(4)
+	blob := src.saveState()
+
+	dst := &app{buf: NewBuffer(), path: defaultPath, top: 1}
+	dst.noteState(blob)
+	if dst.path != defaultPath {
+		t.Fatalf("blob path not applied before load: %q", dst.path)
+	}
+	dst.buf.Load([]byte("ab")) // the file on disk is the pre-edit version
+	marker := dst.applyRestored()
+	if marker != markerState+"restored cur=4 path="+defaultPath+" dirty" {
+		t.Fatalf("dirty restore marker = %q", marker)
+	}
+	if got := string(dst.buf.Bytes()); got != "ab\ncd" {
+		t.Fatalf("restored buffer = %q want the blob's text", got)
+	}
+	if !dst.dirty || dst.buf.Cursor() != 4 {
+		t.Fatalf("restore left dirty=%v cursor=%d", dst.dirty, dst.buf.Cursor())
+	}
+
+	// The close-time save case: the blob was taken dirty but the file on
+	// disk already carries the same bytes (closeSave published them) — the
+	// flag goes back clean.
+	dst2 := &app{buf: NewBuffer(), path: defaultPath, top: 1}
+	dst2.noteState(blob)
+	dst2.buf.Load([]byte("ab\ncd"))
+	marker = dst2.applyRestored()
+	if marker != markerState+"restored cur=4 path="+defaultPath {
+		t.Fatalf("published-text restore marker = %q", marker)
+	}
+	if dst2.dirty {
+		t.Fatal("a snapshot the file already has restored dirty")
+	}
+}
+
+// The two stale paths: a blob that does not decode reports "stale bad", and
+// one that decodes under a foreign appver reports "stale version" — the
+// seat-visible tag is the app's own refusal, applied even when the bytes
+// parsed.
+func TestStateRestoreStale(t *testing.T) {
+	a := &app{buf: NewBuffer(), path: defaultPath, top: 1}
+	a.noteState([]byte{0xde, 0xad})
+	if got := a.applyRestored(); got != markerState+"stale bad" {
+		t.Fatalf("torn blob marker = %q", got)
+	}
+	// A second stale report does not re-print: pendBad was consumed.
+	if got := a.applyRestored(); got != "" {
+		t.Fatalf("consumed stale blob re-reported %q", got)
+	}
+
+	a = &app{buf: NewBuffer(), path: defaultPath, top: 1, ta: &tabapp.TabApp{RestoredVersion: stateAppVer + 1}}
+	a.noteState((&noteState{cur: 2, path: defaultPath}).encode())
+	if got := a.applyRestored(); got != markerState+"stale version" {
+		t.Fatalf("foreign appver marker = %q", got)
+	}
+	if a.buf.Cursor() != 0 {
+		t.Fatalf("a refused restore still moved the caret to %d", a.buf.Cursor())
+	}
+}
+
+// No blob at all is the ordinary first boot: applyRestored stays silent and
+// the app is exactly what load() left.
+func TestStateRestoreAbsent(t *testing.T) {
+	a := &app{buf: NewBuffer(), path: defaultPath, top: 1}
+	if got := a.applyRestored(); got != "" {
+		t.Fatalf("no-blob applyRestored = %q want silence", got)
+	}
+}
+
+// The caret rides the blob as a byte offset; a stale one past the end (or a
+// mid-rune offset a hand-made blob could carry) clamps through SetCursor
+// instead of stranding the caret.
+func TestStateRestoreClampsCaret(t *testing.T) {
+	a := &app{buf: NewBuffer(), path: defaultPath, top: 1}
+	a.buf.Load([]byte("aöb"))
+	a.noteState((&noteState{cur: 99, path: defaultPath}).encode())
+	_ = a.applyRestored()
+	if a.buf.Cursor() != 4 {
+		t.Fatalf("past-end caret = %d want %d", a.buf.Cursor(), 4)
+	}
+	a.noteState((&noteState{cur: 2, path: defaultPath}).encode()) // inside ö
+	_ = a.applyRestored()
+	if a.buf.Cursor() != 1 {
+		t.Fatalf("mid-rune caret = %d want rune boundary 1", a.buf.Cursor())
+	}
+}

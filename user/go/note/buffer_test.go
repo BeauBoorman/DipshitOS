@@ -408,6 +408,35 @@ func TestDeleteAtEndOfLineJoins(t *testing.T) {
 	}
 }
 
+// The status line's word count (M192b #3247): whitespace-separated runs,
+// where the whitespace set is what this text can actually carry (' ', '\t',
+// '\n' — load strips '\r' and the key path never inserts a tab). Multibyte
+// runes are word text; the count is byte-local so a continuation byte is
+// never mistaken for a space.
+func TestWords(t *testing.T) {
+	cases := []struct {
+		name string
+		text string
+		want int
+	}{
+		{"empty", "", 0},
+		{"one word", "hello", 1},
+		{"spaces inside", "hello world", 2},
+		{"leading/trailing whitespace", "  hello  \n", 1},
+		{"lines and a tab", "a b\nc\td\n", 4},
+		{"only whitespace", " \n ", 0},
+		{"multibyte is word text", "aöb é", 2},
+		{"punctuation does not split", "well,that", 1},
+	}
+	for _, c := range cases {
+		b := NewBuffer()
+		b.Load([]byte(c.text))
+		if got := b.Words(); got != c.want {
+			t.Fatalf("%s: Words(%q) = %d want %d", c.name, c.text, got, c.want)
+		}
+	}
+}
+
 // The buffer counts UTF-8 bytes for file limits and offsets, but the caret
 // moves by whole Unicode scalars.
 func TestUTF8CaretMovesByRune(t *testing.T) {
