@@ -710,7 +710,7 @@ func TestTimezoneAcceptedUnseededCyclableAndFallsBackToUTC(t *testing.T) {
 			t.Errorf("ValidTimezone(%q) = false", val)
 		}
 	}
-	for _, val := range []string{"", "utc", "UTC+5:30", "UTC+15:00", "Europe/Paris", "5:30"} {
+	for _, val := range []string{"", "utc", "UTC+5:30", "UTC+15:00", "Europe/Nowhere", "5:30"} {
 		if ValidTimezone(val) {
 			t.Errorf("ValidTimezone(%q) = true", val)
 		}
@@ -722,7 +722,7 @@ func TestTimezoneAcceptedUnseededCyclableAndFallsBackToUTC(t *testing.T) {
 	if z := (File{State: StateMissing}).Timezone(); z != clockfmt.UTC {
 		t.Fatalf("absent timezone = %d, want UTC", z)
 	}
-	bad := File{Rows: []Setting{{Key: TimezoneKey, Val: "Europe/Paris"}}, State: StateOK}
+	bad := File{Rows: []Setting{{Key: TimezoneKey, Val: "Europe/Nowhere"}}, State: StateOK}
 	if z := bad.Timezone(); z != clockfmt.UTC {
 		t.Fatalf("invalid persisted timezone = %d, want the UTC fallback", z)
 	}

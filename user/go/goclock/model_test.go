@@ -225,3 +225,55 @@ func TestAlarmRecordRefusals(t *testing.T) {
 		t.Fatal("encodeAlarms must refuse a negative at or a bad HHMM")
 	}
 }
+
+// --- M178c (#3146): the named-zone row ----------------------------------------
+
+// TestWorldZonesNamedLocal: a named zone leads the row list like a fixed
+// one and never collides with the curated offsets — the sentinel encoding
+// keeps `z != local` honest.
+func TestWorldZonesNamedLocal(t *testing.T) {
+	local, ok := clockfmt.Parse("Europe/Berlin")
+	if !ok {
+		t.Fatal("Europe/Berlin must parse")
+	}
+	zones := worldZones(local)
+	if zones[0] != local {
+		t.Fatalf("zones[0] = %v, want the settings zone first", zones[0])
+	}
+	if len(zones) != len(clockfmt.Offsets)+1 {
+		t.Fatalf("n = %d, want %d", len(zones), len(clockfmt.Offsets)+1)
+	}
+}
+
+// TestWorldRowNamedZone: the World row is the whole clockfmt string, so a
+// named row shows the instant's abbreviation and offset.
+func TestWorldRowNamedZone(t *testing.T) {
+	berlin, _ := clockfmt.Parse("Europe/Berlin")
+	// 2026-10-20 12:00:00 UTC = epoch 1792497600; Berlin is still CEST.
+	if got := worldRow(1792497600, berlin); got != "2026-10-20 14:00:00 CEST UTC+02:00" {
+		t.Fatalf("worldRow Berlin = %q", got)
+	}
+}
+
+// TestAlarmAtFollowsTheNamedOffset pins the alarm solve against the
+// instant-dependent offset: on the 2026-10-25 fall-back day a Berlin 07:30
+// rings at 06:30 UTC (CET, not CEST), and on an ordinary July day a 13:45
+// rings at 11:45 UTC (CEST). Expected epochs computed with host zoneinfo.
+func TestAlarmAtFollowsTheNamedOffset(t *testing.T) {
+	berlin, _ := clockfmt.Parse("Europe/Berlin")
+	// now = 2026-10-24 20:00:00 UTC — Berlin reads 22:00 CEST on the
+	// Saturday; tomorrow's 07:30 lands past the 01:00 UTC transition in
+	// CET, so the naive +86400 would ring an hour early.
+	if got := alarmAt(1792872000, berlin, 7, 30); got != 1792909800 {
+		t.Fatalf("alarmAt over the fall-back = %d, want 1792909800 (07:30 CET)", got)
+	}
+	// now = 2026-07-15 10:00:00 UTC — 12:00 CEST; today's 13:45 is ahead.
+	if got := alarmAt(1784109600, berlin, 13, 45); got != 1784115900 {
+		t.Fatalf("alarmAt same-day = %d, want 1784115900 (13:45 CEST)", got)
+	}
+	// The UTC check stays: alarmAt's old behaviour is intact on UTC —
+	// now = 2026-10-20 11:30 UTC, 12:00 today is 1800 s out.
+	if got := alarmAt(1792495800, clockfmt.UTC, 12, 0); got != 1792497600 {
+		t.Fatalf("alarmAt UTC = %d, want 1792497600", got)
+	}
+}

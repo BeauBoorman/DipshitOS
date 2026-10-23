@@ -960,3 +960,226 @@ if not os.path.getsize(os.path.join(sh, "SNAPSHOT.BUNDLE")):
 print("enforce leg: GRANTS.TXT mode=enforce, GOCLOCK.ALARM row landed, "
       "SESSION.TABS blob %r, bundle present" % hits[0][2])
 PY
+
+# --- run 10 (M178c #3146): the named-zone row — World row + seat face -------
+# A run-scoped share (`--cvc-file`, the run-09 pattern) carries SETTINGS.TXT
+# with `timezone=Europe/Berlin`, so the seat reads the row at boot — before
+# its first chromeTick — and GOCLOCK's own settings.Load picks it up at
+# exec. Two independent witnesses make the leg: the serial zone markers
+# (`goclock: zones local=Europe/Berlin`, `goclock: zone 0 Europe/Berlin`)
+# plus row 0's pixels glyph-decoded against python's zoneinfo at the
+# painted epoch (the run-01 probe, scoped to the named row — its string is
+# 33-34 chars: `YYYY-MM-DD HH:MM:SS CEST UTC+02:00`), and the seat clock's
+# `gotabwm: clock HH:MM:SS` checked against the Berlin faces the host's own
+# epoch window allows. The check is DST-boundary correct by construction —
+# it computes the rule's answer, it does not pin CEST.
+vgate_setup_python <<'PY'
+# Declared LAST of this spec's setup hooks so the copy sees the armed
+# share's final state, then layers the named-zone row on top. The boot
+# epoch is sampled here too — the seat clock check needs the same host
+# window the go-sh legs use.
+import os, shutil, time
+share = os.environ.get("VG_SHARE") or os.path.join(os.environ["RUN_DIR"], "share")
+tz = os.path.join(os.environ["RUN_DIR"], "tz-share")
+if os.path.exists(tz):
+    shutil.rmtree(tz)
+shutil.copytree(share, tz)
+open(os.path.join(tz, "SETTINGS.TXT"), "w").write(
+    "#v2\ntimezone=Europe/Berlin\n")
+for stale in ("SESSION.TABS", "GOCLOCK.ALARM"):
+    p = os.path.join(tz, stale)
+    if os.path.exists(p):
+        os.remove(p)
+with open(os.path.join(os.environ["RUN_DIR"], "host-epoch-start.txt"), "w") as fh:
+    fh.write(repr(time.time()))
+print("tz-share: %d files, timezone=Europe/Berlin" % len(os.listdir(tz)))
+PY
+
+vgate_file script-10.txt <<'EOF'
+vf rm SESSION.TABS
+echo rx-goclock-10-boot
+EOF
+
+vgate_file script2-10.txt <<'EOF'
+exec GOCLOCK.ELF
+EOF
+
+vgate_file script3-10.txt <<'EOF'
+vf rm SESSION.TABS
+echo rx-goclock-tz-ok
+EOF
+
+vgate_run 10 -- \
+    --screen '$RUN_DIR/screen-10' \
+    --via-virtio --cvc-snap --snapshot-out '$RUN_DIR/snap-10' \
+    --cvc-file '$RUN_DIR/tz-share' \
+    --script '$RUN_DIR/script-10.txt' \
+    --script2 '$RUN_DIR/script2-10.txt' \
+    --script2-after 'gotabwm: mode live' \
+    --script3 '$RUN_DIR/script3-10.txt' \
+    --script3-after 'goclock: painted epoch=' \
+    --script3-delay 10 \
+    --snapshot-after 'goclock: painted epoch=' \
+    --snapshot-after 'rx-goclock-tz-ok' \
+    --script-expect 'rx-goclock-tz-ok' --timeout 300
+
+vgate_assert 10 serial-contains 'wm: autostart gotabwm (settings wm=gotabwm)'
+vgate_assert 10 serial-contains 'gotabwm: mode live'
+vgate_assert 10 serial-contains 'gotabwm: clock-source kernel'
+vgate_assert 10 serial-contains 'exec: loaded GOCLOCK.ELF'
+vgate_assert 10 serial-contains 'goclock: declare accepted'
+vgate_assert 10 serial-contains 'goclock: zones local=Europe/Berlin n=13'
+vgate_assert 10 serial-contains 'goclock: zone 0 Europe/Berlin'
+vgate_assert 10 serial-contains 'goclock: painted epoch='
+vgate_assert 10 serial-contains 'rx-goclock-tz-ok'
+vgate_assert 10 serial-absent '[EXC] parking:'
+vgate_assert 10 serial-absent 'exited status=139'
+
+# The seat clock's local face: the one-shot `gotabwm: clock HH:MM:SS` marker
+# is the kernel epoch under the row. The host computes every Berlin face
+# the epoch window could show (the marker prints seconds after boot; the
+# window brackets boot with the go-sh legs' 60 s slack) and requires the
+# marker to be one of them — a face that read UTC would be two hours off.
+vgate_assert 10 python <<'PY'
+import datetime, glob, os, re, sys, time, zoneinfo
+rd = os.environ["RUN_DIR"]
+ser_hits = sorted(glob.glob(os.path.join(rd, "vm-serial-10*.log")),
+                  key=os.path.getmtime)
+if not ser_hits:
+    sys.exit("no serial log for run 10")
+ser = open(ser_hits[-1], errors="replace").read()
+mc = re.search(r"(?m)^gotabwm: clock (\d\d:\d\d:\d\d)$", ser)
+if not mc:
+    sys.exit("no 'gotabwm: clock' marker in serial")
+face = mc.group(1)
+with open(os.path.join(rd, "host-epoch-start.txt")) as fh:
+    host_start = float(fh.read())
+host_end = time.time()
+zi = zoneinfo.ZoneInfo("Europe/Berlin")
+faces = set()
+e = int(host_start) - 90
+while e <= host_end + 90:
+    loc = datetime.datetime.fromtimestamp(e, datetime.timezone.utc).astimezone(zi)
+    faces.add(loc.strftime("%H:%M:%S"))
+    e += 1
+if face not in faces:
+    sys.exit("seat clock face %s is not a Europe/Berlin face in the host "
+             "window [%d, %d]" % (face, host_start, host_end))
+print("seat clock %s is a Europe/Berlin face inside the host window" % face)
+PY
+
+# The named world row, as pixels: row 0 is the settings row — decode its
+# glyph cells and require the exact clockfmt string python computes for
+# the painted epoch (or a second either side of it, the run-01 lag window).
+vgate_assert 10 snapshot 'snap-10-*.raw' <<'PY'
+import datetime, os, re, sys, time, glob as _glob, zoneinfo
+
+W, H = 1280, 720
+need = W * H * 4
+snaps = sorted(_glob.glob(os.path.join(os.path.dirname(sys.argv[1]),
+                                       "snap-%s-*.raw"
+                                       % re.match(r"snap-(\w+)-\d+\.raw",
+                                                  os.path.basename(sys.argv[1])).group(1))),
+               key=os.path.getmtime)
+frames = []
+for p in snaps:
+    raw = open(p, "rb").read()
+    if len(raw) >= need:
+        frames.append((os.path.basename(p), raw))
+if not frames:
+    sys.exit("no complete snapshot in %s" % snaps)
+
+def px(raw, x, y):
+    off = (y * W + x) * 4
+    b, g, r = raw[off], raw[off + 1], raw[off + 2]
+    return (r, g, b)
+
+def lum(p):
+    return p[0] * 0.30 + p[1] * 0.55 + p[2] * 0.15
+
+src = open("user/go/webrender/font/font8x8.go").read()
+rows = re.findall(r"\{(0x[0-9a-fA-F]{2}(?:,\s*0x[0-9a-fA-F]{2}){7})\}", src)
+if len(rows) != 95:
+    sys.exit("font8x8.go: %d glyph rows, want 95" % len(rows))
+GB = {}
+for i, r in enumerate(rows):
+    vals = [int(v, 16) for v in r.split(",") if v.strip()]
+    mask = 0
+    for y in range(8):
+        for x in range(8):
+            mask = (mask << 1) | ((vals[y] >> x) & 1)
+    GB[0x20 + i] = mask
+
+tag = re.match(r"snap-(\w+)-\d+\.raw", os.path.basename(sys.argv[1]))
+ser_hits = sorted(
+    _glob.glob(os.path.join(os.path.dirname(sys.argv[1]),
+                            "vm-serial-%s*.log" % tag.group(1))),
+    key=os.path.getmtime)
+if not ser_hits:
+    sys.exit("no serial log for snap tag %s" % tag.group(1))
+ser = open(ser_hits[-1], errors="replace").read()
+
+mz = re.search(r"(?m)^goclock: zones local=(\S+) n=(\d+)$", ser)
+if not mz:
+    sys.exit("no 'goclock: zones' marker in serial")
+local_label, nrows = mz.group(1), int(mz.group(2))
+if local_label != "Europe/Berlin":
+    sys.exit("local row is %r, want Europe/Berlin" % local_label)
+z0 = re.search(r"(?m)^goclock: zone 0 (\S+)$", ser)
+if not z0 or z0.group(1) != "Europe/Berlin":
+    sys.exit("zone 0 marker = %r, want Europe/Berlin"
+             % (z0.group(1) if z0 else None))
+
+me = list(re.finditer(r"(?m)^goclock: painted epoch=(\d+)$", ser))
+if not me:
+    sys.exit("no painted-epoch markers in serial")
+epoch = int(me[-1].group(1))
+
+zi = zoneinfo.ZoneInfo("Europe/Berlin")
+def expected(e):
+    loc = datetime.datetime.fromtimestamp(e, datetime.timezone.utc).astimezone(zi)
+    off = int(loc.utcoffset().total_seconds())
+    canon = "UTC" if off == 0 else "UTC%s%02d:%02d" % (
+        "+" if off >= 0 else "-", abs(off) // 3600, abs(off) // 60 % 60)
+    return "%s %s %s" % (loc.strftime("%Y-%m-%d %H:%M:%S"),
+                         loc.tzname(), canon)
+
+def decode_cell(raw, x0, y0):
+    lums = [lum(px(raw, x0 + k % 8, y0 + k // 8)) for k in range(64)]
+    lo, hi = min(lums), max(lums)
+    if hi - lo < 20:
+        return " "
+    mid = (lo + hi) / 2
+    mask = 0
+    for v in lums:
+        mask = (mask << 1) | (v >= mid)
+    best, bs = 32, 999
+    for cp, gm in GB.items():
+        d = bin(mask ^ gm).count("1")
+        if d < bs:
+            bs, best = d, cp
+    return chr(best)
+
+# Candidates: EVERY epoch the app painted, plus a second either way — the
+# capture can lag the last marker by far more than run 01's 10 s window
+# under vgate_repeat contention (observed 10-01: a 13 s-stale frame that
+# was itself a correct face). The row must render one of the app's own
+# painted epochs, which is the honest bound.
+cand = sorted({e + d for e in (int(m.group(1)) for m in me)
+               for d in (-1, 0, 1)})
+matched, decoded, want = False, None, None
+for name, raw in frames:
+    for e in cand:
+        w = expected(e)
+        text = "".join(decode_cell(raw, 18 + j * 8, 61)
+                       for j in range(len(w)))
+        if text == w:
+            matched, decoded, want = True, text, w
+if not matched:
+    decoded = "".join(decode_cell(frames[-1][1], 18 + j * 8, 61)
+                      for j in range(34))
+    sys.exit("row 0 is not a Europe/Berlin face across %d captures "
+             "(epoch %d; decoded %r, want e.g. %r)"
+             % (len(frames), epoch, decoded, expected(epoch)))
+print("world row 0 = %r (epoch ~%d, %s)" % (want or decoded, epoch, "matched"))
+PY

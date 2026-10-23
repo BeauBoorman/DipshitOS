@@ -12,6 +12,7 @@ import (
 	"testing"
 	"unsafe"
 
+	"virelai/clockfmt"
 	"virelai/draw"
 	"virelai/theme"
 	"virelai/vi"
@@ -692,4 +693,66 @@ func TestFocusBadgeGoldenDegrade(t *testing.T) {
 		t.Fatal("OpenTab")
 	}
 	checkSeatGolden(t, "seat-focus-badge-degrade", paintGoldenBadge(t), FocusW, ChromeH)
+}
+
+// --- M178c (#3146): the seat clock applies the timezone row ---------------
+
+// saveClockSeam restores the seat clock's epoch/zone seams and cache —
+// the tests below drive clockNow without a guest.
+func saveClockSeam() func() {
+	kt, zl, zm, zv := kernelTime, clockZoneLoad, clockZoneMin, clockZoneVal
+	return func() {
+		kernelTime, clockZoneLoad = kt, zl
+		clockZoneMin, clockZoneVal = zm, zv
+	}
+}
+
+// TestClockNowAppliesTheTimezoneRow pins the card's seat-clock leg: the
+// kernel epoch formats under the `timezone` row in force — a named zone's
+// offset at that instant — so the seat face agrees with `date`. Epoch
+// 1792497600 is 2026-10-20 12:00:00 UTC; Berlin is still CEST (+02:00).
+func TestClockNowAppliesTheTimezoneRow(t *testing.T) {
+	defer saveClockSeam()()
+	kernelTime = func() int64 { return 1792497600 }
+	berlin, ok := clockfmt.Parse("Europe/Berlin")
+	if !ok {
+		t.Fatal("Europe/Berlin must parse")
+	}
+	clockZoneLoad = func() clockfmt.Zone { return berlin }
+	clockZoneMin = -1
+	face := clockNow(0)
+	if face.source != "kernel" || face.h != 14 || face.m != 0 || face.s != 0 {
+		t.Fatalf("Berlin face = %+v, want 14:00:00 kernel", face)
+	}
+	// The same epoch under the UTC default keeps the old face.
+	clockZoneLoad = func() clockfmt.Zone { return clockfmt.UTC }
+	clockZoneMin = -1
+	if face := clockNow(0); face.h != 12 || face.m != 0 || face.s != 0 {
+		t.Fatalf("UTC face = %+v, want 12:00:00", face)
+	}
+	// A fixed-offset row shifts the face by exactly its offset.
+	clockZoneLoad = func() clockfmt.Zone { return 5*3600 + 30*60 }
+	clockZoneMin = -1
+	if face := clockNow(0); face.h != 17 || face.m != 30 {
+		t.Fatalf("+05:30 face = %+v, want 17:30:00", face)
+	}
+}
+
+// TestClockZoneRereadsOnMinuteRollover pins the cache discipline: the row
+// is read once per displayed minute — a `settings set` lands within a
+// minute without a settings-bus subscription — and never twice inside one.
+func TestClockZoneRereadsOnMinuteRollover(t *testing.T) {
+	defer saveClockSeam()()
+	loads := 0
+	clockZoneLoad = func() clockfmt.Zone { loads++; return clockfmt.UTC }
+	clockZoneMin = -1
+	clockZoneFor(100)
+	clockZoneFor(100)
+	if loads != 1 {
+		t.Fatalf("two reads inside one minute: %d", loads)
+	}
+	clockZoneFor(101)
+	if loads != 2 {
+		t.Fatalf("minute rollover did not re-read: %d", loads)
+	}
 }

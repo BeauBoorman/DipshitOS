@@ -175,15 +175,36 @@ var timerPresetLabels = [5]string{"1m", "3m", "5m", "10m", "25m"}
 // alarmAt computes the next epoch at which the civil time in zone z reads
 // h:m — today's occurrence when it is still ahead, tomorrow's otherwise.
 // The zone's own civil day bounds the math, so a UTC+05:30 alarm lands on
-// the user's 07:30, not UTC's.
+// the user's 07:30, not UTC's; under a named zone the solve runs against
+// the instant-dependent offset (M178c), so a 07:30 alarm set the night
+// before a DST switch still rings at civil 07:30.
 func alarmAt(now int64, z clockfmt.Zone, h, m int) int64 {
 	c := clockfmt.At(now, z)
-	dayStart := now - int64(c.Hour*3600+c.Minute*60+c.Second)
-	t := dayStart + int64(h)*3600 + int64(m)*60
+	target := int64(h)*3600 + int64(m)*60
+	// The local wall clock at now is epoch + the offset now in force;
+	// today's wall midnight plus the h:m target is the candidate wall.
+	wallMidnight := now + clockfmt.Offset(now, z) -
+		int64(c.Hour*3600+c.Minute*60+c.Second)
+	t := localEpoch(wallMidnight+target, now, z)
 	if t <= now {
-		t += 86400
+		t = localEpoch(wallMidnight+86400+target, now, z)
 	}
 	return t
+}
+
+// localEpoch solves e + Offset(e, z) = wall for e: the wall reading is the
+// user-facing civil time, the offset is what the zone charges at the
+// answer. A fixed offset converges in one pass and lands exactly where the
+// old dayStart arithmetic did; a named zone can step once mid-day (the
+// twice-a-year transition), so the guess refines a few times. A wall time
+// the transition skips or repeats pins to the transition's edge — an alarm
+// set inside the spring gap fires at the jump, which is the honest answer.
+func localEpoch(wall, guess int64, z clockfmt.Zone) int64 {
+	e := wall - clockfmt.Offset(guess, z)
+	for i := 0; i < 3; i++ {
+		e = wall - clockfmt.Offset(e, z)
+	}
+	return e
 }
 
 // parseHHMM validates a four-digit HHMM field and splits it.

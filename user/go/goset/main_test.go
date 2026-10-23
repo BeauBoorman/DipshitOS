@@ -546,7 +546,7 @@ func TestTimezoneRowCyclesAndValidatesBeforeSave(t *testing.T) {
 	if got, _ := settings.Get(a.disp, "timezone"); got != "UTC+05:30" {
 		t.Fatalf("typed timezone = %q, want UTC+05:30", got)
 	}
-	for _, val := range []string{"utc", "Europe/Paris", "UTC+5:30", "UTC+15:00", ""} {
+	for _, val := range []string{"utc", "Europe/Nowhere", "UTC+5:30", "UTC+15:00", ""} {
 		a.input.SetValue("timezone=" + val)
 		a.applyInput()
 		if got, _ := settings.Get(a.disp, "timezone"); got != "UTC+05:30" {

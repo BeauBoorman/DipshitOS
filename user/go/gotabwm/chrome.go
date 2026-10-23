@@ -32,7 +32,9 @@
 package main
 
 import (
+	"virelai/clockfmt"
 	"virelai/draw"
+	"virelai/settings"
 	"virelai/theme"
 	"virelai/vi"
 	"virelai/widgets"
@@ -162,11 +164,37 @@ func paintGodMenuButton(scan []byte, width, height int) int {
 	return n
 }
 
+// clockZoneLoad is the seat clock's seam for the `timezone` row — real
+// settings.Load on the guest, stubbed in host tests (the notify.go
+// settings.Load discipline). M178c (#3146): the row applies to the kernel
+// source, the same epoch `date` formats, so the seat's face agrees with
+// the shell's. The host .clock is already the host's local face and
+// uptime has no epoch, so neither carries the row.
+var clockZoneLoad = func() clockfmt.Zone { return settings.Load().Timezone() }
+
+// clockZone caches the row between minute rollovers: the read is one
+// bounded file decode and a settings change lands within a minute, the
+// same re-read pattern refreshReduceMotion (notify.go) uses — no
+// settings-bus subscription needed.
+var clockZoneMin int64 = -1
+var clockZoneVal clockfmt.Zone
+
+// clockZoneFor returns the row in force for the displayed minute, re-
+// reading the file when the minute rolls over (and once at boot, when the
+// -1 sentinel misses).
+func clockZoneFor(minute int64) clockfmt.Zone {
+	if minute != clockZoneMin {
+		clockZoneVal = clockZoneLoad()
+		clockZoneMin = minute
+	}
+	return clockZoneVal
+}
+
 // clockNow resolves the face from the honest sources in D2's order.
 func clockNow(ticks uint64) clockFace {
 	if ep, ok := kernelEpoch(); ok {
-		h, m, s := clockHMS(0, ep, true)
-		return clockFace{h: h, m: m, s: s, source: "kernel"}
+		c := clockfmt.At(ep, clockZoneFor(ep/60))
+		return clockFace{h: c.Hour, m: c.Minute, s: c.Second, source: "kernel"}
 	}
 	if ep, ok := hostEpoch(); ok {
 		h, m, s := clockHMS(ticks, ep, true)
@@ -176,15 +204,19 @@ func clockNow(ticks uint64) clockFace {
 	return clockFace{h: h, m: m, s: s, source: "uptime"}
 }
 
+// kernelTime is the slot-66 read behind kernelEpoch — a var so a host test
+// can drive the face without the guest syscall.
+var kernelTime = vi.Time
+
 // kernelEpoch is sys_time (slot 66): Unix wall-clock seconds, already
-// advanced by 1 Hz uptime, or no epoch at all. Folded to
-// seconds-since-midnight for the face.
-func kernelEpoch() (uint32, bool) {
-	v := vi.Time()
+// advanced by 1 Hz uptime, or no epoch at all. The FULL epoch travels —
+// a named zone's offset depends on the date, not just the time of day.
+func kernelEpoch() (int64, bool) {
+	v := kernelTime()
 	if v <= 0 {
 		return 0, false
 	}
-	return uint32(v % 86400), true
+	return v, true
 }
 
 // hostEpoch is /host/.clock, seconds since local midnight.

@@ -455,3 +455,77 @@ shutil.copy(os.path.join(os.environ["VG_SHARE"], "GOSHDATE.TXT"),
 print("date epoch %d agrees with the +05:30 face and lies within 60 s of host [%d, %d]" %
       (epoch, host_start, host_end))
 PY
+
+# --- M178c (#3146): date under a NAMED zone ----------------------------------
+# `date` resolves the `timezone` row through clockfmt: an IANA name carries
+# the zone's current POSIX-TZ rule, so the face and its label follow the
+# offset in force at the printed instant. This boot stores
+# `timezone=Europe/Berlin` before the shell starts (the kernel's `settings
+# set` validation is unchanged — out of scope on the card); the check runs
+# the printed epoch through python's zoneinfo rather than pinning one
+# offset, so the leg is correct across every DST boundary. Runs 01 and 05
+# pin the UTC default and a fixed offset — unchanged.
+vgate_file script-07.txt <<'EOF'
+settings set timezone Europe/Berlin
+tabwm
+tabwm start
+EOF
+
+vgate_file script2-07.txt <<'EOF'
+exec GOSH.ELF
+EOF
+
+vgate_file script3-07.txt <<'EOF'
+dui close 2
+echo rx-m178c-tz-ok
+EOF
+
+vgate_run 07 -- \
+    --screen '$RUN_DIR/screen-07' \
+    --via-virtio \
+    --script '$RUN_DIR/script-07.txt' \
+    --script2 '$RUN_DIR/script2-07.txt' \
+    --script2-after 'tabwm: sidebar-rendered' \
+    --script3 '$RUN_DIR/script3-07.txt' \
+    --script3-after 'gosh: prompt' \
+    --script-expect 'rx-m178c-tz-ok' --timeout 240
+
+vgate_assert 07 serial-contains 'settings: timezone=Europe/Berlin (persisted)'
+vgate_assert 07 serial-contains 'gosh: line date > /host/GOSHDATE.TXT'
+vgate_assert 07 serial-contains 'rx-m178c-tz-ok'
+vgate_assert 07 serial-absent '[EXC] parking:'
+vgate_assert 07 serial-absent 'exited status=139'
+vgate_assert 07 python <<'PY'
+import datetime, os, re, shutil, time, zoneinfo
+rd = os.environ["RUN_DIR"]
+with open(os.path.join(os.environ["VG_SHARE"], "GOSHDATE.TXT"), "rb") as fh:
+    line = fh.read()
+m = re.fullmatch(
+    rb"(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d) ([A-Z0-9+-]+ UTC[+-]\d\d:\d\d|[A-Z0-9+-]+ UTC) \(epoch=([0-9]+)\)\n",
+    line)
+if not m:
+    raise SystemExit("date did not print a calendar face + zone label + epoch: %r" % line)
+epoch = int(m.group(3))
+loc = datetime.datetime.fromtimestamp(epoch, datetime.timezone.utc).astimezone(
+    zoneinfo.ZoneInfo("Europe/Berlin"))
+if m.group(1).decode() != loc.strftime("%Y-%m-%d %H:%M:%S"):
+    raise SystemExit("date face %r disagrees with epoch %d in Europe/Berlin"
+                     % (m.group(1), epoch))
+off = int(loc.utcoffset().total_seconds())
+canon = "UTC" if off == 0 else "UTC%s%02d:%02d" % (
+    "+" if off >= 0 else "-", abs(off) // 3600, abs(off) // 60 % 60)
+want_label = "%s %s" % (loc.tzname(), canon)
+if m.group(2).decode() != want_label:
+    raise SystemExit("date label %r, want %r at epoch %d"
+                     % (m.group(2), want_label, epoch))
+with open(os.path.join(rd, "host-epoch-start.txt")) as fh:
+    host_start = float(fh.read())
+host_end = time.time()
+if not host_start - 60 <= epoch <= host_end + 60:
+    raise SystemExit("date epoch %d outside host interval [%d, %d] with 60 s slack"
+                     % (epoch, host_start, host_end))
+shutil.copy(os.path.join(os.environ["VG_SHARE"], "GOSHDATE.TXT"),
+            "artifacts/go-sh-share-date-named.txt")
+print("date epoch %d agrees with the Europe/Berlin face (%s) and lies within "
+      "60 s of host [%d, %d]" % (epoch, want_label, host_start, host_end))
+PY
