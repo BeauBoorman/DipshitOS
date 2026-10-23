@@ -72,4 +72,4 @@
   and is refused EINVAL every time, then exits 44 — the victim never
   exits). Live gate `verify-live-hardening.sh` PASS 1/1 on VZ.
 
-See [`march-m14.md`](../march-m14.md) for the per-card tracker.
+See [`march-m14.md`](march-m14.md) for the per-card tracker.

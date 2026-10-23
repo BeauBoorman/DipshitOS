@@ -56,4 +56,4 @@ Housekeeping folded into this milestone: the `win` → `dui` command rename
 pointer-focus evidence with the class-B CG gate (issue #151, self-gating
 on Accessibility trust).
 
-See [`march-m13.md`](../march-m13.md) for the per-card tracker.
+See [`march-m13.md`](march-m13.md) for the per-card tracker.

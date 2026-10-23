@@ -6,7 +6,7 @@
 > **Completed-milestone plans live in [`docs/archive/`](archive/README.md)** —
 > each milestone below points at its verbatim archived plan
 > (`roadmap-m{N}.md`, moved from this file by issue #264 / claim 2860). The
-> per-card trackers are `docs/march-m*.md`; this file holds pointers, the
+> per-card trackers are `docs/archive/march-m*.md`; this file holds pointers, the
 > current position, and the wishlist.
 
 ## Completed milestones (M0–M16) — archived plans
@@ -85,7 +85,7 @@
   ScrollView…), NOTEPAD depth, FILE.BIN preview/breadcrumbs, TOP sort/
   filter, CALC keyboard/history, SETTINGS theme preview. Shipped
   2026-08-21 — full card detail:
-  [`docs/m17-desktop-completeness.md`](m17-desktop-completeness.md).
+  [`docs/archive/m17-desktop-completeness.md`](archive/m17-desktop-completeness.md).
 - **Post-M17 arcs** — ALL DONE 2026-08-21:
   - **Arc1 — widget depth**: ScrollView, Checkbox/Toggle, ProgressBar,
     Dialog, HScrollBar, DropDown. PRs #259–#261.

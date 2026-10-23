@@ -6,17 +6,17 @@
 
 > Living status tracker. **Claims are GitHub issues labeled `claim`** (see
 > [Multiagent coordination](#multiagent-coordination)), not repo files. Keep
-> this file a compact table: per-card detail lives on the issue and its
-> `docs/march-m*.md` tracker, not here. Gates are the evidence — **observed**
+> this file a compact table: closed-milestone detail lives on the issue and
+> in its `docs/archive/march-*.md` tracker, not here. Gates are the evidence — **observed**
 > (saved gate output / CI) versus **inferred** (reasoning only). The
 > pre-compaction text (the M17–M51 gate-by-gate narrative, 2026-09-12,
 > 687 lines) is preserved in git history at `e5480c9`.
 
 ## Milestones
 
-All milestones through M52 are complete. Closed-milestone detail is under
-`docs/archive/` and in the per-arc `docs/march-m*.md` trackers; open cards, if
-any, are on the GitHub tracker.
+All milestones through M52 are complete. Closed-milestone detail is under `docs/archive/` (the per-arc `march-*.md`
+trackers and the `status-m*-detail.md` files); open cards, if any, are on the
+GitHub tracker.
 
 | # | Milestone | What it proved | Status |
 |---|-----------|----------------|--------|
@@ -283,8 +283,8 @@ The old file-based tracker (`docs/claims/` + `docs/logs/`) was deleted
 ## Housekeeping conventions
 
 - **This file is the single source of truth** for status, and stays a compact
-  table. Per-card detail goes on the issue; per-arc detail goes in one
-  `docs/march-m*.md` or ADR.
+  table. Per-card detail goes on the issue; closed-arc detail goes in the
+  archived tracker or an ADR.
 - **Evidence under `artifacts/`** (gitignored). No evidence ⇒ not observed.
 - **Facts vs inference:** hypotheses are tagged `(inferred)`; hardware tags flip
   only with saved logs.
@@ -300,5 +300,5 @@ The old file-based tracker (`docs/claims/` + `docs/logs/`) was deleted
 - [`architecture.md`](architecture.md) — components & data flow.
 - [`gate-inventory.md`](gate-inventory.md) · [`gate-fleet-inventory.md`](gate-fleet-inventory.md) — gate classes; generated fleet inventory.
 - [`archive/`](archive/) — closed-milestone detail (`status-m*-detail.md`), frozen designs, one-shots.
-- Per-milestone trackers: `docs/march-m*.md`.
+- Per-milestone trackers: `docs/archive/march-m*.md`.
 - Claims: `gh issue list --label claim --state open`.

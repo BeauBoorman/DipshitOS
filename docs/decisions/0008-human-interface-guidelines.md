@@ -138,6 +138,6 @@ The guidelines are enforced by gates, not by review:
 - Every new or changed command must ship its blurb, usage string, and
   `help <cmd>` entry, or the help/misuse gates fail.
 - The milestone-eight cards (U0–U8) implement this ADR; their scope, order,
-  and agent split live in [`march-m8.md`](../march-m8.md).
+  and agent split live in [`march-m8.md`](../archive/march-m8.md).
 - Status and roadmap updates land in `docs/status.md` / `docs/roadmap.md` at
   card close-out, per the repo's coordination rules.

@@ -6,7 +6,7 @@
 - Related: ADR 0009 (app events), ADR 0010 (userland storage), ADR 0011
   (desktop platform), ADR 0016 (pixel ownership), ADR 0013 D3.1 (.bss budget),
   ADR 0026 (Go runtime port — numbering note below), M40 GF6 (gate rules),
-  `docs/html-renderer-scoping.md` (the design card this ADR fixes),
+  `docs/archive/html-renderer-scoping.md` (the design card this ADR fixes),
   M70d #1456 (JS-in-WASM measurement), `docs/wasm-import-contract.md`
 
 ## Context

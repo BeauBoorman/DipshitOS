@@ -22,7 +22,7 @@ const std = @import("std");
 const console = @import("console.zig");
 const process = @import("process.zig");
 
-/// The pipe buffer size (march-m19.md P1: max 4 KiB).
+/// The pipe buffer size (docs/archive/march-m19.md P1: max 4 KiB).
 pub const pipe_capacity: usize = 4096;
 
 var buf: [pipe_capacity]u8 = undefined;

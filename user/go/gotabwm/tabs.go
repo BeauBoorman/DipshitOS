@@ -77,7 +77,7 @@ type Tab struct {
 	navCount int
 	navPos   int
 	// Frozen is FlagFrozen (0x02). M71e (#1564): Zig's BT6 frozen is a
-	// STATUS BADGE (docs/march-m39-tabbed-desktop.md labels it "a frozen
+	// STATUS BADGE (docs/archive/march-m39-tabbed-desktop.md labels it "a frozen
 	// status badge (Ctrl+Shift+F)", and tabwm.zig's field comment calls it
 	// "future demand-paging freeze"). It is deliberately NOT a lock: Zig
 	// has no frozen check anywhere in its close path, so GOTABWM refuses

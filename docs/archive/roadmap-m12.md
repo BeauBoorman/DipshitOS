@@ -11,7 +11,7 @@
 
 > Connect userland applications to the network with a clean TCP syscall seam (ADR 0007 slots 30–33),
 > RFC 1035 DNS resolution, and standalone network applications (`TCP.BIN`, `FETCH.BIN`, `CHAT.BIN`).
-> See [`docs/march-m12.md`](../march-m12.md) and [`docs/decisions/0012-userland-network-applications.md`](../decisions/0012-userland-network-applications.md) (Issues #148, #149, #150).
+> See [`docs/march-m12.md`](march-m12.md) and [`docs/decisions/0012-userland-network-applications.md`](../decisions/0012-userland-network-applications.md) (Issues #148, #149, #150).
 
 - **N0 — Architecture & Network ABI contract (ADR 0012).** Normative specification
   for userland networking: TCP syscall semantics (`sys_tcp_connect`, `sys_tcp_send`, `sys_tcp_recv`, `sys_tcp_close` on slots 30–33),
@@ -26,4 +26,4 @@
   combining `ui.zig` micro-widgets with UDP messaging. Live gate: `verify-live-fetch.sh`.
 
 
-See [`march-m12.md`](../march-m12.md) for the per-card tracker.
+See [`march-m12.md`](march-m12.md) for the per-card tracker.

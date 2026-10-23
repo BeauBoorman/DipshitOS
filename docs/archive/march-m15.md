@@ -11,7 +11,7 @@
 > gates, hard gates) and links here. Marking a step in this file never
 > collides with status.md edits.
 >
-> Milestone scope, definition of done, and hard gates: [`docs/status.md`](status.md).
+> Milestone scope, definition of done, and hard gates: [`docs/status.md`](../status.md).
 > Claim work first (`docs/claims/`), append to your branch's log
 > (`docs/logs/`), and record per-step progress in your claim file — then
 > flip your row here. Evidence in `artifacts/`; no evidence, no `✅`.

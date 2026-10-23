@@ -3,7 +3,7 @@
 > **Archived from `docs/status.md` on 2026-08-21 (issue #262).**
 > The canonical one-line summary now lives in `docs/status.md` Current position table.
 > This file preserves the full narrative that was previously inline in `docs/status.md`
-> so the live tracker can stay ~150–200 lines. See also [`docs/march-m11.md`](../march-m11.md) and the claim files cited below.
+> so the live tracker can stay ~150–200 lines. See also [`docs/march-m11.md`](march-m11.md) and the claim files cited below.
 
 ## One-line summary (now in `docs/status.md`)
 
@@ -11,7 +11,7 @@
 
 - **Close date:** 2026-08-16
 - **Claim:** 2427
-- **March tracker:** [`docs/march-m11.md`](../march-m11.md)
+- **March tracker:** [`docs/march-m11.md`](march-m11.md)
 
 ## Full narrative as it appeared in `docs/status.md` (pre-compression)
 
@@ -32,7 +32,7 @@ The following is the verbatim Current position table row for M11, previously at 
 ### Notes on `## What comes immediately afterward`
 
 M11 closed after the `## What comes immediately afterward` ordered list was frozen;
-its cards are tracked in [`docs/march-m11.md`](../march-m11.md) and its close-out is noted
+its cards are tracked in [`docs/march-m11.md`](march-m11.md) and its close-out is noted
 only in the Current position table row above (now archived here). No numbered entry for M11
 existed in the pre-compression list (which ended at item 18 for M8).
 

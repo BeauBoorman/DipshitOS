@@ -22,7 +22,7 @@
 
 ## M18 — Terminal & shell depth
 
-> Full card detail: [`docs/march-m18.md`](../march-m18.md).
+> Full card detail: [`docs/march-m18.md`](march-m18.md).
 
 The shell is the most-used interface in VirelaiOS. This milestone makes it
 actually comfortable to work in.
@@ -45,7 +45,7 @@ No new kernel syscalls.
 
 ## M19 — Shell as programming environment
 
-> Full card detail: [`docs/march-m19.md`](../march-m19.md).
+> Full card detail: [`docs/march-m19.md`](march-m19.md).
 
 The shell should be a *tool*, not just a command-line echo chamber.
 
@@ -68,7 +68,7 @@ script execution.
 
 ## M20 — Text rendering & Unicode
 
-> Full card detail: [`docs/march-m20.md`](../march-m20.md).
+> Full card detail: [`docs/march-m20.md`](march-m20.md).
 
 The framebuffer text layer should handle more than ASCII.
 
@@ -90,7 +90,7 @@ variable-width fonts (monospace only for now). No CJK/Latin/Beyond.
 
 ## M21 — Window management depth
 
-> Full card detail: [`docs/march-m21.md`](../march-m21.md).
+> Full card detail: [`docs/march-m21.md`](march-m21.md).
 
 The window manager should feel *intentional*, not just functional.
 
@@ -112,7 +112,7 @@ in Arc4). No multi-monitor (single display only).
 
 ## M22 — Developer tools
 
-> Full card detail: [`docs/march-m22.md`](../march-m22.md).
+> Full card detail: [`docs/march-m22.md`](march-m22.md).
 
 A "weird little computer" needs tools to build things *on* it.
 
@@ -134,7 +134,7 @@ for now). No debugger (tombstones + strace cover the basics).
 
 ## M23 — The text editor
 
-> Full card detail: [`docs/march-m23.md`](../march-m23.md).
+> Full card detail: [`docs/march-m23.md`](march-m23.md).
 
 NOTEPAD exists. A *text editor* does not. This milestone builds one that
 a developer could actually use for small files.
@@ -160,7 +160,7 @@ for a *small* OS.
 
 ## M24 — CALC grows up
 
-> Full card detail: [`docs/march-m24.md`](../march-m24.md).
+> Full card detail: [`docs/march-m24.md`](march-m24.md).
 
 The calculator should actually be useful.
 
@@ -182,7 +182,7 @@ This is a pocket calculator, not Mathematica.
 
 ## M25 — File manager depth
 
-> Full card detail: [`docs/march-m25.md`](../march-m25.md).
+> Full card detail: [`docs/march-m25.md`](march-m25.md).
 
 FILE.BIN is a file browser. This milestone makes it a file *manager*.
 
@@ -204,7 +204,7 @@ model. No file content search (use EDIT.BIN or Ctrl+F).
 
 ## M26 — Network experience
 
-> Full card detail: [`docs/march-m26.md`](../march-m26.md).
+> Full card detail: [`docs/march-m26.md`](march-m26.md).
 
 The network stack exists (M5). This milestone makes it *visible* and *useful*.
 
@@ -226,7 +226,7 @@ No network file system. This is diagnostics, not infrastructure.
 
 ## M27 — Desktop polish & completeness
 
-> Full card detail: [`docs/march-m27.md`](../march-m27.md).
+> Full card detail: [`docs/march-m27.md`](march-m27.md).
 
 The final milestone in this arc. Not new capabilities — making everything
 *feel right*.
