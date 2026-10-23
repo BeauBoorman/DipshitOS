@@ -27,8 +27,11 @@ type AppEntry struct {
 	// after the binary. Empty on a v1 row, and the launch is the binary
 	// alone.
 	Args []string
-	// Caps is `caps=` — declared capabilities, metadata only (M82a's
-	// non-goal: nothing here grants or gates power).
+	// Caps is `caps=` — declared capabilities. M188a (#3186) made them
+	// load-bearing: the kernel intersects the exec'd process's grant
+	// decision with the declared words plus the runtime floor, so an
+	// underdeclared verb is refused by name. The seat still treats the
+	// field as data it reports, never as something it enforces.
 	Caps []string
 	// Opens is `opens=` — what the app can be handed: an M81b mime type
 	// name (text image audio archive binary), a URL scheme, or since

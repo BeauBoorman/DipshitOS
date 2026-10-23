@@ -145,6 +145,18 @@ pub const baseline: u32 = (1 << word_count) - 1;
 /// or consented app's row keeps its `net`/`file`/`audio` words.
 pub const ambient: u32 = baseline & ~(word_file | word_audio | word_net);
 
+/// M188a (#3186, ADR 0054 amendment): the manifest `caps=` ceiling.
+/// `image/apps.txt`'s declared words reach exec as a NARROW-ONLY bound:
+/// the process's word set is `decide(name) & (declared | caps_floor)` —
+/// the manifest can only remove power the grant decision already gave,
+/// never add to it, which is why the guest-writable file is safe as a
+/// ceiling source (the ADR's rejected alternative was caps as a GRANT
+/// source; a ceiling grants nothing). `caps_floor` is the Go-runtime
+/// existence set the fleet audit convention implies (debug = print/exit,
+/// memory = allocation, process = spawn/lifecycle/mmap) — an app may not
+/// declare those away, they are how a process exists at all.
+pub const caps_floor: u32 = word_memory | word_process | word_debug;
+
 const vocab = [word_count][]const u8{ "file", "window", "audio", "timer", "memory", "process", "debug", "net", "term" };
 
 comptime {
@@ -491,6 +503,67 @@ pub fn lookup(name: []const u8, scratch: *Row) Lookup {
         }
     }
     return .none;
+}
+
+// ---------------------------------------------------------------------------
+// M188a (#3186): the APPS.TXT `caps=` ceiling — the manifest's declared
+// words, parsed at exec into the bound `decide`'s answer is intersected
+// with.
+// ---------------------------------------------------------------------------
+
+/// The manifest's share name — same host-share channel `GRANTS.TXT`
+/// reads through.
+pub const manifest_filename = "APPS.TXT";
+/// Every reader's manifest budget (sexiburger.manifest_buf_max): a file
+/// at or over it is truncated at the last whole line.
+pub const manifest_max: usize = 4096;
+
+var manifest_buf: [manifest_max]u8 = undefined;
+
+/// The ceiling `name`'s manifest row declares, or null when the row is
+/// absent, carries no `caps=` field, or the field is unparseable — an
+/// unreadable declaration is no ceiling at all, and the grant decision
+/// alone governs (the backwards-compatible default: a caps-less spawn
+/// behaves exactly as today). Because the ceiling only narrows, a
+/// guest-authored or mangled manifest can at worst restore the grant
+/// row's words — never exceed them. Returned WITH `caps_floor` unioned
+/// in: the existence words are implied, not declared.
+pub fn manifest_ceiling(text: []const u8, name: []const u8) ?u32 {
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (line.len == 0 or line[0] == '#') continue;
+        var fit = std.mem.splitScalar(u8, line, '|');
+        const rname = std.mem.trim(u8, fit.next() orelse continue, " \t");
+        // Case-insensitive like the row keys (APFS canonicalization).
+        if (rname.len == 0 or !std.ascii.eqlIgnoreCase(rname, name)) continue;
+        // The trailing key=value space starts at field 5 — the same
+        // split every reader honors (a `caps=` in a positional field is
+        // label text, not a declaration). A repeated key resolves to its
+        // last field, matching the Go seat's parse.
+        var declared: ?u32 = null;
+        var i: usize = 1;
+        while (fit.next()) |f| : (i += 1) {
+            if (i < 4) continue;
+            const t = std.mem.trim(u8, f, " \t");
+            if (!std.mem.startsWith(u8, t, "caps=")) continue;
+            declared = parseWords(std.mem.trim(u8, t[5..], " \t")) orelse return null;
+        }
+        return if (declared) |d| d | caps_floor else null;
+    }
+    return null;
+}
+
+/// Read `APPS.TXT` and resolve `name`'s `caps=` ceiling. Null on no
+/// channel, no file, or no declaration — every unresolvable state means
+/// "no ceiling", the exact pre-M188a behavior. One BSS buffer under the
+/// exec loader's synchronous discipline (the same `pending_*` /
+/// `program` convention exec keeps — exec holds the FILE|KERNEL
+/// domains, so no two execs parse the buffer concurrently).
+pub fn caps_ceiling(name: []const u8) ?u32 {
+    if (!virtio_file.available()) return null;
+    const n = virtio_file.read_whole(manifest_filename, &manifest_buf) orelse return null;
+    return manifest_ceiling(manifest_buf[0..n], name);
 }
 
 comptime {
@@ -1742,6 +1815,92 @@ test "grant: fleet base rows cover the shipped roster (M116a #2467)" {
             if (std.mem.eql(u8, n, name)) found = true;
         }
         try std.testing.expect(found);
+    }
+}
+
+test "grant: manifest caps= parses into a narrow-only ceiling (M188a)" {
+    init();
+    const manifest =
+        "# comment\n" ++
+        "GOCALC.ELF | 64-bit Calc | c | dock=true\n" ++ // v1 row: no tail
+        "PROBE.ELF | Probe | p | dock=false | v=2 | caps=file,net\n" ++
+        "EMPTY.ELF | Empty | e | dock=false | v=2 | caps=-\n" ++
+        "BAD.ELF | Bad | b | dock=false | v=2 | caps=narnia\n" ++
+        "POS.ELF | caps=file | x | dock=false | v=2\n"; // caps in a positional field
+    // A declared row: ceiling = declared | caps_floor.
+    try std.testing.expectEqual(
+        @as(?u32, word_file | word_net | caps_floor),
+        manifest_ceiling(manifest, "PROBE.ELF"),
+    );
+    // Case-insensitive like the grant row keys.
+    try std.testing.expectEqual(
+        @as(?u32, word_file | word_net | caps_floor),
+        manifest_ceiling(manifest, "probe.elf"),
+    );
+    // caps=- declares nothing beyond the existence floor.
+    try std.testing.expectEqual(@as(?u32, caps_floor), manifest_ceiling(manifest, "EMPTY.ELF"));
+    // No caps= field, an unparseable declaration, and a caps= sitting in
+    // the positional span all resolve to no ceiling — the grant decision
+    // alone governs (the caps-less backwards default).
+    try std.testing.expectEqual(@as(?u32, null), manifest_ceiling(manifest, "GOCALC.ELF"));
+    try std.testing.expectEqual(@as(?u32, null), manifest_ceiling(manifest, "BAD.ELF"));
+    try std.testing.expectEqual(@as(?u32, null), manifest_ceiling(manifest, "POS.ELF"));
+    try std.testing.expectEqual(@as(?u32, null), manifest_ceiling(manifest, "GONE.ELF"));
+    // The ceiling's only direction is down: it can never exceed the
+    // vocabulary the grant decision could have produced.
+    if (manifest_ceiling(manifest, "PROBE.ELF")) |c| {
+        try std.testing.expect((c & ~baseline) == 0);
+    }
+}
+
+test "grant: shipped manifest rows never underdeclare their audited calls (M188a)" {
+    // The fleet-truth pin: for every apps.txt row carrying caps=, the
+    // declared words plus the runtime floor must cover that app's
+    // OBSERVED audit set in image/fleet-grants.txt — an underdeclaring
+    // row is exactly the case the audit fixes or names. Rows with no
+    // caps= stay unenforced by the manifest (the transition rule).
+    const apps_txt = try readRepoFile("image/apps.txt", 8 * 1024);
+    defer std.testing.allocator.free(apps_txt);
+    const policy = try readRepoFile("image/fleet-grants.txt", 32 * 1024);
+    defer std.testing.allocator.free(policy);
+
+    var observed: [64]u32 = @splat(0);
+    var names: [64][]const u8 = undefined;
+    var obs_count: usize = 0;
+    var pit = std.mem.splitScalar(u8, policy, '\n');
+    while (pit.next()) |line| {
+        if (line.len == 0 or line[0] == '#') continue;
+        var fit = std.mem.splitScalar(u8, line, '\t');
+        const name = fit.next() orelse return error.BadPolicyLine;
+        const obs_s = fit.next() orelse return error.BadPolicyLine;
+        try std.testing.expect(obs_count < names.len);
+        names[obs_count] = name;
+        observed[obs_count] = parseWords(obs_s) orelse return error.BadObserved;
+        obs_count += 1;
+    }
+
+    var ait = std.mem.splitScalar(u8, apps_txt, '\n');
+    while (ait.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (line.len == 0 or line[0] == '#') continue;
+        var fit = std.mem.splitScalar(u8, line, '|');
+        const name = std.mem.trim(u8, fit.next() orelse continue, " \t");
+        var declared: ?u32 = null;
+        var i: usize = 1;
+        while (fit.next()) |f| : (i += 1) {
+            if (i < 4) continue;
+            const t = std.mem.trim(u8, f, " \t");
+            if (std.mem.startsWith(u8, t, "caps=")) {
+                declared = parseWords(std.mem.trim(u8, t[5..], " \t")) orelse
+                    return error.BadManifestCaps; // an unreadable declaration is a lie
+            }
+        }
+        const d = declared orelse continue; // caps-less rows are unenforced
+        for (names[0..obs_count], observed[0..obs_count]) |n, obs| {
+            if (!std.ascii.eqlIgnoreCase(n, name)) continue;
+            // declared ∪ floor must cover the observed call set.
+            try std.testing.expect((obs & ~(d | caps_floor)) == 0);
+        }
     }
 }
 

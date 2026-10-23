@@ -318,6 +318,10 @@ pub fn last_exec_pid() ?usize {
 /// a single context), so one pending slot suffices — the same discipline
 /// `program` and `envp_*` already keep.
 var pending_words: u32 = grant.ambient;
+/// M188a (#3186): the grant decision BEFORE the manifest `caps=` ceiling
+/// intersects it — the word gate compares `words` against this to name a
+/// caps-stripped denial `caps_denied`.
+var pending_granted: u32 = grant.ambient;
 var pending_digest: [measure.digest_len]u8 = @as([measure.digest_len]u8, @splat(@as(u8, 0)));
 var pending_measured_ok: bool = false;
 var pending_name: []const u8 = "";
@@ -364,7 +368,7 @@ fn emit_exec_receipt(verdict: []const u8) void {
 /// failed but no row required one) emits `unmeasured` — a stage that was
 /// not measured is never reported `measured`.
 fn note_exec_grant(proc_id: usize) void {
-    process.set_grant(proc_id, pending_words, pending_digest, pending_measured_ok);
+    process.set_grant(proc_id, pending_words, pending_granted, pending_digest, pending_measured_ok);
     emit_exec_receipt(if (pending_measured_ok) "measured" else "unmeasured");
 }
 
@@ -389,6 +393,13 @@ fn apply_exec_grant(name: []const u8, size: u64, uid: u32) ExecResult {
             return .grant_stale;
         },
     }
+    // M188a (#3186, ADR 0054 amendment): the manifest's `caps=` reaches
+    // exec as a NARROW-ONLY ceiling — the granted set intersected with
+    // the declared words (plus the runtime floor). No row, no `caps=`,
+    // an unreadable manifest — all resolve to null and the decision
+    // stands untouched: a caps-less spawn is byte-identical to today.
+    pending_granted = pending_words;
+    if (grant.caps_ceiling(name)) |ceiling| pending_words &= ceiling;
     return .ok;
 }
 

@@ -11,10 +11,10 @@
 #          in every reader, so an undocked v2 row writes `dock=false`.
 #   argv=  fixed arguments after the binary, space separated, at most 8 (the
 #          kernel's exec bound). v1: none.
-#   caps=  declared capabilities, comma separated: file window audio timer
-#          memory process debug net term — the first seven are the WASM
-#          import contract's Cap names (user/src/wasm.zig). DECLARATIVE:
-#          nothing grants or gates power from this field.
+#   caps=  declared capabilities, comma separated (WASM Cap names;
+#          user/src/wasm.zig). Enforced narrow-only at exec: grant
+#          decision ∩ (declared ∪ {memory,process,debug}); `caps_denied`
+#          names the refusal. No caps= → unenforced. (ADR 0054, #3186)
 #   opens= what the app can be handed: an M81b mime type (text image audio
 #          archive binary document), a URL scheme (http https; M81c #1763),
 #          or an M124a (#2580) type/subtype spelling (text/plain, image/png).
@@ -34,18 +34,18 @@ NOTE.ELF | Text Editor | n | dock=true | v=2 | opens=text
 GOEDIT.ELF | Code Editor | e | dock=true | v=2 | opens=text,binary | selection=primary
 GOFILES.ELF | Files | f | dock=true | v=2 | caps=file,window | opens=text/vcard
 GOTERM.ELF | Terminal | t | dock=true | v=2 | selection=primary
-WEB.ELF | Web | w | dock=true | v=2 | caps=net | opens=http,https
+WEB.ELF | Web | w | dock=true | v=2 | caps=file,window,net | opens=http,https
 PULSE.ELF | Pulse | u | dock=true
 GOSH.ELF | Shell | s | dock=false | v=2 | caps=file,process,term
 GOHELP.ELF | Help | h
 GOWELCOME.ELF | Welcome | ?
 GOTOP.ELF | Top | p | dock=true
-GOSET.ELF | Settings | g | dock=false | v=2 | caps=file
+GOSET.ELF | Settings | g | dock=false | v=2 | caps=file,window,audio
 GOVIEW.ELF | Image Viewer | v | dock=false | v=2 | opens=image
 GOSOUND.ELF | Sound | a | dock=false | v=2 | caps=file,window,audio | opens=audio
 TABWM.BIN | Tabbed Desktop | m
 GOSTALGIA.ELF | Gostalgia | o | dock=false | v=2 | argv=shell --root /host/GS | caps=file,window,term,process
-GOSTORE.ELF | Store | i | dock=false | v=2 | caps=file,net
+GOSTORE.ELF | Store | i | dock=false | v=2 | caps=file,window,net
 GOINFER.ELF | LLM Infer | l | dock=false | v=2 | caps=file
 GOREC.ELF | Recorder | r | dock=false | v=2 | caps=file,audio
 GOSNAP.ELF | Snapshots | b | dock=false | v=2 | caps=file
@@ -53,9 +53,9 @@ GOASSIST.ELF | Assistant | y | dock=false | v=2 | caps=file,window
 GOSHEET.ELF | Sheet | x | dock=false | v=2 | caps=file,window | opens=text
 GOREADER.ELF | Reader | d | dock=false | v=2 | caps=file,window | opens=document
 GOCLOCK.ELF | Clock | k | dock=false | v=2 | caps=file,window,timer | opens=text/calendar
-GOMINE.ELF | Mines | j | dock=false | v=2 | caps=window,audio
-GOSOL.ELF | Solitaire | q | dock=false | v=2 | caps=window,audio
-GOEMOJI.ELF | Emoji | : | dock=false | v=2 | caps=window
+GOMINE.ELF | Mines | j | dock=false | v=2 | caps=file,window,audio
+GOSOL.ELF | Solitaire | q | dock=false | v=2 | caps=file,window,audio
+GOEMOJI.ELF | Emoji | : | dock=false | v=2 | caps=file,window
 GOIRC.ELF | IRC | / | dock=false | v=2 | caps=file,window,net
 GOVAULT.ELF | Vault | $ | dock=false | v=2 | caps=file,window,timer | selection=primary
 GOMAIL.ELF | Mail | @ | dock=false | v=2 | caps=file,net

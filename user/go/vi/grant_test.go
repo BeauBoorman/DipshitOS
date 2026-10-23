@@ -201,3 +201,21 @@ func TestGrantDenialsRefusedStaysUnknown(t *testing.T) {
 		t.Fatalf("lines=%v rc=%d", lines, rc)
 	}
 }
+
+// TestCapsCeilingImpliesTheRuntimeFloor pins the M188a composition: the
+// manifest's declared words plus the existence verbs the kernel unions
+// in — memory, process, debug (grant.caps_floor).
+func TestCapsCeilingImpliesTheRuntimeFloor(t *testing.T) {
+	got := GrantWordsCanonical(CapsCeiling([]string{"file", "net"}))
+	if got != "file,memory,process,debug,net" {
+		t.Fatalf("ceiling = %q", got)
+	}
+	// A declared existence word is not duplicated, and an empty
+	// declaration is the floor alone.
+	if got := GrantWordsCanonical(CapsCeiling([]string{"debug"})); got != "memory,process,debug" {
+		t.Fatalf("dup floor = %q", got)
+	}
+	if got := GrantWordsCanonical(CapsCeiling(nil)); got != "memory,process,debug" {
+		t.Fatalf("empty = %q", got)
+	}
+}

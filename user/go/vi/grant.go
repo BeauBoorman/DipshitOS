@@ -101,6 +101,21 @@ func GrantWordsCanonical(words []string) string {
 	return strings.Join(out, ",")
 }
 
+// CapsFloorWords are the existence verbs every enforced caps= ceiling
+// implies (kernel grant.caps_floor — M188a): the manifest's declared set
+// is read as "these powers, plus existing" because an app that cannot
+// allocate, spawn, print, or exit is not confined, it is stuck.
+var CapsFloorWords = [3]string{"memory", "process", "debug"}
+
+// CapsCeiling renders the enforced ceiling a manifest caps= declaration
+// produces: the declared words plus the floor, in canonical vocabulary
+// order — the set the kernel intersects the grant decision with at exec.
+// Unknown words pass through like GrantWordsCanonical (the kernel's own
+// parse refuses a word outside the vocabulary as "no ceiling").
+func CapsCeiling(declared []string) []string {
+	return append(append([]string{}, declared...), CapsFloorWords[:]...)
+}
+
 // GrantWordsSubset reports whether every word of a is in b — the
 // non-widening test ADR 0054 D10 names for an update's declared words
 // against the words a consent already granted.

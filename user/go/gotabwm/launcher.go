@@ -376,10 +376,16 @@ func execSelected() {
 		seatRefusalErr(err, "exec "+bin, bin)
 		return
 	}
+	// M188a: the marker reports the declared ceiling the kernel now
+	// enforces — the manifest's caps= plus the implied runtime floor.
+	caps := ""
+	if len(e.Caps) > 0 {
+		caps = " caps=" + vi.GrantWordsCanonical(vi.CapsCeiling(e.Caps))
+	}
 	if len(e.Args) > 0 {
-		vi.ConsoleLine(MarkerLaunchExec + e.Bin + " argv=" + joinSpace(e.Args))
+		vi.ConsoleLine(MarkerLaunchExec + e.Bin + " argv=" + joinSpace(e.Args) + caps)
 	} else {
-		vi.ConsoleLine(MarkerLaunchExec + e.Bin)
+		vi.ConsoleLine(MarkerLaunchExec + e.Bin + caps)
 	}
 	launch.launching = true
 	if releaseLauncherFocus(false) {

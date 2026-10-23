@@ -244,3 +244,108 @@ if not names:
     sys.exit("FAIL: no agentd dispatch receipts in AGENT/AUDIT")
 print("boundary host inspection ok: %d receipts, write inside only" % len(names))
 PY
+
+# ---------------------------------------------------------------------------
+# M188a (#3186, ADR 0054 amendment): the manifest `caps=` ceiling. One probe
+# binary ships under two names on a mode=enforce share; both get a wildcard
+# GRANTS.TXT row granting file+window+net, but only CAPSP.ELF has an
+# APPS.TXT row — caps=file (which strips net AND window the row granted).
+# The row is the controlled variable: same bytes, same grant, different
+# declared set.
+#   * CAPSP.ELF — the file read lands (declared), the listen is refused
+#     EACCES and the kernel receipts `refused:caps_denied` naming the word
+#     the manifest stripped (word=net), not a crash.
+#   * NOCAPS.ELF — no manifest row: the caps-less spawn is unchanged —
+#     both boundary verbs work, no denial receipt names it.
+# ---------------------------------------------------------------------------
+
+vgate_file caps_probe.go <<'EOF'
+package main
+
+import (
+    "virelai/vi"
+    "virelai/vsys"
+)
+
+func main() {
+    if _, rc := vi.ReadFileAll("PROBE.TXT", 64); rc < 0 {
+        vsys.Println("capsprobe: file refused " + vi.ErrnoName(rc))
+    } else {
+        vsys.Println("capsprobe: file read")
+    }
+    // Slot 9 (net word): a listen-table bind needs no wire state — when
+    // granted it just succeeds, when caps-stripped it returns EACCES.
+    if rc := vi.UDPListen(4871); rc < 0 {
+        vsys.Println("capsprobe: listen refused " + vi.ErrnoName(rc))
+    } else {
+        vsys.Println("capsprobe: listen ok")
+    }
+    vsys.Println("capsprobe: done")
+    vsys.Exit(0)
+}
+EOF
+
+vgate_setup_python <<'PY'
+import os, shutil, subprocess, sys
+
+run = os.environ["RUN_DIR"]
+share = os.path.join(run, "caps-share")
+os.makedirs(share, exist_ok=True)
+
+probe_dir = os.path.join(run, "capsprobe-build")
+os.makedirs(probe_dir, exist_ok=True)
+env = dict(os.environ, TMPDIR=probe_dir,
+           GO_BUILD_OUT=probe_dir, GO_BUILD_NAME="PROBE",
+           GO_LDFLAGS_VALUE="-s -w")
+subprocess.run(["bash", "tools/go/build-go.sh",
+                os.path.join(run, "caps_probe.go")], env=env, check=True)
+probe = os.path.join(probe_dir, "PROBE.ELF")
+for name in ("CAPSP.ELF", "NOCAPS.ELF"):
+    shutil.copy(probe, os.path.join(share, name))
+
+open(os.path.join(share, "PROBE.TXT"), "w").write("caps-probe-payload\n")
+# The manifest: ONE row, declaring file only — net and window are the
+# granted words the ceiling strips.
+open(os.path.join(share, "APPS.TXT"), "w").write(
+    "# manifest under test\n"
+    "CAPSP.ELF | Caps Probe | p | dock=false | v=2 | caps=file\n")
+# Enforce posture + wildcard rows granting the same set to both names.
+open(os.path.join(share, "GRANTS.TXT"), "w").write(
+    "#v1 mode=enforce\n"
+    "CAPSP.ELF\t*\tfile,window,memory,process,debug,net\n"
+    "NOCAPS.ELF\t*\tfile,window,memory,process,debug,net\n")
+print("caps-share staged: two probe names, enforce GRANTS, one caps row")
+PY
+
+vgate_file script-03a.txt <<'PYEOF'
+exec CAPSP.ELF
+PYEOF
+
+vgate_file script-03b.txt <<'PYEOF'
+exec NOCAPS.ELF
+PYEOF
+
+vgate_file script-03c.txt <<'PYEOF'
+echo caps-run-done
+PYEOF
+
+vgate_run 03 -- --cvc-file '$RUN_DIR/caps-share' \
+    --script '$RUN_DIR/script-03a.txt' \
+    --script2 '$RUN_DIR/script-03b.txt' --script2-after 'capsprobe: done' \
+    --script3 '$RUN_DIR/script-03c.txt' --script3-after 'NOCAPS.ELF exited status=0' \
+    --script-expect 'caps-run-done' --timeout 120
+
+# The declared verb lands; the manifest-stripped one is refused by name —
+# the receipt names the LAYER (caps_denied) and the word it stripped.
+vgate_assert 03 serial-contains 'verdict=measured name=CAPSP.ELF'
+vgate_assert 03 serial-count 'capsprobe: file read' 2
+vgate_assert 03 serial-contains 'capsprobe: listen refused EACCES'
+vgate_assert 03 serial-contains 'verdict=refused:caps_denied name=CAPSP.ELF word=net'
+vgate_assert 03 serial-contains 'CAPSP.ELF exited status=0'
+# The caps-less spawn is unchanged: the same bytes under a plain grant row
+# run the boundary verb and earn no denial of either kind.
+vgate_assert 03 serial-contains 'capsprobe: listen ok'
+vgate_assert 03 serial-contains 'NOCAPS.ELF exited status=0'
+vgate_assert 03 serial-absent 'denied name=NOCAPS.ELF'
+vgate_assert 03 serial-contains 'caps-run-done'
+vgate_assert 03 serial-absent '\[EXC\]'

@@ -386,8 +386,13 @@ const Process = struct {
     /// masks only narrow; no syscall may widen one. `measured`/
     /// `measured_ok` carry the exec-time image digest the audit receipts
     /// quote (zeros for a process that was never exec-measured — the
-    /// boot payload, kernel spawns).
+    /// boot payload, kernel spawns). `granted` is the pre-ceiling
+    /// decision (M188a: the grant table's own answer, before the
+    /// manifest `caps=` ceiling intersects it — the word gate reads it
+    /// to name a caps-stripped denial `caps_denied` rather than
+    /// `<word>_denied`).
     words: u32 = word_ambient,
+    granted: u32 = word_ambient,
     measured: [32]u8 = @as([32]u8, @splat(@as(u8, 0))),
     measured_ok: bool = false,
     /// Claim 0826: the executor's EL1 exception stack (allocator-backed
@@ -509,6 +514,7 @@ fn reset_process(p: *Process) void {
     p.addr_space.mmap_next_va = mmap_default_va;
     p.uid = uid_user;
     p.words = word_ambient;
+    p.granted = word_ambient;
     p.task_id = null;
     p.thread_tasks = @as([max_threads]?usize, @splat(@as(?usize, null)));
 }
@@ -1032,12 +1038,24 @@ pub fn principal(id: usize) ?Principal {
 /// `grant.decide`) plus the image digest the audit receipts quote.
 /// Called once at create by the exec loader; there is no setter path for
 /// EL0, and `mask` is clamped to the baseline so a stored mask can never
-/// exceed the vocabulary ceiling.
-pub fn set_grant(id: usize, mask: u32, digest: [32]u8, measured_ok: bool) void {
+/// exceed the vocabulary ceiling. `granted` is the decision BEFORE the
+/// M188a `caps=` ceiling narrowed it (`mask = granted & ceiling`); the
+/// seam compares them to name the denying layer.
+pub fn set_grant(id: usize, mask: u32, granted: u32, digest: [32]u8, measured_ok: bool) void {
     if (id >= max_processes or processes[id].state == .free) return;
     processes[id].words = mask & word_baseline;
+    processes[id].granted = granted & word_baseline;
     processes[id].measured = digest;
     processes[id].measured_ok = measured_ok;
+}
+
+/// M188a (#3186): the grant decision as measured at exec, BEFORE the
+/// manifest `caps=` ceiling intersected it — `word_ambient` for an
+/// invalid/free id (the same fallback `word_mask` takes: no live EL0
+/// principal, nothing to classify).
+pub fn grant_words(id: usize) u32 {
+    if (id >= max_processes or processes[id].state == .free) return word_ambient;
+    return processes[id].granted;
 }
 
 /// M113c (#2419, ADR 0054 D9): the word set the dispatch seam enforces —

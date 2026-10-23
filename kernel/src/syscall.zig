@@ -839,7 +839,16 @@ pub fn dispatch(number: u64, args: Args, frame: *exceptions.VectorFrame) u64 {
         if (process.find_by_task(scheduler.current_id())) |pid| {
             const missing = required & ~process.word_mask(pid);
             if (missing != 0) {
-                emit_word_denial(pid, @intCast(@ctz(missing)));
+                const bit: u5 = @intCast(@ctz(missing));
+                // M188a (#3186): a word the grant decision gave but the
+                // manifest's `caps=` ceiling stripped is a `caps_denied`
+                // refusal — the receipt names WHICH layer denied, not
+                // just the word (`word=` still carries the word).
+                if ((process.grant_words(pid) >> bit) & 1 != 0) {
+                    grant.emit_denial(pid, "caps", grant.wordName(bit));
+                } else {
+                    emit_word_denial(pid, bit);
+                }
                 if (grant.enforceMode()) return error_result(.eacces);
             }
         }

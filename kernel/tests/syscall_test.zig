@@ -7759,7 +7759,7 @@ test "syscall: the M113c word mask receipts audit denials and enforces EACCES at
     const pid = process.find_by_task(2).?;
     // The exec-applied mask a `words:-` row would leave: no words at all.
     const digest: [32]u8 = @as([32]u8, @splat(@as(u8, 0xab)));
-    process.set_grant(pid, 0, digest, true);
+    process.set_grant(pid, 0, 0, digest, true);
 
     const prev_hook = syscall.klog.line_hook;
     defer syscall.klog.line_hook = prev_hook;

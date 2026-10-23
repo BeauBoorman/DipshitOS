@@ -40,6 +40,11 @@ const (
 // ok=false when the call did not answer the full 8-byte record — which is
 // what a host build (no `svc`) sees, so callers must treat !ok as "no
 // identity available" rather than "uid 0". There is no setter.
+//
+// The `caps` word here is the principal capability BITMASK (cap_fs_any /
+// cap_proc_admin / cap_clipboard — ADR 0024), NOT the grant word set: the
+// per-process word mask the manifest caps= ceiling narrows (M188a) lives
+// on the process's grant state and is never exposed through this slot.
 func Principal() (uid uint32, caps uint32, ok bool) {
 	var buf [PrincipalBytes]byte
 	r := svc1(SlotPrincipal, uintptr(unsafe.Pointer(&buf[0])))
