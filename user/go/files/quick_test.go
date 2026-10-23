@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -21,6 +23,35 @@ func qoi(w, h int, r, g, b byte) []byte {
 		out = append(out, 0xfe, r, g, b)
 	}
 	return append(out, 0, 0, 0, 0, 0, 0, 0, 1)
+}
+
+// pdfDoc builds a minimal single-page document inside the M89 engine's
+// closed classic-xref subset — the same byte discipline pdf's own
+// document() helper emits: exact ascending object offsets, a Size/Root
+// trailer, the %%EOF tail. The 72x48 pt MediaBox is the 96x64 raster
+// that already IS the pane's bank bound — the thumbnail passes through.
+func pdfDoc(content string) []byte {
+	objects := []string{
+		"<< /Type /Catalog /Pages 2 0 R >>",
+		"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+		"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 72 48] /Contents 4 0 R >>",
+		fmt.Sprintf("<< /Length %d >>\nstream\n%s\nendstream", len(content), content),
+	}
+	var b bytes.Buffer
+	b.WriteString("%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
+	offsets := make([]int, len(objects)+1)
+	for i, o := range objects {
+		offsets[i+1] = b.Len()
+		fmt.Fprintf(&b, "%d 0 obj\n%s\nendobj\n", i+1, o)
+	}
+	start := b.Len()
+	fmt.Fprintf(&b, "xref\n0 %d\n0000000000 65535 f \n", len(offsets))
+	for _, off := range offsets[1:] {
+		fmt.Fprintf(&b, "%010d 00000 n \n", off)
+	}
+	fmt.Fprintf(&b, "trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n",
+		len(offsets), start)
+	return b.Bytes()
 }
 
 // fileBacker points the readHead seam at a fixture table — the same shape
@@ -115,6 +146,88 @@ func TestQuickLookImageArmSixel(t *testing.T) {
 	}
 	if got := pendingJoined(&m); !strings.Contains(got, markerQuickClose) {
 		t.Fatalf("close marker missing: %q", got)
+	}
+}
+
+func TestQuickLookDocumentArmPageOne(t *testing.T) {
+	// Page one is two field fills — red left half, blue right — on the
+	// 72x48 pt page that rasterizes exactly at the 96x64 bank bound.
+	fileBacker(t, map[string][]byte{
+		"/host/FM/PAGE.PDF": pdfDoc("1 0 0 rg 0 0 36 48 re f 0 0 1 rg 36 0 36 48 re f"),
+	})
+	m := testModel(entry("PAGE.PDF", false))
+	m.handleKey(runeKey(' '))
+	if m.mode != modeQuickLook || m.ql.kind != qlImage || !m.ql.doc {
+		t.Fatalf("space must open the pdf arm: mode=%d kind=%d doc=%v",
+			m.mode, m.ql.kind, m.ql.doc)
+	}
+	if m.ql.imgW != 96 || m.ql.imgH != 64 || m.ql.thW != 96 || m.ql.thH != 64 {
+		t.Fatalf("dims = %dx%d thumb %dx%d, want 96x64/96x64",
+			m.ql.imgW, m.ql.imgH, m.ql.thW, m.ql.thH)
+	}
+	if m.ql.pages != 1 {
+		t.Fatalf("pages = %d, want 1", m.ql.pages)
+	}
+	if got := pendingJoined(&m); !strings.Contains(got,
+		markerQuick+"PAGE.PDF kind=pdf 96x64 thumb=96x64") {
+		t.Fatalf("pdf open marker missing: %q", got)
+	}
+	frame := m.render()
+	if !strings.Contains(frame, "pdf page 1/1 · 96x64") {
+		t.Fatal("the facts row must name the page, not an image")
+	}
+	if !strings.Contains(frame, "\x1bPq\"1;1;96;64") {
+		t.Fatal("the sixel raster declaration is missing from the frame")
+	}
+	if !strings.Contains(frame, "\x1b\\") {
+		t.Fatal("the sixel ST is missing")
+	}
+	m.handleKey(keys.Event{Key: keys.KeyEsc})
+	if m.mode != modeNormal {
+		t.Fatalf("escape must close: mode=%d", m.mode)
+	}
+	if got := pendingJoined(&m); !strings.Contains(got, markerQuickClose) {
+		t.Fatalf("close marker missing: %q", got)
+	}
+}
+
+func TestQuickLookDocumentRefusalsAreNamed(t *testing.T) {
+	// Not a PDF at all — the .pdf name earns the sniff but the engine
+	// names the refusal; the card carries it, never a bare card.
+	fileBacker(t, map[string][]byte{
+		"/host/FM/BAD.PDF": []byte("a text file that borrowed a .pdf name"),
+		"/host/FM/BIG.PDF": []byte("%PDF-1.4\n"),
+	})
+	m := testModel(entry("BAD.PDF", false))
+	m.handleKey(runeKey(' '))
+	if m.ql.kind != qlCard || m.ql.typeName != "document" ||
+		m.ql.refuse != "UnsupportedStructure" {
+		t.Fatalf("malformed pdf = kind=%d type=%q refuse=%q",
+			m.ql.kind, m.ql.typeName, m.ql.refuse)
+	}
+	if got := pendingJoined(&m); !strings.Contains(got,
+		markerQuick+"BAD.PDF kind=card type=document refused=UnsupportedStructure") {
+		t.Fatalf("refused card marker missing: %q", got)
+	}
+	frame := m.render()
+	if !strings.Contains(frame, "refused   UnsupportedStructure") {
+		t.Fatal("the card must name the refusal in the pane")
+	}
+	if strings.Contains(frame, "\x1bPq") {
+		t.Fatal("a refused document must not emit a sixel")
+	}
+	// Oversized: the listing's own size says the source can never fit
+	// the preview read — SourceLimit before the engine ever runs.
+	big := entry("BIG.PDF", false)
+	big.Size = 1 << 20
+	m = testModel(big)
+	m.handleKey(runeKey(' '))
+	if m.ql.kind != qlCard || m.ql.refuse != "SourceLimit" {
+		t.Fatalf("oversized pdf = kind=%d refuse=%q", m.ql.kind, m.ql.refuse)
+	}
+	if got := pendingJoined(&m); !strings.Contains(got,
+		markerQuick+"BIG.PDF kind=card type=document refused=SourceLimit") {
+		t.Fatalf("oversized refusal marker missing: %q", got)
 	}
 }
 

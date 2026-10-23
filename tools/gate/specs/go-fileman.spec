@@ -84,12 +84,23 @@
 # third window). Three identical tagged runs is the acceptance itself:
 # the journey either passes unchanged on every boot or it is not done.
 #
+# M192e (#3250) adds run 21: the document arm of the spacebar pane.
+# FMPDF holds a seeded two-tone single-page PDF and a .pdf-named text
+# file. Space on the non-document earns the card arm with the engine's
+# refusal named on the marker; the real document renders page one
+# through the M89 engine and paints it through the same sixel path at
+# the same 96x64 bank bound — the scanout reads the two field fills.
+# The kind=pdf marker flushes the instant the pane's frame is painted,
+# so the capture deliberately trails it by a second — the kernel's cell
+# render lands in that gap — and the close script's settle is stretched
+# past it so the pane still stands when the framebuffer is read.
+#
 # exec-order: assert-proven -- each run ends on its own `rx-go-fileman-*`
 # marker, which only its closing script prints, and that script waits on the
 # app's own marker; an app that never ran, never renamed, never settled or
 # never refused cannot pass.
 
-vgate_name go-fileman "M74a + M81a #1761 + M125c #2588 + M124b #2581 + M124d #2583 + M134b #2760 + M149a #2806 + M155a #2929 + M155b #2930 + M155c #2931 + M155d #2932 + M167a #2989 + M167b #2992 + M167c #2993 + M160c #2994: GOFILES navigates, previews, renames, trashes, restores, opens files, picks paths, resumes its session, opens with the right-click menu, lists the kernel mount table, spacebar-QuickLooks image and text, answers file properties with its ctime, birth, on-disk bytes and volume free facts, batch-moves and batch-deletes a marked set, and content-searches a seeded subtree within bounds, and runs the props + batch-move + search journey three times over, and toggles a thumbnail grid of cell-mosaic tiles with the focused image as a real sixel, and pins folders into FILES.FAV favorites that list with gone pins named missing, and browses a .tar in place as a read-only virtual directory with QuickLook on its members, and (M187d #3185) routes a .vcf through the opens=text/vcard manifest row into the contact-card face"
+vgate_name go-fileman "M74a + M81a #1761 + M125c #2588 + M124b #2581 + M124d #2583 + M134b #2760 + M149a #2806 + M155a #2929 + M155b #2930 + M155c #2931 + M155d #2932 + M167a #2989 + M167b #2992 + M167c #2993 + M160c #2994 + M192e #3250: GOFILES navigates, previews, renames, trashes, restores, opens files, picks paths, resumes its session, opens with the right-click menu, lists the kernel mount table, spacebar-QuickLooks image, text and a PDF's page one, answers file properties with its ctime, birth, on-disk bytes and volume free facts, batch-moves and batch-deletes a marked set, and content-searches a seeded subtree within bounds, and runs the props + batch-move + search journey three times over, and toggles a thumbnail grid of cell-mosaic tiles with the focused image as a real sixel, and pins folders into FILES.FAV favorites that list with gone pins named missing, and browses a .tar in place as a read-only virtual directory with QuickLook on its members, and (M187d #3185) routes a .vcf through the opens=text/vcard manifest row into the contact-card face"
 vgate_share seed
 vgate_runner_flags -Xswiftc -DSPIKE
 
@@ -2388,3 +2399,160 @@ vgate_assert 21 serial-absent 'gofiles: menu closed'
 vgate_assert 21 serial-absent 'gofiles: contact refused'
 vgate_assert 21 serial-absent '[EXC] parking:'
 vgate_assert 21 serial-absent 'exited status=139'
+# --- M192e (#3250) run 21: QuickLook's document arm -------------------
+# FMPDF holds two rows, name-sorted: BAD.PDF (a text file wearing the
+# extension — the engine's UnsupportedStructure is the card's named
+# refusal) then PAGE.PDF (a real single-page document — two field fills,
+# red left / blue right, on the 72x48 pt MediaBox that rasterizes at
+# exactly the pane's 96x64 bank bound). Space on BAD.PDF cards it with
+# the refusal named on the marker; escape hands the frame back; j + space
+# lands page one in the pane. The pdf marker is the LAST event before
+# teardown, so it anchors both the scanout and the close script — the
+# pane still stands when the capture reads it (the run-16 barrier
+# pattern: markers flush post-paint).
+vgate_file script-21.txt <<'EOFQ'
+exec GOFILES.ELF /host/FMPDF
+EOFQ
+
+vgate_file script2-21.txt <<'EOFQ'
+dui close 2
+echo rx-go-fileman-quicklook-pdf-ok
+EOFQ
+
+vgate_setup_python <<'PY'
+import os
+share = os.environ.get("VG_SHARE") or os.path.join(os.environ["RUN_DIR"], "share")
+fmpdf = os.path.join(share, "FMPDF")
+os.makedirs(fmpdf, exist_ok=True)
+# A minimal document inside the engine's closed classic-xref subset —
+# the same byte discipline pdf's own document() helper emits: exact
+# ascending object offsets, a Size/Root trailer, the %%EOF tail. The
+# 72x48 pt MediaBox rasterizes at 96x64 — the pane's bank bound — so
+# the thumbnail passes through unscaled.
+content = "1 0 0 rg 0 0 36 48 re f 0 0 1 rg 36 0 36 48 re f"
+objects = [
+    "<< /Type /Catalog /Pages 2 0 R >>",
+    "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+    "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 72 48] /Contents 4 0 R >>",
+    "<< /Length %d >>\nstream\n%s\nendstream" % (len(content), content),
+]
+pdf = bytearray(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
+offsets = []
+for i, o in enumerate(objects):
+    offsets.append(len(pdf))
+    pdf += ("%d 0 obj\n%s\nendobj\n" % (i + 1, o)).encode("latin-1")
+start = len(pdf)
+pdf += ("xref\n0 %d\n0000000000 65535 f \n" % (len(objects) + 1)).encode("latin-1")
+for off in offsets:
+    pdf += ("%010d 00000 n \n" % off).encode("latin-1")
+pdf += ("trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n"
+        % (len(objects) + 1, start)).encode("latin-1")
+with open(os.path.join(fmpdf, "PAGE.PDF"), "wb") as f:
+    f.write(bytes(pdf))
+with open(os.path.join(fmpdf, "BAD.PDF"), "wb") as f:
+    f.write(b"a text file that borrowed a .pdf name\n")
+print("staged FMPDF: BAD.PDF + PAGE.PDF (%d bytes, red/blue page one)" % len(pdf))
+PY
+
+vgate_run 21 -- \
+    --screen '$RUN_DIR/fileman-quicklook-pdf' \
+    --input --via-virtio \
+    --script '$RUN_DIR/script-21.txt' \
+    --input-chords 'space,escape,j,space' \
+    --input-chords-after 'gofiles: ready' \
+    --screenshot-after 'gofiles: quicklook PAGE.PDF kind=pdf' \
+    --screenshot-after-delay 1 \
+    --script2 '$RUN_DIR/script2-21.txt' \
+    --script2-after 'gofiles: quicklook PAGE.PDF kind=pdf' \
+    --script2-delay 3 \
+    --script-expect 'gofiles OK' --timeout 240
+
+vgate_assert 21 serial-contains 'exec: loaded GOFILES.ELF'
+vgate_assert 21 serial-contains 'gofiles: list /host/FMPDF n=2'
+vgate_assert 21 serial-contains 'gofiles: entry BAD.PDF file'
+vgate_assert 21 serial-contains 'gofiles: entry PAGE.PDF file'
+# The non-document wears the engine's refusal by name on the card marker.
+vgate_assert 21 serial-contains 'gofiles: quicklook BAD.PDF kind=card type=document refused=UnsupportedStructure'
+vgate_assert 21 serial-contains 'gofiles: quicklook close'
+# Page one armed the sixel path at the bank bound — named, not an image.
+vgate_assert 21 serial-contains 'gofiles: quicklook PAGE.PDF kind=pdf 96x64 thumb=96x64'
+vgate_assert 21 serial-contains 'gofiles: close'
+vgate_assert 21 serial-contains 'gofiles OK'
+vgate_assert 21 serial-contains 'rx-go-fileman-quicklook-pdf-ok'
+vgate_assert 21 serial-absent '[EXC] parking:'
+vgate_assert 21 serial-absent 'exited status=139'
+
+# The scanout: the same 2x capture the run-16 assert reads (client
+# x=64..1088 y=96..832, cell 16x32 px). The 96x64 thumb centres in the
+# body band: 12x4 cells at the 8x16 rung, origin cell row 9 col 26 ->
+# x=480..672, y=384..512. Page one's two fills land red on the left
+# half (x<576) and blue on the right — the same hue-preserving-shift
+# dominance the M149a boxes carry, inset past the cell edges.
+vgate_assert 21 snapshot 'fileman-quicklook-pdf-after' <<'PY'
+import struct, sys, zlib
+
+d = open(sys.argv[1], "rb").read()
+assert d[:8] == b"\x89PNG\r\n\x1a\n", "not a PNG scanout"
+pos = 8
+idat = b""
+w = h = ct = 0
+while pos < len(d):
+    n, typ = struct.unpack(">I4s", d[pos:pos + 8])
+    chunk = d[pos + 8:pos + 8 + n]
+    if typ == b"IHDR":
+        w, h, depth, ct = struct.unpack(">IIBB", chunk[:10])
+        assert depth == 8
+    elif typ == b"IDAT":
+        idat += chunk
+    pos += 12 + n
+bpp = 4 if ct == 6 else 3
+raw = zlib.decompress(idat)
+stride = w * bpp
+out = bytearray()
+prev = bytearray(stride)
+i = 0
+for _ in range(h):
+    filt = raw[i]
+    i += 1
+    row = bytearray(raw[i:i + stride])
+    i += stride
+    if filt == 1:
+        for x in range(bpp, stride):
+            row[x] = (row[x] + row[x - bpp]) & 0xff
+    elif filt == 2:
+        for x in range(stride):
+            row[x] = (row[x] + prev[x]) & 0xff
+    elif filt == 3:
+        for x in range(stride):
+            left = row[x - bpp] if x >= bpp else 0
+            row[x] = (row[x] + ((left + prev[x]) >> 1)) & 0xff
+    elif filt == 4:
+        for x in range(stride):
+            left = row[x - bpp] if x >= bpp else 0
+            up = prev[x]
+            up_left = prev[x - bpp] if x >= bpp else 0
+            p = left + up - up_left
+            pa, pb, pc = abs(p - left), abs(p - up), abs(p - up_left)
+            pred = (left if pa <= pb and pa <= pc else up if pb <= pc else up_left)
+            row[x] = (row[x] + pred) & 0xff
+    out += row
+    prev = row
+
+def count(x0, x1, y0, y1, pred):
+    n = 0
+    for y in range(y0, y1):
+        for x in range(x0, x1):
+            k = (y * w + x) * bpp
+            if pred(out[k], out[k + 1], out[k + 2]):
+                n += 1
+    return n
+
+# Page one's fills: red on the thumb's left half, blue on the right.
+red = count(490, 560, 392, 504,
+            lambda r, g, b: r >= 150 and r >= g + 60 and r >= b + 60)
+blue = count(592, 662, 392, 504,
+             lambda r, g, b: b >= 150 and b >= r + 60 and b >= g + 60)
+print("pdf page-one sixel: red=%d blue=%d" % (red, blue))
+assert red >= 2000, "page-one left field ink absent from the pane"
+assert blue >= 2000, "page-one right field ink absent from the pane"
+PY

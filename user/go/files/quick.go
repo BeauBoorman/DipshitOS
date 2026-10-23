@@ -2,10 +2,12 @@
 // entry takes over the frame with a mime-sniffed preview: a decoded image
 // painted through the terminal's sixel image layer (webrender.DecodeImage
 // + the M85a primary protocol, the same encoder imgcat proved), the first
-// qlTextLines of a text file, or a type/size/mtime card for everything
-// else (mtime by the M134a slot-79 stat — meta_guest.go/meta_host.go own
-// the platform half). Space or Esc hands the frame back to the list; j/k
-// scroll a text arm taller than the pane.
+// qlTextLines of a text file, page one of a document rendered by the M89
+// pdf engine into the same sixel path at the same 96x64 cap (M192e
+// #3250), or a type/size/mtime card for everything else (mtime by the
+// M134a slot-79 stat — meta_guest.go/meta_host.go own the platform
+// half). Space or Esc hands the frame back to the list; j/k scroll a
+// text arm taller than the pane.
 //
 // The model stays pure: openQuickLook decides and marks, render.go owns
 // the frame (the sixel is bytes appended after a CUP — image cells
@@ -17,9 +19,11 @@ import (
 	"bytes"
 	"errors"
 	"strings"
+	"sync"
 
 	"virelai/clockfmt"
 	"virelai/mime"
+	"virelai/pdf"
 	"virelai/rss/keys"
 	"virelai/vi"
 	"virelai/webrender"
@@ -62,6 +66,7 @@ type quickLook struct {
 	ctOK     bool // the same stat wire's ctime — the card's "changed" row
 	ctSec    int64
 	vol      string // volume rows: the mount's state words ("mounted rw")
+	refuse   string // a named refusal the card carries ("SourceLimit", an ADR 0040 code)
 
 	lines  []string // qlText: the first qlTextLines sanitized lines
 	scroll int      // qlText: first visible line
@@ -71,6 +76,8 @@ type quickLook struct {
 	sixel      []byte // encoded once at open; re-placed by every frame
 	cellW      uint32 // the grid rung at open (tile geometry)
 	cellH      uint32
+	doc        bool // the raster is a document's page one, not an image file
+	pages      int  // the document's page count (the subtitle's 1/N)
 }
 
 // decodeImage is the decode seam — webrender.DecodeImage in both builds —
@@ -85,6 +92,47 @@ var statTimes = fileTimes
 
 // termCell is the grid rung seam — vi.TerminalCell in both builds.
 var termCell = vi.TerminalCell
+
+// qlRenderPage is the document arm's render seam — pdf.Render page zero
+// in both builds. A var so the host tests can pin the refusal arm
+// without standing up the engine.
+var qlRenderPage = func(src pdf.Source, arena []byte, l *pdf.Ledger) (pdf.Page, pdf.Stats, pdf.Failure) {
+	return pdf.Render(src, 0, arena, l)
+}
+
+// qlPDFNanos is the render deadline's clock — vi.Nanos in both builds.
+var qlPDFNanos = func() uint64 { return uint64(vi.Nanos()) }
+
+// qlPDFHooks installs the adapter's DCTDecode hook once (ADR 0040 A4 —
+// the engine owns no image codec; a PDF's embedded JPEG decodes through
+// the same webrender path the image arm uses). qlPDFArena is the
+// engine's fixed 9 MiB POD partition, allocated lazily on the first
+// document arm and retained for the app's life — a fresh 9 MiB per
+// spacebar press is churn the arena's caller-owned contract already
+// forbids paying (the goreader heap-slice precedent).
+var (
+	qlPDFHooks sync.Once
+	qlPDFArena []byte
+)
+
+// qlPDFSource is the pane's pdf.Source over the already-read document
+// bytes: the whole file is in memory (bounded by the preview's read cap),
+// so reads charge the ledger and copy — the same shape goreader's
+// memSource proves.
+type qlPDFSource struct{ data []byte }
+
+func (s *qlPDFSource) Length() int64 { return int64(len(s.data)) }
+
+func (s *qlPDFSource) ReadAt(dst []byte, offset int64, l *pdf.Ledger) (int, pdf.Code) {
+	if offset < 0 || int64(len(dst)) > s.Length()-offset {
+		return 0, pdf.ReadFailed
+	}
+	if c := l.Read(uint64(len(dst))); c != pdf.OK {
+		return 0, c
+	}
+	copy(dst, s.data[offset:offset+int64(len(dst))])
+	return len(dst), pdf.OK
+}
 
 // openQuickLook is the space chord: sniff the selection and open the arm
 // it earns — image bytes that decode paint as sixel, text shows its first
@@ -159,6 +207,9 @@ func (m *model) openQuickLook() {
 		case id == mime.Text:
 			ql.kind = qlText
 			ql.lines = quickLines(data)
+		case id == mime.Document && ql.armDocument(data):
+			// armDocument set kind/dims/sixel + the page count; a
+			// refusal named itself on ql.refuse for the card.
 		default:
 			ql.kind = qlCard
 		}
@@ -199,14 +250,22 @@ func (m *model) openQL(ql quickLook) {
 	m.mode = modeQuickLook
 	switch ql.kind {
 	case qlImage:
-		m.emit(markerQuick + ql.name + " kind=image " +
+		kind := "image"
+		if ql.doc {
+			kind = "pdf"
+		}
+		m.emit(markerQuick + ql.name + " kind=" + kind + " " +
 			vi.Itoa64(int64(ql.imgW)) + "x" + vi.Itoa64(int64(ql.imgH)) +
 			" thumb=" + vi.Itoa64(int64(ql.thW)) + "x" + vi.Itoa64(int64(ql.thH)))
 	case qlText:
 		m.emit(markerQuick + ql.name + " kind=text lines=" +
 			vi.Itoa64(int64(len(ql.lines))))
 	default:
-		m.emit(markerQuick + ql.name + " kind=card type=" + ql.typeName)
+		msg := markerQuick + ql.name + " kind=card type=" + ql.typeName
+		if ql.refuse != "" {
+			msg += " refused=" + ql.refuse
+		}
+		m.emit(msg)
 	}
 	m.status = "quicklook " + ql.name
 }
@@ -305,6 +364,61 @@ func (ql *quickLook) armImage(data []byte) bool {
 	return true
 }
 
+// armDocument is the document arm's load: page one through the M89
+// engine inside the pane's own bounds — the preview read cap as the
+// source admission, the ledger's work bound plus a pdf.MaxNanos
+// deadline so a hostile document can never hang the grid — then the
+// image arm's sixel path at the same 96x64 cap. The raster is marked
+// doc so the marker and facts row name the page, not an image file.
+// ok=false leaves kind at qlCard and names the refusal on ql.refuse:
+// SourceLimit when the source never fit the read, the engine's own
+// code word otherwise — never a silent card.
+func (ql *quickLook) armDocument(data []byte) bool {
+	if ql.size > uint64(maxQuickBytes) {
+		ql.refuse = "SourceLimit" // the pane's read bound — goreader's word
+		return false
+	}
+	qlPDFHooks.Do(func() {
+		pdf.SetImageDecoder(func(data []byte) (w, h int, pix []uint32, err error) {
+			im, err := decodeImage(data)
+			if err != nil {
+				return 0, 0, nil, err
+			}
+			return im.Width, im.Height, im.Pix, nil
+		})
+	})
+	if qlPDFArena == nil {
+		qlPDFArena = make([]byte, pdf.ArenaBytes)
+	}
+	l := &pdf.Ledger{Max: pdf.MaxWork}
+	l.Now = qlPDFNanos
+	l.Deadline = qlPDFNanos() + pdf.MaxNanos
+	p, st, f := qlRenderPage(&qlPDFSource{data: data}, qlPDFArena, l)
+	if f.Code != pdf.OK {
+		ql.refuse = f.Error()
+		return false
+	}
+	if p.Width < 1 || p.Height < 1 || len(p.Pix) != p.Width*p.Height {
+		ql.refuse = "Malformed"
+		return false
+	}
+	th := thumbnail(&webrender.Image{Width: p.Width, Height: p.Height, Pix: p.Pix},
+		qlImageMaxW, qlImageMaxH)
+	seq, err := sixelEncode(th)
+	if err != nil {
+		ql.refuse = err.Error()
+		return false
+	}
+	ql.kind = qlImage
+	ql.doc = true
+	ql.pages = int(st.Pages)
+	ql.imgW, ql.imgH = p.Width, p.Height
+	ql.thW, ql.thH = th.Width, th.Height
+	ql.sixel = seq
+	ql.cellW, ql.cellH = termCell()
+	return true
+}
+
 // qlTiles is the thumbnail's footprint in cells on the rung it was armed
 // under (ceil — a partial tile still covers a whole cell).
 func (ql quickLook) qlTiles() (cols, rows int) {
@@ -346,6 +460,10 @@ func (m model) qlOrigin() (row, col int) {
 func (m model) qlSubtitle() string {
 	switch m.ql.kind {
 	case qlImage:
+		if m.ql.doc {
+			return "pdf page 1/" + vi.Itoa64(int64(m.ql.pages)) + " · " +
+				vi.Itoa64(int64(m.ql.imgW)) + "x" + vi.Itoa64(int64(m.ql.imgH))
+		}
 		return "image " + vi.Itoa64(int64(m.ql.imgW)) + "x" +
 			vi.Itoa64(int64(m.ql.imgH))
 	case qlText:
@@ -369,6 +487,9 @@ func (m model) qlCardRows() []string {
 	out = append(out,
 		"  type      "+m.ql.typeName,
 		"  size      "+vi.Itoa64(int64(m.ql.size))+" B")
+	if m.ql.refuse != "" {
+		out = append(out, "  refused   "+m.ql.refuse)
+	}
 	mod, changed := "—", "—"
 	if m.ql.mtOK {
 		mod = clockfmt.Format(m.ql.mtSec, clockfmt.UTC)
