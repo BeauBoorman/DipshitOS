@@ -19,7 +19,10 @@ type AppEntry struct {
 	Bin   string
 	Label string
 	Icon  byte
-	Dock  bool
+	// Dock parses `dock=true` but paints nowhere: M190c (#3238) named it
+	// out — the rail IS the running set (one cell per live tab), so a
+	// dock-of-pinned-apps layer would need its own surface.
+	Dock bool
 	// Version is the row's schema version. 0 is a v1 row: the four positional
 	// fields only, no trailing fields honoured.
 	Version int

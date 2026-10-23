@@ -450,6 +450,43 @@ func paintNotifyCenter(scan []byte, width, height int) int {
 	return written
 }
 
+// railBadgeCount is the M190c rail badge's number: how many of the tab's
+// center entries postdate its read watermark (Tab.notifySeen — armed at
+// open, re-armed by FocusTab). Zero for an id no live tab owns, so a
+// closed app's history never badges a window that reuses the id.
+func railBadgeCount(tabID uint32) int {
+	i := tabs.index(tabID)
+	if i < 0 {
+		return 0
+	}
+	seen := tabs.tabs[i].notifySeen
+	n := 0
+	for _, r := range notifyCenter {
+		if r.tabID == tabID && r.id > seen {
+			n++
+		}
+	}
+	return n
+}
+
+// noteRailBadges is the badge's transition reporter, driven by the same
+// call sites as the focus indicator's noteBadgeTransition — every loop
+// pass, after input, after paint. A tab whose live count differs from
+// the last printed one gets a line naming the new count; an N->0 read
+// (the tab took focus) prints `n=0` so the gate sees the clear.
+func noteRailBadges() {
+	for i := 0; i < tabs.Count(); i++ {
+		id := tabs.tabs[i].ID
+		n := railBadgeCount(id)
+		if tabs.tabs[i].badgeN == n {
+			continue
+		}
+		tabs.tabs[i].badgeN = n
+		vi.ConsoleLine(MarkerRailBadge + "id=" + vi.Itoa64(int64(id)) +
+			" n=" + vi.Itoa64(int64(n)))
+	}
+}
+
 func notifyCenterPaintMarker(painted, presented bool) (string, bool) {
 	if !notifyCenterOpen || !painted || !presented || notifyCenterPainted {
 		return "", false

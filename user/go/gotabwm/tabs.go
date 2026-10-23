@@ -18,6 +18,7 @@ import (
 	"virelai/draw"
 	"virelai/icons"
 	"virelai/theme"
+	"virelai/vi"
 	"virelai/widgets"
 )
 
@@ -90,6 +91,17 @@ type Tab struct {
 	// carries it for free, and a close carries it into the reopen LIFO.
 	State    []byte
 	StateVer uint8
+	// M190c (#3238): the dock badge's read watermark — center rows with
+	// ids up through notifySeen are accounted "seen" by this tab, so the
+	// rail badge counts only notices that arrived SINCE the last focus
+	// (railBadgeCount in notify_center.go). OpenTab arms it at the
+	// current counter — history that predates the tab is not its news —
+	// and FocusTab re-arms it, which is what makes a badge clear when the
+	// app takes focus. It rides the Tab value like navHist, so reorder,
+	// pin, and space moves carry it for free; badgeN is the last count
+	// noteRailBadges printed, so the marker reports transitions.
+	notifySeen uint32
+	badgeN     int
 }
 
 // TabStrip is the in-process tab list. The zero value is empty (unsplit).
@@ -224,6 +236,10 @@ const (
 	MarkerZoomOff      = "gotabwm: zoom off"
 	MarkerPaneDrop     = "gotabwm: pane drop "
 	MarkerFocusRestore = "gotabwm: focus restore "
+	// M190c (#3238): the rail badge's transition line — `id=<n> n=<count>`
+	// printed when a tab's undismissed-notice count changes (a push, a
+	// center dismiss, or the focus clear, where n=0 is the clear).
+	MarkerRailBadge = "gotabwm: rail badge "
 )
 
 // mruMax is the M151a focus-ring bound — the card's eight ids.
@@ -454,7 +470,10 @@ func (s *TabStrip) OpenTab(id uint32, title string) bool {
 	if s.count >= MaxTabs {
 		return false
 	}
-	s.tabs[s.count] = Tab{ID: id, Title: title, Bin: guessBin(title)}
+	// M190c: the badge counts notices that arrive AFTER the tab opens —
+	// a window id reused from a dead app must not inherit its rows.
+	s.tabs[s.count] = Tab{ID: id, Title: title, Bin: guessBin(title),
+		notifySeen: notifyCenterNextID}
 	if s.count == 0 {
 		s.focus = 0
 		s.mruNote(id)
@@ -773,6 +792,11 @@ func (s *TabStrip) FocusTab(id uint32) bool {
 	}
 	s.focus = i
 	s.mruNote(id)
+	// M190c: taking focus is the badge's clear — every path that lands
+	// focus on a tab (rail click, alt-tab, toast click, RPC raise, the
+	// menu's Focus row) funnels through here, so the watermark re-arms
+	// exactly once per focus claim.
+	s.tabs[i].notifySeen = notifyCenterNextID
 	return true
 }
 
@@ -1418,6 +1442,21 @@ func paintRail(scan []byte, width, height, stripH int, ts *TabStrip, hover, clos
 				written += seatFill(c, widgets.Rect{X: x + w - 1 - bw, Y: railBadgeInset, W: bw, H: stripH - 2*railBadgeInset}, railFrozenRGB())
 			}
 		}
+		// M190c (#3238): the unread badge — the count of this tab's
+		// undismissed center entries posted since it last took focus
+		// (railBadgeCount). A small Danger plate at the cell's left edge
+		// carrying the digit; it clears when the tab takes focus again,
+		// not when the toast fades.
+		if n := railBadgeCount(ts.At(i).ID); n > 0 {
+			if r, ok := railNotifPlate(x, w, stripH); ok {
+				draw.FillRoundedRect(c, r, radiusControl, draw.Opaque(tok.Danger))
+				written += seatArea(c, r)
+				digit := vi.Itoa64(int64(n))
+				seatText(c, cell, r.X+(r.W-seatTextWidth(digit, seatSmallPx))/2,
+					r.Y+(r.H-8)/2, seatSmallPx, digit, tok.OnAccent)
+				written++
+			}
+		}
 		// M79b (#1705): the close glyph — VirelaiChrome's window-close,
 		// the bitmap 'x' when the symbol face is absent — inside the
 		// cell's close zone and left of the frozen badge's edge strip.
@@ -1465,6 +1504,56 @@ func paintRail(scan []byte, width, height, stripH int, ts *TabStrip, hover, clos
 		}
 	}
 	return written
+}
+
+// railNotifPlate is the M190c badge's rect inside one painted cell: a
+// plate against the focus marker's slot, vertically centred, wide enough
+// for the single digit the NotifyCenterMax bound allows. False when the
+// cell is too narrow to carry it left of the close zone — the count
+// still reports on the marker line, only the pill drops.
+const (
+	railNotifH    = 14
+	railNotifPadX = 4
+)
+
+func railNotifPlate(cellX, cellW, stripH int) (widgets.Rect, bool) {
+	w := seatTextWidth("8", seatSmallPx) + 2*railNotifPadX
+	x := cellX + 1 + seatMarkerW + 3
+	if stripH < railNotifH || x+w > cellX+cellW-railCloseW {
+		return widgets.Rect{}, false
+	}
+	return widgets.Rect{X: x, Y: (stripH - railNotifH) / 2, W: w, H: railNotifH}, true
+}
+
+// paintRailMenu paints the open M190c button-2 menu over the rail — the
+// power menu's plate discipline at four rows, the highlight on
+// railMenuSel. Called from compositePaint with the other modal chrome so
+// it lands over the rail it was opened from and under the toasts.
+func paintRailMenu(scan []byte, width, height int) int {
+	if !railMenuOpen {
+		return 0
+	}
+	x, y, w, h := railMenuRect(width, height)
+	if w <= 0 || len(scan)/4/width < y+h {
+		return 0
+	}
+	c := seatCanvas(scan, width, height)
+	if c == nil {
+		return 0
+	}
+	tok := theme.Current
+	plate := widgets.Rect{X: x, Y: y, W: w, H: h}
+	n := seatPlate(c, plate, radiusControl, tok.Accent, tok.Surface)
+	draw.StrokeRoundedRect(c, plate, radiusControl, tok.BorderW, draw.Opaque(tok.Rule))
+	clip := plate.Inset(tok.BorderW)
+	for i := 0; i < railActN; i++ {
+		rr := widgets.Rect{X: x, Y: y + railMenuPadY + i*railMenuRowH, W: w, H: railMenuRowH}
+		if i == railMenuSel {
+			c.FillRect(rr.Inset(2), draw.Opaque(tok.Selection))
+		}
+		seatText(c, clip, x+10, rr.Y+6, seatTextPx, railMenuLabel(i), tok.Ink)
+	}
+	return n
 }
 
 // spacePillRects computes the painted pill rects — spaceN pills,

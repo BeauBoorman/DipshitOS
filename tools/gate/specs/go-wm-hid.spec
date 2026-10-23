@@ -108,6 +108,7 @@
 #   bash tools/go/build-gocalc.sh    ->  .build/go/GOCALC.ELF
 #   bash tools/go/build-goset.sh     ->  .build/go/GOSET.ELF   (run 08)
 #   bash tools/go/build-files.sh     ->  .build/go/GOFILES.ELF (runs 18-21)
+#   bash tools/go/build-goclock.sh   ->  .build/go/GOCLOCK.ELF (run 22)
 #
 # exec-order: assert-proven -- each run ends on a script-only marker
 # (`rx-gotabwm-hid-ok` / `rx-gotabwm-hid-drag-ok`), and every stage gate
@@ -223,6 +224,12 @@ src = os.path.join(".build", "go", "GOSH.ELF")
 if not os.path.exists(src):
     sys.exit("GOSH.ELF missing - build it first: bash tools/go/build-gosh.sh")
 shutil.copy(src, os.path.join(share, "GOSH.ELF"))
+# M190c (#3238): run 22's badge leg needs a toast poster — GOCLOCK's
+# timer fires vi.Notify.
+src = os.path.join(".build", "go", "GOCLOCK.ELF")
+if not os.path.exists(src):
+    sys.exit("GOCLOCK.ELF missing - build it first: bash tools/go/build-goclock.sh")
+shutil.copy(src, os.path.join(share, "GOCLOCK.ELF"))
 # M121e (#2568): run 17's GOFILES trash leg — one file so 'd' selects it.
 src = os.path.join(".build", "go", "GOFILES.ELF")
 if not os.path.exists(src):
@@ -2046,3 +2053,114 @@ if not (files_i < verb_i < exec_i < list_i < entry_i < search_i < arg_i):
 print("M191b leg: hit@%d verb@%d exec@%d list@%d hand-off@%d arg@%d" % (
     files_i, verb_i, exec_i, list_i, search_i, arg_i))
 PYEOF
+
+# --- run 22 (M190c / #3238): the rail-depth leg -------------------------
+# Seat + GOEDIT + GOCLOCK (three Go runtimes, inside the #1449 wall at
+# GOMAXPROCS=1). GOEDIT declares first (cell 0), GOCLOCK second (cell 1,
+# focused). Chords arm a 3s timer; its expiry posts a kind-12 toast, so
+# the badge counts it on GOCLOCK's cell (`rail badge id=<clock> n=1`).
+# The pointer script then: left-clicks cell 0 (seat focus moves to
+# GOEDIT), left-clicks cell 1 (GOCLOCK takes focus -> `rail badge n=0`),
+# right-clicks cell 1 (the button-2 menu opens, `rail menu open id=`),
+# and left-clicks the Quit row (`rail menu pick quit` -> the close-x's
+# closeTabByID seam -> `host close`/`tab close` and the window is gone).
+# Menu geometry for n=2: cell 1 anchors the panel at x=640, Quit is row
+# 3 of the 4x20px list at y=RailHeight+2 => the click lands (700,97).
+vgate_file script2-m190c.txt <<'SCRIPT'
+exec GOEDIT.ELF &
+fg
+exec GOCLOCK.ELF
+SCRIPT
+
+vgate_file script3-m190c.txt <<'SCRIPT'
+wm
+dui
+echo rx-gotabwm-hid-menu-ok
+SCRIPT
+
+vgate_run 22 -- \
+    --screen '$RUN_DIR/screen-22' \
+    --via-virtio \
+    --script '$RUN_DIR/script.txt' \
+    --script2 '$RUN_DIR/script2-m190c.txt' \
+    --script2-after 'gotabwm: win focus' \
+    --input-chords 'right,right,e,3,return' \
+    --input-chords-after 'goclock: painted epoch=' \
+    --pointer-virtio '320,10,c;960,10,c;960,10,rc;700,97,c' \
+    --pointer-virtio-after 'goclock: timer armed 3' \
+    --script3 '$RUN_DIR/script3-m190c.txt' \
+    --script3-after 'wm: unregistered, shim resumed' \
+    --script-expect 'rx-gotabwm-hid-menu-ok' --timeout 300
+
+vgate_assert 22 serial-contains 'exec: loaded GOTABWM.ELF'
+vgate_assert 22 serial-contains 'exec: loaded GOEDIT.ELF'
+vgate_assert 22 serial-contains 'exec: loaded GOCLOCK.ELF'
+vgate_assert 22 serial-contains 'gotabwm: rail n=2'
+vgate_assert 22 serial-contains 'goclock: timer armed 3'
+vgate_assert 22 serial-contains 'goclock: fired timer'
+vgate_assert 22 serial-contains 'gotabwm: notify id='
+vgate_assert 22 serial-contains 'timer done'
+vgate_assert 22 serial-contains 'gotabwm: rail badge id='
+vgate_assert 22 serial-contains 'gotabwm: rail menu open id='
+vgate_assert 22 serial-contains 'gotabwm: rail menu pick quit id='
+vgate_assert 22 serial-contains 'gotabwm: close'
+vgate_assert 22 serial-contains 'gotabwm OK'
+vgate_assert 22 serial-contains 'rx-gotabwm-hid-menu-ok'
+vgate_assert 22 serial-absent '[EXC] parking:'
+vgate_assert 22 serial-absent 'exited status=139'
+vgate_assert 22 python <<'PY'
+import os, re, sys
+ser = open(os.environ["VG_SER"], errors="replace").read().splitlines()
+
+def first_match(rx, start=0):
+    for i in range(start, len(ser)):
+        m = rx.match(ser[i])
+        if m:
+            return i, m
+    sys.exit("missing /%s/ after %d" % (rx.pattern, start))
+
+edit_re = re.compile(r"^goedit: open id=(\d+)$")
+clock_re = re.compile(r"^goclock: open id=(\d+)$")
+badge_re = re.compile(r"^gotabwm: rail badge id=(\d+) n=(\d+)$")
+click_re = re.compile(r"^gotabwm: rail-click id=(\d+)$")
+menu_re = re.compile(r"^gotabwm: rail menu open id=(\d+)$")
+pick_re = re.compile(r"^gotabwm: rail menu pick quit id=(\d+)$")
+close_re = re.compile(r"^gotabwm: tab close id=(\d+)$")
+
+_, edit_m = first_match(edit_re)
+_, clock_m = first_match(clock_re)
+edit_id, clock_id = edit_m.group(1), clock_m.group(1)
+
+# The toast lands as a badge on GOCLOCK's cell, then its focus click
+# clears it, then the button-2 menu's Quit takes the window down.
+queued_i, _ = first_match(re.compile(r"^gotabwm: notify id=" + clock_id + " "))
+badge_i, badge_m = first_match(badge_re, queued_i)
+if badge_m.group(1) != clock_id or badge_m.group(2) != "1":
+    sys.exit("first badge transition = id=%s n=%s, want id=%s n=1" % (
+        badge_m.group(1), badge_m.group(2), clock_id))
+click_i, click_m = first_match(click_re, badge_i)
+if click_m.group(1) != edit_id:
+    sys.exit("first rail click after the badge hit id=%s want GOEDIT %s" % (
+        click_m.group(1), edit_id))
+click2_i, click2_m = first_match(click_re, click_i + 1)
+if click2_m.group(1) != clock_id:
+    sys.exit("second rail click id=%s want GOCLOCK %s" % (click2_m.group(1), clock_id))
+clear_i, clear_m = first_match(badge_re, click2_i)
+if clear_m.group(1) != clock_id or clear_m.group(2) != "0":
+    sys.exit("badge clear = id=%s n=%s, want id=%s n=0" % (
+        clear_m.group(1), clear_m.group(2), clock_id))
+menu_i, menu_m = first_match(menu_re, clear_i)
+if menu_m.group(1) != clock_id:
+    sys.exit("menu opened on id=%s want GOCLOCK %s" % (menu_m.group(1), clock_id))
+pick_i, pick_m = first_match(pick_re, menu_i)
+if pick_m.group(1) != clock_id:
+    sys.exit("quit pick id=%s want %s" % (pick_m.group(1), clock_id))
+close_i, close_m = first_match(close_re, pick_i)
+if close_m.group(1) != clock_id:
+    sys.exit("closed id=%s want %s" % (close_m.group(1), clock_id))
+# The strip drops to one live cell.
+if not any(re.match(r"^gotabwm: rail n=1 ", l) for l in ser[close_i:]):
+    sys.exit("no rail n=1 after the quit")
+print("M190c leg: badge n=1@%d clear@%d menu@%d quit->close@%d" % (
+    badge_i, clear_i, menu_i, close_i))
+PY

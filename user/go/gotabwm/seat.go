@@ -548,6 +548,7 @@ func main() {
 	for events := 0; !demoMode || (events < maxEvents && ticks < tickLimit); {
 		serviceMailbox()
 		noteBadgeTransition()
+		noteRailBadges()
 		if remote != nil {
 			if remote.drainInput() {
 				remote = nil
@@ -560,6 +561,10 @@ func main() {
 		// dead-window discipline as the launcher's.
 		if powerMenuOpen && powerSink != 0 && !ensurePowerFocus() {
 			dismissPowerMenu()
+		}
+		// M190c (#3238): the rail menu's sink on the same discipline.
+		if railMenuOpen && railMenuSink != 0 && !ensureRailMenuFocus() {
+			dismissRailMenu()
 		}
 		e, ok := vi.PollEvent()
 		if !ok {
@@ -858,6 +863,11 @@ func compositePaint(scan []byte, ticks uint64, presents *int) (presented bool) {
 	if powerMenuOpen {
 		_ = paintPowerMenu(scan, vi.ScanoutWidth, vi.ScanoutHeight)
 	}
+	// M190c (#3238): the button-2 rail menu floats with the other modal
+	// chrome — above the rail it opened from, under the toasts.
+	if railMenuOpen {
+		_ = paintRailMenu(scan, vi.ScanoutWidth, vi.ScanoutHeight)
+	}
 	// M161b (#2974): not-responding banners paint over their panes and
 	// under the toasts/ghost/curtain — the pointer path hit-tests them in
 	// the same order (the modal menus above already consumed the press).
@@ -915,6 +925,7 @@ func compositePaint(scan []byte, ticks uint64, presents *int) (presented bool) {
 	// M121d (#2567): the focus indicator's transition line — catches every
 	// state the input/RPC paths did not (choreography closes, restores).
 	noteBadgeTransition()
+	noteRailBadges()
 	if line, once := dragGhostPaintMarker(ghostPainted > 0, presented); once {
 		vi.ConsoleLine(line)
 	}
@@ -1087,6 +1098,7 @@ func consumeSeatEvent(e vi.Event) bool {
 		}
 		handleWmPointer(e)
 		noteBadgeTransition()
+		noteRailBadges()
 		return false
 	}
 	if e.Kind == vi.EvWmKey {
@@ -1100,6 +1112,7 @@ func consumeSeatEvent(e vi.Event) bool {
 		}
 		handleWmKey(e)
 		noteBadgeTransition()
+		noteRailBadges()
 		// M107e (#2322): poll the host-integration lane on the input path,
 		// not only at the ~1 Hz composite tick — a host clipboard item the
 		// user pastes with ctrl-v would otherwise sit unapplied for up to a

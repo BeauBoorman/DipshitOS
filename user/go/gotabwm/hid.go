@@ -97,6 +97,11 @@ const (
 	// and the seat's own undo (the reopen LIFO) answered.
 	MarkerUndo = "gotabwm: undo "
 
+	// M190c (#3238): the rail button-2 menu's lines — `open id=` names the
+	// target cell's tab, `dismiss` any dismissal (Esc, outside press, or a
+	// pick's own close), and `pick <verb> id=` the row that ran.
+	MarkerRailMenu = "gotabwm: rail menu "
+
 	// M82c (#1770): the registry's guest-side markers. The summary line
 	// follows `registered`; the refusal names the checker's error sentence;
 	// `fixture accepted` is the loud failure (the checker passing a table
@@ -140,6 +145,7 @@ const (
 	// scope) and the harness's chord vocabulary has no ctrl+alt+<letter>.
 	hidUsageI    uint8 = 0x0C
 	hidBtnLeft   uint8 = 0x01
+	hidBtnRight  uint8 = 0x02 // M190c (#3238): the rail menu press
 	hidBtnMiddle uint8 = 0x04
 )
 
@@ -612,6 +618,10 @@ func handleWmKey(e vi.Event) {
 	if handleClipMenuKey(e) {
 		return
 	}
+	// M190c (#3238): the rail menu's keys are the seat's while it is up.
+	if handleRailMenuKey(e) {
+		return
+	}
 	// M82c (#1770): dispatch IS the registry walk — one exact (mods, usage)
 	// match, so there is no branch precedence to reason about (the old
 	// scattered `if`s folded ctrl+shift+tab into the ctrl branch; the table
@@ -985,6 +995,10 @@ func handleWmPointer(e vi.Event) {
 	// gesture. It never starts a chrome path (those all key on the left
 	// edge), so it reaches the content tail where the delivery happens.
 	midDown := btn&hidBtnMiddle != 0 && prevPtrButtons&hidBtnMiddle == 0
+	// M190c (#3238): the right button's own down edge — the rail menu's
+	// open press. It never keys a chrome path on the left edge, so off the
+	// rail it keeps its old fate: the content forward below still sees it.
+	rightDown := btn&hidBtnRight != 0 && prevPtrButtons&hidBtnRight == 0
 	prevPtrButtons = btn
 	// M124a (#2580): an armed guest drag owns every pointer sample —
 	// motion feeds the ghost's hit-test, the release edge settles the
@@ -1072,6 +1086,30 @@ func handleWmPointer(e vi.Event) {
 		}
 		return
 	}
+	// M190c (#3238): the rail menu is chrome-modal like the power and
+	// paste menus — a press on a row picks it (either button), a press
+	// anywhere else dismisses it, and nothing reaches content either way.
+	if railMenuOpen {
+		if down || rightDown {
+			r := railMenuRowAt(px, py, vi.ScanoutWidth, vi.ScanoutHeight)
+			// A right press off the panel but on another cell retargets
+			// the menu rather than dismissing it — the cell's own menu
+			// gesture, like a desktop's context-click on a second icon.
+			if r < 0 && rightDown {
+				if i, ok := railCellAt(px, py, vi.ScanoutWidth, tabs.Count(), RailHeight); ok {
+					openRailMenu(i)
+					return
+				}
+			}
+			if r >= 0 {
+				railMenuSel = r
+				applyRailMenuPick(r)
+			} else {
+				dismissRailMenu()
+			}
+		}
+		return
+	}
 	if launch.open {
 		if btn != 0 {
 			menuGesture = true
@@ -1090,6 +1128,16 @@ func handleWmPointer(e vi.Event) {
 			execSelected()
 		}
 		return
+	}
+	if rightDown {
+		// M190c (#3238): a right press on a rail cell opens that tab's
+		// menu. The rail already swallows its chrome samples, so the only
+		// new behaviour is the open itself; off the rail the sample falls
+		// through to the content forward exactly as before.
+		if i, ok := railCellAt(px, py, vi.ScanoutWidth, tabs.Count(), RailHeight); ok {
+			openRailMenu(i)
+			return
+		}
 	}
 	if down {
 		// M161b (#2974): a not-responding banner is chrome over its pane —
@@ -1398,6 +1446,320 @@ func endRailDrag(px, py uint32) bool {
 		}
 	}
 	return false
+}
+
+// --- M190c (#3238): the button-2 rail menu ------------------------------
+//
+// A right press (button byte bit1) on a rail cell opens a four-row menu —
+// Focus / Duplicate / Pin|Unpin / Quit — anchored under that cell and
+// aimed at ITS tab, not the focused one. Each row runs the same seat seam
+// the matching chord does: focusHosted for Focus (the rail-click path),
+// the re-exec for Duplicate (ctrl+shift+d), Pin/Unpin for pin (the
+// ctrl+shift+n state change, extended both directions), closeTabByID for
+// Quit (the close-x's seam — the app gets the real WIN_CLOSE). Modal like
+// the power menu: an input sink holds kernel focus while it is up so its
+// keys are the seat's alone, Esc or an outside press dismisses, Enter and
+// a row press pick.
+
+const (
+	railMenuW    = 112
+	railMenuRowH = 20
+	railMenuPadY = 3
+	railMenuGapY = 2
+)
+
+// The row indices. The pin row's label flips with the target's state.
+const (
+	railActFocus = iota
+	railActDuplicate
+	railActPin
+	railActQuit
+	railActN
+)
+
+var (
+	railMenuOpen bool
+	railMenuSel  int
+	railMenuSink uint32
+	// railMenuTab is the menu's target tab BY ID — a reorder under an
+	// open menu re-anchors the panel but keeps aiming at the same app.
+	railMenuTab uint32
+	// railMenuPrior is the focused tab at open — the sink stole its
+	// kernel focus, so dismissal hands it back (the launcher's rule).
+	railMenuPrior uint32
+)
+
+// railMenuRect anchors the menu just under the rail at its target cell's
+// left edge, clamped inside the scanout insets. The anchor re-resolves
+// the tab's CURRENT index, so the panel tracks its app across a reorder.
+// Zero rect when the target is gone — the caller dismisses on it.
+func railMenuRect(width, height int) (x, y, w, h int) {
+	i := tabs.index(railMenuTab)
+	n := tabs.Count()
+	if i < 0 || n <= 0 || width <= 0 || height <= 0 {
+		return 0, 0, 0, 0
+	}
+	w, h = railMenuW, railActN*railMenuRowH+2*railMenuPadY
+	cellW := width / n
+	if cellW < 48 {
+		cellW = 48
+	}
+	x = i * cellW
+	if x+w+chromeInset > width {
+		x = width - w - chromeInset
+	}
+	if x < chromeInset {
+		x = chromeInset
+	}
+	y = RailHeight + railMenuGapY
+	if y+h > height-chromeInset {
+		y = height - chromeInset - h
+	}
+	if y < RailHeight {
+		y = RailHeight
+	}
+	return
+}
+
+// railMenuRowAt maps a point onto a row index, or -1 outside — the one
+// geometry source paintRailMenu and the pointer path share.
+func railMenuRowAt(px, py uint32, width, height int) int {
+	x, y, w, _ := railMenuRect(width, height)
+	if w == 0 || int(px) < x || int(px) >= x+w {
+		return -1
+	}
+	rel := int(py) - y - railMenuPadY
+	if rel < 0 {
+		return -1
+	}
+	i := rel / railMenuRowH
+	if i < 0 || i >= railActN {
+		return -1
+	}
+	return i
+}
+
+// railMenuLabel is a row's painted verb — Pin reads "Unpin" while the
+// target already carries the bit, so the row names what it will do.
+func railMenuLabel(i int) string {
+	switch i {
+	case railActFocus:
+		return "Focus"
+	case railActDuplicate:
+		return "Duplicate"
+	case railActPin:
+		if idx := tabs.index(railMenuTab); idx >= 0 && tabs.At(idx).Pinned {
+			return "Unpin"
+		}
+		return "Pin"
+	default:
+		return "Quit"
+	}
+}
+
+// --- the modal sink (the launcher/power pattern over the menu rect) ---
+
+func acquireRailMenuFocus() bool {
+	x, y, w, h := railMenuRect(vi.ScanoutWidth, vi.ScanoutHeight)
+	if w <= 0 {
+		return false
+	}
+	id, r := openInputSink(uint32(x), uint32(y), uint32(w), uint32(h))
+	if r < 0 {
+		return false
+	}
+	railMenuSink = uint32(id)
+	st, qr := queryWindow(int(railMenuSink))
+	if qr < 0 || (st[5] == 0 && focusRaise(railMenuSink) != 0) {
+		_ = closeWin(railMenuSink)
+		railMenuSink = 0
+		return false
+	}
+	return true
+}
+
+// ensureRailMenuFocus reports whether the menu's sink still exists — the
+// kernel reaps a dead window out from under the seat.
+func ensureRailMenuFocus() bool {
+	if railMenuSink == 0 {
+		return false
+	}
+	_, r := queryWindow(int(railMenuSink))
+	return r >= 0
+}
+
+// restoreRailMenuFocus hands kernel focus back to the tab that held it
+// at open — re-resolved against the strip as it is, because a tab that
+// closed mid-menu is not a target.
+func restoreRailMenuFocus() {
+	id := railMenuPrior
+	railMenuPrior = 0
+	if tabs.index(id) < 0 || id >= sessionIDBase {
+		var ok bool
+		if id, ok = tabs.Focused(); !ok {
+			return
+		}
+	}
+	if id < sessionIDBase && focusRaise(id) == 0 {
+		kernelFocusID = id
+	}
+}
+
+// openRailMenu arms the menu on cell i's tab. A right press on another
+// cell while it is open retargets rather than toggling — the open marker
+// reprints so the serial names the current target.
+func openRailMenu(i int) {
+	dragAbort("chrome") // M124a: the modal menu takes the gesture
+	railDragFrom, contentDown, sashDragging = -1, false, false
+	if i < 0 || i >= tabs.Count() {
+		return
+	}
+	id := tabs.At(i).ID
+	if railMenuOpen && railMenuTab == id {
+		return
+	}
+	if !railMenuOpen {
+		railMenuPrior = 0
+		if fid, ok := tabs.Focused(); ok && fid < sessionIDBase {
+			railMenuPrior = fid
+		}
+		if !acquireRailMenuFocus() {
+			railMenuSink = 0
+		}
+	}
+	railMenuOpen = true
+	railMenuTab = id
+	railMenuSel = 0
+	vi.ConsoleLine(MarkerRailMenu + "open id=" + vi.Itoa64(int64(id)))
+}
+
+func dismissRailMenu() {
+	if !railMenuOpen {
+		return
+	}
+	if railMenuSink != 0 {
+		_ = closeWin(railMenuSink)
+		railMenuSink = 0
+	}
+	railMenuOpen = false
+	restoreRailMenuFocus()
+	vi.ConsoleLine(MarkerRailMenu + "dismiss")
+}
+
+// handleRailMenuKey consumes the menu's keys while it is open — Esc
+// dismisses, Up/Down move the highlight, Enter is the highlighted row's
+// pick. Every other key is swallowed by the sink anyway; the return just
+// keeps the seat's own chords quiet.
+func handleRailMenuKey(e vi.Event) bool {
+	if !railMenuOpen {
+		return false
+	}
+	switch e.Arg0 {
+	case 0x29: // Escape
+		dismissRailMenu()
+	case 0x52: // Up
+		if railMenuSel > 0 {
+			railMenuSel--
+		}
+	case 0x51: // Down
+		if railMenuSel < railActN-1 {
+			railMenuSel++
+		}
+	case 0x28: // Enter
+		applyRailMenuPick(railMenuSel)
+	}
+	return true
+}
+
+// applyRailMenuPick dismisses the menu, then runs the row's seam against
+// the recorded tab. The pick line precedes the seam's own markers so the
+// serial names which surface asked.
+func applyRailMenuPick(i int) {
+	id := railMenuTab
+	dismissRailMenu()
+	if tabs.index(id) < 0 {
+		return
+	}
+	switch i {
+	case railActFocus:
+		vi.ConsoleLine(MarkerRailMenu + "pick focus id=" + vi.Itoa64(int64(id)))
+		railMenuFocusTab(id)
+	case railActDuplicate:
+		vi.ConsoleLine(MarkerRailMenu + "pick duplicate id=" + vi.Itoa64(int64(id)))
+		railMenuDuplicate(id)
+	case railActPin:
+		verb := "pin"
+		if tabs.At(tabs.index(id)).Pinned {
+			verb = "unpin"
+		}
+		vi.ConsoleLine(MarkerRailMenu + "pick " + verb + " id=" + vi.Itoa64(int64(id)))
+		railMenuPinToggle(id)
+	case railActQuit:
+		vi.ConsoleLine(MarkerRailMenu + "pick quit id=" + vi.Itoa64(int64(id)))
+		_ = closeTabByID(id)
+	}
+}
+
+// railMenuFocusTab is the Focus row: the same focusHosted seam the rail
+// click and the toast click ride. Unlike applyRailClick it runs even on
+// the already-focused tab — an explicit re-focus is the gesture that
+// clears that cell's notify badge.
+// railMenuFocus is the Focus row's tab-focus seam (the powerFocus /
+// paletteFocus pattern): focusHosted on the guest, a recorder in tests.
+var railMenuFocus = focusHosted
+
+func railMenuFocusTab(id uint32) {
+	if !railMenuFocus(id) {
+		return
+	}
+	vi.ConsoleLine(MarkerTabFocus + vi.Itoa64(int64(id)))
+	vi.ConsoleLine(MarkerHostFocus + vi.Itoa64(int64(id)))
+	dumpOrder()
+}
+
+// railMenuDuplicate is the Duplicate row: ctrl+shift+d's re-exec seam
+// aimed at the target cell's recorded bin rather than the focused tab's.
+// A tab with no bin is the chord's honest no-op.
+func railMenuDuplicate(id uint32) {
+	i := tabs.index(id)
+	if i < 0 {
+		return
+	}
+	bin := tabs.At(i).Bin
+	if bin == "" {
+		return
+	}
+	if _, err := execApp(bin); err != nil {
+		vi.ConsoleLine(MarkerDuplicateMissing + bin)
+		seatRefusalErr(err, "exec "+bin, bin)
+		return
+	}
+	vi.ConsoleLine(MarkerDuplicate + bin)
+}
+
+// railMenuPinToggle is the Pin/Unpin row: the ctrl+shift+n state change
+// by tab id — pin re-partitions and relinks the pane leaves exactly like
+// the chord, so the zoom restore and the session write ride along.
+func railMenuPinToggle(id uint32) {
+	i := tabs.index(id)
+	if i < 0 {
+		return
+	}
+	restorePaneZoom() // M151a: pin re-partitions + relinks leaves
+	if tabs.At(i).Pinned {
+		if !tabs.Unpin(id) {
+			return
+		}
+		vi.ConsoleLine(MarkerPin + "id=" + vi.Itoa64(int64(id)) + " off")
+	} else {
+		if !tabs.Pin(id) {
+			return
+		}
+		vi.ConsoleLine(MarkerPin + "id=" + vi.Itoa64(int64(id)) + " on")
+	}
+	dumpOrder()
+	// M79g (#1718): the pin bit is part of the session either way.
+	noteSessionMutation()
 }
 
 // applyRailReorder is Zig TABWM reorder_tab: Reorder() then the existing
