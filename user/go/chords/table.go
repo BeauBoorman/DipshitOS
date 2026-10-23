@@ -107,6 +107,16 @@ var Global = Table{
 			"— ctrl+shift+v is split-cycle (seat) and tty clipboard paste " +
 			"(kernel), so primary rides the canonical chord",
 		"#2584 (M124e)", false},
+	// M190a (#3236): the clipboard-history menu. v is doubly taken —
+	// split-cycle at this scope (M79c) and tty clipboard paste at
+	// kernel-terminal scope (M73e) — and the cv-input harness's chord
+	// vocabulary has no ctrl+alt+<letter> spelling, so the summon rides
+	// ctrl+shift+i: free at every scope, the insert-adjacent letter.
+	{Chord{ModCtrl | ModShift, UsageI}, "seat", ScopeSeat, "clip-menu",
+		"summon the clipboard-history paste menu — the seat's ring of " +
+			"the last 16 typed clips; ctrl+shift+v is split-cycle (seat) " +
+			"and tty clipboard paste (kernel), so history rides 'i'",
+		"#3236 (M190a)", false},
 	// M121b (#2565): the tab-manipulation chords. Close rides ctrl+shift+w
 	// — the card's proposed ctrl+w is GOSH.ELF's kill-word (the app row
 	// below, "the chord the seat must never bind"); a seat row on it would

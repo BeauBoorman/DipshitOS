@@ -189,6 +189,10 @@ func hostclipApply(rec hostint.Record) string {
 	hostClipHash = fnv1a(rec.Payload[:n])
 	hostClipLen = n
 	markClipSource(true)
+	// M190a (#3236): a host-applied clip is a clip — the ring records it
+	// directly, because the echo guard above hides this write from the
+	// poll's diff.
+	cliphistNote(rec.Payload[:n])
 	sum := shlib.SHA256Sum(rec.Payload[:n])
 	trunc := "0"
 	if rec.Flags&hostint.FlagTruncated != 0 {
@@ -221,6 +225,9 @@ func hostclipApplyT(rec hostint.Record) string {
 	hostClipHash = fnv1a(blob[:n])
 	hostClipLen = n
 	markClipSource(true)
+	// M190a (#3236): the typed apply joins the ring the same way — the
+	// echo guard hides the write from the poll's diff.
+	cliphistNote(blob[:n])
 	sum := shlib.SHA256Sum(blob[:n])
 	trunc := "0"
 	if rec.Flags&hostint.FlagTruncated != 0 {

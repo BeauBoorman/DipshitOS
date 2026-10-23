@@ -91,6 +91,10 @@ var chromeLogged bool
 // once, after the first successful paint. Painting and logging live together
 // so a caller cannot print the marker without having painted the panel.
 func chromeTick(scan []byte, ticks uint64) {
+	// M190a (#3236): the clipboard ring's composite-pass observation —
+	// the seat's per-tick chrome drive is the one unclaimed place a
+	// buffer poll can run on every frame, heartbeat or damage.
+	cliphistPoll()
 	face := clockNow(ticks)
 	text := formatClock(face.h, face.m, face.s)
 	_ = paintChrome(scan, vi.ScanoutWidth, vi.ScanoutHeight, text)
@@ -100,6 +104,10 @@ func chromeTick(scan []byte, ticks uint64) {
 	_ = paintGodMenuButton(scan, vi.ScanoutWidth, vi.ScanoutHeight)
 	// M115d (#2463): the PWR button sits on the same band, right of Apps.
 	_ = paintPowerButton(scan, vi.ScanoutWidth, vi.ScanoutHeight)
+	// M190a (#3236): the paste menu paints over the rail and content and
+	// under the launcher, the power menu and the toasts — the layer the
+	// M115d panel claimed.
+	_ = paintClipMenu(scan, vi.ScanoutWidth, vi.ScanoutHeight)
 	if chromeLogged {
 		return
 	}

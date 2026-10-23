@@ -48,6 +48,11 @@ const (
 // selection is text and the seat never inspects it. primSelSet
 // distinguishes "no selection yet" from a stored empty span (a publish
 // of zero bytes is refused, so a set buffer is never empty).
+//
+// M190a (#3236): primary publishes are excluded from the clipboard
+// history BY CONSTRUCTION — this buffer never touches slots 38/39, so
+// the ring's kernel-buffer observer cannot see it. The exclusion is a
+// rule of where the bytes live, not a flag the publish path checks.
 var (
 	primSel    []byte
 	primSelSet bool

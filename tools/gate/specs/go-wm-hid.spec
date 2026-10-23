@@ -1847,3 +1847,113 @@ if not (del_i < restore_i):
 print("M121e GOFILES leg: route id=%s@%d, deleted@%d, restored@%d" % (
     route_m.group(1), route_i, del_i, restore_i))
 PY
+
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Run 20 (M190a / #3236): the clipboard-history paste menu. `clip alpha`
+# seeds the older clip before the apps declare; GOFILES 'c' yanks NOTE.TXT
+# — the M124c clip-sys publish lands a text/uri-list clip as the newer —
+# the menu summons on ctrl-shift-i, down picks the OLDER clip, and Enter
+# pastes through the existing deliver path: the typed write lands on the
+# kernel buffer and the focused tab's own ctrl-v pulls it. `clip` readback
+# proves the buffer holds the pick, `goedit: paste n=5` proves the app
+# received it. Both copies are marker-ordered ahead of the chord batch —
+# an in-batch app copy races the summon (the seat cannot observe a write
+# the app has not completed yet), so the second distinct string is the
+# monitor's own `clip` write rather than a GOEDIT ctrl-c.
+
+vgate_file script2-m190a.txt <<'SCRIPT'
+dui focus 0
+exec -u0 GOEDIT.ELF /host/EDIT/SEED.TXT &
+fg
+exec -u0 GOFILES.ELF /host/FMUNDO
+clip alpha
+SCRIPT
+
+vgate_file script3-m190a.txt <<'SCRIPT'
+clip
+wm
+dui
+echo rx-gotabwm-hid-ok
+SCRIPT
+
+vgate_run 20 -- \
+    --screen '$RUN_DIR/screen-20' \
+    --via-virtio \
+    --script '$RUN_DIR/script.txt' \
+    --script2 '$RUN_DIR/script2-m190a.txt' \
+    --script2-after 'gotabwm: win focus' \
+    --input-string 'c' \
+    --input-string-after 'gofiles: ready' \
+    --pointer-virtio '320,10,c' \
+    --pointer-virtio-after 'gofiles: clip-sys ' \
+    --input-chords 'ctrl-shift-i,down,return' \
+    --input-chords-after 'gotabwm: rail-click id=' \
+    --script3 '$RUN_DIR/script3-m190a.txt' \
+    --script3-after 'wm: unregistered, shim resumed' \
+    --script-expect 'rx-gotabwm-hid-ok' --timeout 300
+
+vgate_assert 20 serial-contains 'VirelaiOS kernel has seized control.'
+vgate_assert 20 serial-contains 'exec: loaded GOTABWM.ELF'
+vgate_assert 20 serial-contains 'exec: loaded GOEDIT.ELF'
+vgate_assert 20 serial-contains 'exec: loaded GOFILES.ELF'
+vgate_assert 20 serial-contains 'gotabwm: registered'
+vgate_assert 20 serial-contains 'gofiles: ready'
+# The two copies, typed honestly: the seeded text first (the older clip),
+# the file yank's URI list second — the ring records each in copy order.
+vgate_assert 20 serial-contains 'clip: stored 5 bytes'
+vgate_assert 20 serial-contains 'gofiles: clip-sys n='
+vgate_assert 20 serial-contains 'gotabwm: cliphist push mime=text/plain len=5 '
+vgate_assert 20 serial-contains 'gotabwm: cliphist push mime=text/uri-list len=28 '
+# The menu: two rows, down moves to the older clip, Enter delivers it.
+vgate_assert 20 serial-contains 'gotabwm: clipmenu open n=2'
+vgate_assert 20 serial-contains 'gotabwm: clipmenu pick i=1 mime=text/plain '
+vgate_assert 20 serial-contains 'gotabwm: clipmenu dismiss'
+vgate_assert 20 serial-contains 'gotabwm: clipmenu paste id='
+vgate_assert 20 serial-contains 'goedit: paste n=5'
+vgate_assert 20 serial-contains 'clip: alpha'
+vgate_assert 20 serial-contains 'gotabwm OK'
+vgate_assert 20 serial-contains 'wm: unregistered, shim resumed'
+vgate_assert 20 serial-contains 'rx-gotabwm-hid-ok'
+vgate_assert 20 serial-absent 'gotabwm: clipmenu empty'
+vgate_assert 20 serial-absent 'gotabwm: clipmenu paste refuse'
+vgate_assert 20 serial-absent '[EXC] parking:'
+vgate_assert 20 serial-absent 'exited status=139'
+vgate_assert 20 python <<'PYEOF'
+import os, re, sys
+ser = open(os.environ["VG_SER"], errors="replace").read().splitlines()
+
+def first_after(prefix, start=0):
+    for i in range(start, len(ser)):
+        if ser[i].startswith(prefix):
+            return i
+    sys.exit("missing %s after %d" % (prefix, start))
+
+def first_match_after(rx, start):
+    for i in range(start, len(ser)):
+        m = rx.match(ser[i])
+        if m:
+            return i, m
+    sys.exit("missing /%s/ after %d" % (rx.pattern, start))
+
+# The ring pushes in copy order — the seeded alpha first (the older
+# clip), the file URI second — then the menu lists, picks index 1 (the
+# older), and the focused editor's own paste lands it.
+txt_i = first_after("gotabwm: cliphist push mime=text/plain len=5 ")
+uri_i = first_after("gotabwm: cliphist push mime=text/uri-list len=28 ", txt_i)
+open_i = first_after("gotabwm: clipmenu open n=2", uri_i)
+pick_i = first_after("gotabwm: clipmenu pick i=1 ", open_i)
+paste_i, paste_m = first_match_after(
+    re.compile(r"^gotabwm: clipmenu paste id=(\d+) mime=text/plain len=5"), pick_i)
+app_i, app_m = first_match_after(
+    re.compile(r"^goedit: paste n=(\d+)"), paste_i)
+open_m = re.match(r"^goedit: open id=(\d+)", ser[first_after("goedit: open id=")])
+if paste_m.group(1) != open_m.group(1):
+    sys.exit("paste targeted id=%s, want the focused editor %s" % (
+        paste_m.group(1), open_m.group(1)))
+if app_m.group(1) != "5":
+    sys.exit("app pasted n=%s, want the older clip's 5 bytes" % app_m.group(1))
+print("M190a leg: text push@%d uri push@%d menu@%d pick i=1@%d paste id=%s@%d app n=5@%d" % (
+    txt_i, uri_i, open_i, pick_i, paste_m.group(1), paste_i, app_i))
+PYEOF

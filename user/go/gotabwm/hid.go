@@ -26,6 +26,10 @@
 //	ctrl-shift-s  -> take a SNAPSHOT BUNDLE (M81g: settings + SESSION.TABS +
 //	                 a docs selection, published crash-safe to
 //	                 /host/SNAPSHOT.BUNDLE; snapshot.go)
+//	ctrl-shift-i  -> the M190a clipboard-history paste menu: the seat's
+//	                 ≤16-entry ring of typed clips; arrows move, Enter
+//	                 pastes through slot 38 + the content-key forward,
+//	                 Esc dismisses (cliphist.go)
 //	ctrl-shift-[  -> nav back for the FOCUSED tab (M79e)
 //	ctrl-shift-]  -> nav forward (M79e)
 //	ctrl-z        -> undo dispatch (M121e): a focused tab answers through
@@ -128,8 +132,12 @@ const (
 	// asked for ctrl+shift+v, but split-cycle owns it at this scope (M79c)
 	// and the kernel's tty path owns it at kernel-terminal scope (M73e).
 	hidUsageInsert uint8 = 0x70
-	hidBtnLeft     uint8 = 0x01
-	hidBtnMiddle   uint8 = 0x04
+	// M190a (#3236): the clipboard-history menu rides ctrl+shift+i — 'v'
+	// is doubly taken (split-cycle here, tty paste at kernel-terminal
+	// scope) and the harness's chord vocabulary has no ctrl+alt+<letter>.
+	hidUsageI    uint8 = 0x0C
+	hidBtnLeft   uint8 = 0x01
+	hidBtnMiddle uint8 = 0x04
 )
 
 // execApp is the exec seam for the BT1 chords. It is vi.Exec in the guest;
@@ -555,12 +563,20 @@ func runSeatAction(action string, c chords.Chord) {
 	case "sel-paste":
 		// M124e (#2584): shift+insert — the primary-paste chord.
 		applySelPasteChord()
+	case "clip-menu":
+		// M190a (#3236): ctrl+shift+i — the clipboard-history paste
+		// menu over the seat chrome.
+		applyClipMenu()
 	case "undo":
 		_ = applyUndo()
 	}
 }
 
 func handleWmKey(e vi.Event) {
+	// M190a (#3236): every seat key is an observation point for the
+	// clipboard ring — a copy lands in history inside the gesture that
+	// made it, not up to a tick later.
+	cliphistPoll()
 	// Escape dismisses the seat-owned notification center without stealing
 	// ordinary app keystrokes when the overlay is closed.
 	if notifyCenterOpen && e.Arg0 == 0x29 && e.Flags&(vi.ModCtrl|vi.ModShift|vi.ModAlt) == 0 {
@@ -575,6 +591,11 @@ func handleWmKey(e vi.Event) {
 		return
 	}
 	if handleLauncherKey(e) {
+		return
+	}
+	// M190a (#3236): the open paste menu is chrome-modal like the power
+	// menu — its arrows/Enter/Esc are the seat's, never the app's.
+	if handleClipMenuKey(e) {
 		return
 	}
 	// M82c (#1770): dispatch IS the registry walk — one exact (mods, usage)
@@ -932,6 +953,10 @@ func focusHosted(id uint32) bool {
 }
 
 func handleWmPointer(e vi.Event) {
+	// M190a (#3236): the pointer path is an observation point too — a
+	// copy made by a click-driven app lands in the ring inside the
+	// gesture stream, not up to a tick later.
+	cliphistPoll()
 	px := e.Arg0 & 0xffff
 	py := e.Arg0 >> 16
 	btn := uint8(e.Flags & 0xff)
@@ -1015,6 +1040,20 @@ func handleWmPointer(e vi.Event) {
 			if r := powerMenuRowAt(px, py, vi.ScanoutWidth, vi.ScanoutHeight); r >= 0 {
 				powerSel = r
 				runPowerRow(r)
+			}
+		}
+		return
+	}
+	// M190a (#3236): the open paste menu is chrome-modal the same way —
+	// a press on a row picks it through the Enter path, a press anywhere
+	// else dismisses it, and nothing reaches content either way.
+	if clipMenuOpen {
+		if down {
+			if r := clipMenuRowAt(px, py, vi.ScanoutWidth, vi.ScanoutHeight); r >= 0 {
+				clipMenuSel = r
+				applyClipMenuPick(r)
+			} else {
+				dismissClipMenu()
 			}
 		}
 		return

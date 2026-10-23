@@ -62,6 +62,7 @@ const (
 	UsageF            uint8 = 0x09
 	UsageG            uint8 = 0x0A
 	UsageH            uint8 = 0x0B
+	UsageI            uint8 = 0x0C
 	UsageK            uint8 = 0x0E
 	UsageL            uint8 = 0x0F
 	UsageN            uint8 = 0x11

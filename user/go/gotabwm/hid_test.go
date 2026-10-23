@@ -1355,7 +1355,7 @@ func TestHidUsagesMatchRegistry(t *testing.T) {
 		"snapshot-bundle": hidUsageS,
 		"freeze-badge":    hidUsageF, "split-cycle": hidUsageV,
 		"nav-back": hidUsageLeftBracket, "nav-forward": hidUsageRightBracket,
-		"undo": hidUsageZ,
+		"undo": hidUsageZ, "clip-menu": hidUsageI,
 	} {
 		if rowUsage(action) != usage {
 			t.Errorf("registry action %q usage drifted from the local constant %#x", action, usage)
@@ -1453,7 +1453,8 @@ func TestChordSummaryCounts(t *testing.T) {
 	got := chordSummary(len(chords.Global), seat, kernel, app)
 	// M132a (#2752): n=59→66, seat=29→36 — the wave's seven reserved seat
 	// rows (R4–R6) landed ahead of their handlers.
-	want := "gotabwm: chords n=66 seat=36 kernel=12 app=18"
+	// M190a (#3236): n=66→67, seat=36→37 — the clip-menu summon row.
+	want := "gotabwm: chords n=67 seat=37 kernel=12 app=18"
 	if got != want {
 		t.Fatalf("chordSummary = %q want %q", got, want)
 	}

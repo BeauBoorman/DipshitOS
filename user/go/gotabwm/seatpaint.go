@@ -199,3 +199,37 @@ func seatTextWidth(s string, px int) int {
 	}
 	return len(s) * 8 // the 8x8 face at 1x: an 8px advance per cell
 }
+
+// seatFitText truncates s so it measures inside maxW at px, ending the
+// cut with an ellipsis when anything was dropped. The measure is
+// seatTextWidth's, so the fit tracks the resolved face's advance on
+// either render path.
+func seatFitText(s string, maxW, px int) string {
+	if maxW <= 0 || s == "" {
+		return ""
+	}
+	if seatTextWidth(s, px) <= maxW {
+		return s
+	}
+	const ell = "…"
+	budget := maxW - seatTextWidth(ell, px)
+	if budget <= 0 {
+		return ell
+	}
+	// Walk runes, not bytes — a label may carry UTF-8, and a cut inside
+	// a rune paints the replacement glyph.
+	cut := 0
+	used := 0
+	for i, r := range s {
+		w := seatTextWidth(string(r), px)
+		if used+w > budget {
+			break
+		}
+		used += w
+		cut = i + len(string(r))
+	}
+	if cut == 0 {
+		return ell
+	}
+	return s[:cut] + ell
+}
