@@ -24,11 +24,18 @@
 # consumed in-boot); "each iteration, one boot" is only true when the spec
 # IS the journey — the go-dogfood/live-agent-loop acceptance pattern.
 #
+# Run 03 (M177c / #3154) is the same journey audited as accessibility:
+# a11y.contrast=high seeds the boot, GODEMO and GOA11Y (the M177b outline
+# reader) are the hosted pair, run 01's key drive replays, and every
+# focus step GOA11Y samples must read as a named node in key order on
+# high-contrast seat chrome.
+#
 # HOST PREREQUISITES (fail the gate honestly when missing):
 #   bash tools/go/build-gotabwm.sh     ->  .build/go/GOTABWM.ELF
 #   bash tools/go/build-gocalc.sh      ->  .build/go/GOCALC.ELF
 #   bash tools/go/build-note.sh        ->  .build/go/NOTE.ELF
 #   bash tools/go/build-appkitdemo.sh  ->  .build/go/GODEMO.ELF
+#   bash tools/go/build-goa11y.sh      ->  .build/go/GOA11Y.ELF
 #
 # exec-order: assert-proven — the run ends on `gotabwm: session live n=3`,
 # a marker only the post-kill restore can print (the first seat exec finds
@@ -776,4 +783,282 @@ for i, c in enumerate(counts):
         sys.exit("pane %d holds only %d non-Bg sample px" % (i, c))
 print("restored: %d rail accent px, %d face px, %d live-pill px; "
       "pane non-Bg px %s" % (accent, faces, pill, counts))
+PY
+
+# ===========================================================================
+# Run 03 (M177c / #3154): the keyboard journey as an accessibility audit.
+# The seat + GODEMO + GOA11Y are the three-runtime envelope: the reader
+# polls WINDOWS_QUERY (kind 16) every 500 ms and prints the focused
+# window's published outline as `goa11y: focus win=<id> nodes=<n>` plus
+# `goa11y: node <i> <role> <state> <name>` lines, one block per observed
+# outline change.
+#
+# The a11y.contrast=high seed travels INSIDE the boot: the setup stages
+# SETTINGS.HC beside the plain SETTINGS.TXT and the script's `vf rm` +
+# `vf mv` swaps it in before the seat execs — `vf mv` refuses to replace
+# an existing target, hence the rm. Runs 01/02 and later iterations keep
+# reading the plain file because a trailing python assert re-stages both
+# after the run (the armed share persists across vgate_repeat boots).
+#
+# Exec order inside script2 is load-bearing the same way run 01's is:
+# GOA11Y execs first so GODEMO's declare + self-raise is the last focus
+# event the seat sees — a late GOA11Y declare would steal the keyboard
+# and the chords would land on a window that ignores input by contract.
+#
+# The drive is run 01's key sequence verbatim through Return: escape
+# (cancel the prompt), F10 (the bar's expanded state flips), down/right/
+# right (File open -> Edit -> View), e (&Expand All mnemonic), tab (the
+# focus ring hands the table the keys), down/down/right (cell r=2 c=1),
+# return. The end marker is ` row 3 of 64` — a string only GOA11Y's node
+# line for the final outline ever prints, so --script-expect landing on
+# it means every focus block the reader observed is already in serial.
+#
+# EXTRA HOST PREREQUISITE (fails honestly when missing):
+#   bash tools/go/build-goa11y.sh  ->  .build/go/GOA11Y.ELF
+
+vgate_file script-03.txt <<'EOF'
+vf rm GOTABWM.DEMO
+vf rm SESSION.TABS
+vf rm SESSION.PANES
+vf rm SNAPSHOT.BUNDLE
+vf rm SNAPSHOT.RESTORE
+vf rm SETTINGS.TXT
+vf mv SETTINGS.HC SETTINGS.TXT
+set GOMAXPROCS=1
+wm
+exec GOTABWM.ELF
+EOF
+
+vgate_file script2-03.txt <<'EOF'
+dui focus 0
+exec GOA11Y.ELF
+exec GODEMO.ELF
+EOF
+
+vgate_setup_python <<'PY'
+import glob, os, shutil, sys
+share = os.environ.get("VG_SHARE") or os.path.join(os.environ["RUN_DIR"], "share")
+src = os.path.join(".build", "go", "GOA11Y.ELF")
+if not os.path.exists(src):
+    sys.exit("GOA11Y.ELF missing (expected %s) - build it first: "
+             "bash tools/go/build-goa11y.sh" % src)
+shutil.copy(src, os.path.join(share, "GOA11Y.ELF"))
+print("staged GOA11Y.ELF (%d bytes)" % os.path.getsize(src))
+# The run-03 seed: the same wm=none boot posture as SETTINGS.TXT plus the
+# a11y.contrast=high row the seat applies in loadSettings at exec.
+with open(os.path.join(share, "SETTINGS.HC"), "w") as f:
+    f.write("#v2\nwm=none\na11y.contrast=high\n")
+print("staged SETTINGS.HC (a11y.contrast=high seed for run 03)")
+# Drop outlines a previous aborted gate left on this share — a stale
+# A11Y.<win> body is dead data to the reader only while it is never the
+# focused window's file, and a leftover ` row 3 of 64` could fire run
+# 03's end marker before the drive ran.
+stale = [p for p in glob.glob(os.path.join(share, "A11Y.*"))
+         if os.path.isfile(p)]
+for p in stale:
+    os.remove(p)
+if stale:
+    print("dropped %d stale A11Y.* outline(s)" % len(stale))
+PY
+
+vgate_run 03 -- \
+    --screen '$RUN_DIR/screen-03' \
+    --via-virtio --cvc-snap \
+    --snapshot-after 'godemo: table activate r=2 c=1' \
+    --snapshot-out '$RUN_DIR/snap-03' \
+    --script '$RUN_DIR/script-03.txt' \
+    --script2 '$RUN_DIR/script2-03.txt' \
+    --script2-after 'gotabwm: win focus' \
+    --input-chords 'escape,f10,down,right,right,e,tab,down,down,right,return' \
+    --input-chords-after 'godialog: painted' \
+    --script-expect 'row 3 of 64' --script-expect-tail 20 --timeout 300
+
+# --- the opt-in seat under the swapped-in high-contrast settings --------
+vgate_assert 03 serial-contains 'VirelaiOS kernel has seized control.'
+vgate_assert 03 serial-contains 'vf: mv SETTINGS.HC -> SETTINGS.TXT ok'
+vgate_assert 03 serial-contains 'exec: loaded GOTABWM.ELF'
+vgate_assert 03 serial-contains 'gotabwm: registered'
+vgate_assert 03 serial-contains 'gotabwm: mode live'
+# The boot read applied a11y.contrast=high: the seat's own token probe is
+# the DarkHC table (bg/surface/border/accent), the same line go-settings
+# run 03 pins.
+vgate_assert 03 serial-contains 'gotabwm: tokens theme=dark bg=0x000000 surface=0x0d1117 border=0x8b949e accent=0x58a6ff'
+# --- the three-runtime envelope ------------------------------------------
+vgate_assert 03 serial-contains 'exec: loaded GOA11Y.ELF'
+vgate_assert 03 serial-contains 'goa11y: open id='
+vgate_assert 03 serial-contains 'goa11y: declare accepted'
+vgate_assert 03 serial-contains 'goa11y: present'
+vgate_assert 03 serial-contains 'exec: loaded GODEMO.ELF'
+vgate_assert 03 serial-contains 'goa11y: focus win='
+vgate_assert 03 serial-contains 'gotabwm: rail n=2'
+# --- the same key drive run 01 makes --------------------------------------
+vgate_assert 03 serial-contains 'godialog: painted'
+vgate_assert 03 serial-contains 'godemo: menu expand-all'
+vgate_assert 03 serial-contains 'godemo: table activate r=2 c=1'
+# The reader's named states stay honest: the kind-16 answer never came
+# back refused and no focused window read as a malformed file.
+vgate_assert 03 serial-absent 'goa11y: query '
+vgate_assert 03 serial-absent 'goa11y: bad outline win='
+vgate_assert 03 serial-absent '[EXC] parking:'
+vgate_assert 03 serial-absent 'exited status=139'
+
+# --- the audit: every focus step is a named node, in key order ------------
+# GOA11Y dedups on (win, outline bytes), so serial carries one block per
+# DISTINCT outline the 500 ms poll sampled — a subsequence of the states
+# the key drive published, not necessarily all of them. The audit reads
+# blocks only after 'godialog: painted': publish() precedes the first
+# paint, so earlier polls could only have seen a stale share file.
+#
+# Canonical focused-node chain, in key order (role, name-prefix):
+#   tree Tree              the initial ring focus — the CONTROL holds it:
+#                          no key ever selects a tree row, so View.Sel
+#                          stays -1 and no treeitem can carry 'f'
+#   menu File              F10 activates the bar on title 0
+#   menuitem Open          down drops File; first enabled item hovered
+#   menu Edit              right lands the all-disabled menu's title
+#   menuitem Expand All    right drops View on its first item
+#   tree Tree              e fires &Expand All; the ring refocuses
+#   row row 1 of 64        tab hands the table the keys (Row=0)
+#   row row 2 of 64        down
+#   row row 3 of 64        down,right land cell r=2 c=1
+# Any sample the poll caught must sit on this chain, in order; the run's
+# own end marker makes the last link guaranteed present.
+vgate_assert 03 python <<'PY'
+import os, sys
+ser = open(os.environ["VG_SER"], errors="replace").read()
+i0 = ser.find("godialog: painted")
+if i0 < 0:
+    sys.exit("godialog: painted never printed")
+# Group the reader's output into blocks: a focus line opens one, the
+# `goa11y: node` lines that follow are that outline's snapshot.
+blocks = []  # [(win, [node lines])]
+cur = None
+for ln in ser[i0:].splitlines():
+    if ln.startswith("goa11y: focus win="):
+        cur = (ln.split("win=", 1)[1].split(" ", 1)[0], [])
+        blocks.append(cur)
+    elif ln.startswith("goa11y: node ") and cur is not None:
+        cur[1].append(ln)
+wins = sorted({w for w, ns in blocks if ns})
+if len(wins) != 1:
+    sys.exit("node blocks span wins %r, want GODEMO's single id" % wins)
+win = wins[0]
+
+focused = []   # (role, name) the reader saw focused, in order
+menubar = []   # expanded flag per menubar node line, in order
+for w, ns in blocks:
+    for ln in ns:
+        f = ln[len("goa11y: node "):].split(" ", 3)
+        idx, role = f[0], (f[1] if len(f) > 1 else "")
+        state = f[2] if len(f) > 2 else ""
+        name = f[3] if len(f) > 3 else ""
+        if role == "unknown" or name == "":
+            sys.exit("win=%s names an unauditable node: %r" % (win, ln))
+        if role == "menubar":
+            menubar.append("e" in state)
+        if "f" in state:
+            focused.append((role, name))
+
+canonical = [("tree", "Tree"), ("menu", "File"),
+             ("menuitem", "Open"), ("menu", "Edit"),
+             ("menuitem", "Expand All"), ("tree", "Tree"),
+             ("row", "row 1 of 64"), ("row", "row 2 of 64"),
+             ("row", "row 3 of 64")]
+ci = 0
+for role, name in focused:
+    while ci < len(canonical) and not (
+            canonical[ci][0] == role and canonical[ci][1] in name):
+        ci += 1
+    if ci == len(canonical):
+        sys.exit("focus step %r %r breaks key order: observed %r"
+                 % (role, name, focused))
+    ci += 1
+if not focused or focused[-1] != ("row", "row 3 of 64"):
+    sys.exit("last observed focus %r, want row 3 of 64 (the run's own "
+             "end marker)" % (focused[-1] if focused else None))
+if not any(r in ("menu", "menuitem") for r, _ in focused):
+    sys.exit("no menu-mode focus step observed: %r" % focused)
+# The expanded flip on F10: some block carried menubar 'e', and a later
+# block carries it unexpanded again — the post-fire state the row blocks
+# always show.
+if not any(menubar):
+    sys.exit("menubar never carried the expanded state — F10 unobserved")
+first_e = menubar.index(True)
+if False not in menubar[first_e + 1:]:
+    sys.exit("menubar expanded but never read unexpanded again: %r"
+             % menubar)
+print("a11y audit win=%s: %d outline blocks, focused chain %r, "
+      "menubar expanded-then-restored" % (win, len(blocks), focused))
+PY
+
+# --- seat chrome is the high-contrast table -------------------------------
+# The kind-4 BGRX frame at `table activate`: two rail cells (GODEMO
+# focused, GOA11Y idle) over the 1280 band — the go-settings run-03 probe
+# verbatim: every sampled pixel is a DarkHC chrome token, none of the
+# plain-Dark ones.
+vgate_assert 03 snapshot 'snap-03-*.raw' <<'PY'
+import sys
+
+W, H = 1280, 720
+raw = open(sys.argv[1], "rb").read()
+if len(raw) < W * H * 4:
+    sys.exit("snapshot is %d bytes, want %d (%dx%d BGRX)"
+             % (len(raw), W * H * 4, W, H))
+
+def px(x, y):
+    off = (y * W + x) * 4
+    return (raw[off + 2], raw[off + 1], raw[off])  # BGRX -> (r, g, b)
+
+HC = {(0x00, 0x00, 0x00),          # Bg (rail gaps)
+      (0x1f, 0x3a, 0x5f),          # Selection (focused cell)
+      (0x1c, 0x21, 0x28),          # BtnIdle (unfocused cell)
+      (0x58, 0xa6, 0xff),          # Accent (focus bar)
+      (0x8b, 0x94, 0x9e),          # Border
+      (0xff, 0xff, 0xff),          # Text
+      (0xb1, 0xba, 0xc4)}          # Muted
+DARK = {(0x18, 0x20, 0x26), (0x2a, 0x44, 0x60), (0x2d, 0x37, 0x48),
+        (0x3b, 0x82, 0xf6), (0x33, 0x41, 0x55), (0x94, 0xa3, 0xb8)}
+
+# Cell interiors, away from glyph ink: the fill bands above and below the
+# title row inside each half-width cell.
+samples = []
+for cx in (0, 640):                # the two cells' left edges
+    for dx in range(30, 600, 16):
+        for y in (3, 4, 18, 19):
+            samples.append(px(cx + dx, y))
+hc = sum(1 for c in samples if c in HC)
+dark = sum(1 for c in samples if c in DARK)
+if hc * 2 < len(samples):
+    sys.exit("seat rail: only %d/%d px are DarkHC chrome tokens — "
+             "the seat did not take a11y.contrast=high at boot" % (hc, len(samples)))
+if dark > 2:
+    sys.exit("seat rail: %d px are plain-Dark chrome tokens — the "
+             "high-contrast variant did not apply" % dark)
+print("seat rail: %d/%d px DarkHC chrome tokens, %d plain-Dark strays"
+      % (hc, len(samples), dark))
+PY
+
+# --- iteration hygiene -----------------------------------------------------
+# The armed share persists across all three vgate_repeat boots: run 03's
+# `vf rm` + `vf mv` consumed the staged pair, so re-stage SETTINGS.TXT
+# and SETTINGS.HC byte-for-byte or the next iteration's runs 01/02 would
+# boot the seat on high contrast (their probes pin the plain Dark
+# table). Also drop every A11Y.<win> outline — the VM stops mid-run, so
+# UnpublishOutline never ran, and a stale ` row 3 of 64` body could fire
+# the next boot's --script-expect before its drive even started.
+vgate_assert 03 python <<'PY'
+import glob, os, sys
+share = os.environ.get("VG_SHARE")
+if not share:
+    sys.exit("no armed share exported to the assert (vgate_share seed?)")
+for name, body in (("SETTINGS.TXT", "#v2\nwm=none\n"),
+                   ("SETTINGS.HC", "#v2\nwm=none\na11y.contrast=high\n")):
+    with open(os.path.join(share, name), "w") as f:
+        f.write(body)
+stale = [p for p in glob.glob(os.path.join(share, "A11Y.*"))
+         if os.path.isfile(p)]
+for p in stale:
+    os.remove(p)
+print("restaged SETTINGS.TXT + SETTINGS.HC; dropped %d stale A11Y.* "
+      "outline(s)" % len(stale))
 PY
