@@ -371,6 +371,11 @@ func guessBin(title string) string {
 		// (`reopen missing Settings` + `refusal ENOENT exec Settings`,
 		// go-dogfood boot 09).
 		return "GOSET.ELF"
+	case "Top":
+		// M192d (#3249): GOTOP's declared title — the session state leg
+		// re-execs the recorded row, so "Top" must name the real binary
+		// (`refusal ENOENT exec Top`, go-top run 11's restore leg).
+		return "GOTOP.ELF"
 	default:
 		return binToken(title)
 	}

@@ -48,7 +48,7 @@ All of them additionally answer to the schema-v2 manifest grammar
 | Shell | app | GOSH.ELF | — | tools/gate/specs/go-sh.spec | shipped |
 | Help | app | GOHELP.ELF | — | tools/gate/specs/go-help.spec | shipped |
 | Welcome | app | GOWELCOME.ELF | — | — | shipped |
-| Top | app | GOTOP.ELF | — | tools/gate/specs/go-top.spec | shipped |
+| Top | app | GOTOP.ELF | appver 1 | tools/gate/specs/go-top.spec | shipped |
 | Settings | app | GOSET.ELF | — | tools/gate/specs/go-settings.spec | shipped |
 | Image Viewer | app | GOVIEW.ELF | — | tools/gate/specs/live-image-viewer.spec | shipped |
 | Sound | app | GOSOUND.ELF | — | tools/gate/specs/live-sound-playback.spec | shipped |

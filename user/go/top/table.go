@@ -27,6 +27,24 @@ const (
 	ColMem
 )
 
+// Tag is the column's lowercase marker name — the header's sort tag and
+// the appver-1 state blob's serial vocabulary share it.
+func (c Column) Tag() string {
+	switch c {
+	case ColName:
+		return "name"
+	case ColState:
+		return "state"
+	case ColExit:
+		return "exit"
+	case ColCPU:
+		return "cpu"
+	case ColMem:
+		return "mem"
+	}
+	return "pid"
+}
+
 // Label is the column's header text.
 func (c Column) Label() string {
 	switch c {
@@ -479,6 +497,14 @@ func (t *Table) SortBy(col Column) {
 func (t *Table) SortColumn() Column  { return t.col }
 func (t *Table) SortAscending() bool { return t.asc }
 
+// SetSort restores an absolute sort state — the state blob's replay of
+// SortBy's outcome without its repeated-column flip (M192d, #3249).
+func (t *Table) SetSort(col Column, asc bool) {
+	t.col = col
+	t.asc = asc
+	t.Rebuild()
+}
+
 // Names is every process's registry name in snapshot order — the join key
 // the trust tab works from (one sys_procs read feeds both views).
 func (t *Table) Names() []string {
@@ -570,20 +596,7 @@ func (t *Table) Header() string {
 	if t.usage {
 		h += "  " + padRight("CPU%", 5) + " " + padRight("MEM", 8)
 	}
-	tag := "exit"
-	switch t.col {
-	case ColPID:
-		tag = "pid"
-	case ColName:
-		tag = "name"
-	case ColState:
-		tag = "state"
-	case ColCPU:
-		tag = "cpu"
-	case ColMem:
-		tag = "mem"
-	}
-	return h + " " + mark + tag
+	return h + " " + mark + t.col.Tag()
 }
 
 // padRight pads s to width w with spaces (never truncates).

@@ -64,13 +64,27 @@
 # is `go test ./vi ./top` (TestProcsV2OldKernel, TestUsageGoneOnV1) plus the
 # kernel-side byte-frozen snapshot test.
 #
+# Runs 10/11 (issue #3249, M192d) are the appver-1 state legs, and they seat
+# GOTABWM — the snapshot chord and SESSION.TABS restore are Go-seat features
+# (Zig TABWM owns neither). Run 10 sorts the procs tab name-descending (`2
+# 2`), dumps the order (`r`), makes mounts the active tab (`m`), then
+# ctrl-shift-s asks the seat to take GOTOP's 4-byte blob — `u8 fmtver | u8
+# page | u8 col | u8 dir` — into SESSION.TABS's app_state trailer. Run 11 is
+# the fresh boot on that share: the seat session-reexecs GOTOP.ELF, the
+# restore_state request hands the blob back at appver=1, and the startup row
+# dump lands in the same name-descending order on the mounts tab — sorted
+# like you left it. Staging GOTABWM.ELF arms the kernel's compiled
+# wm=gotabwm autostart, so SETTINGS.TXT carries wm=none to keep runs 01-09
+# booting exactly as before (the go-emoji/go-term idiom).
+#
 # HOST PREREQUISITES (fail the gate honestly when missing):
 #   bash tools/go/build-gotop.sh                    -> .build/go/GOTOP.ELF
 #   bash tools/go/build-go.sh tools/go/smpscale.go  -> .build/go/GOSCALE.ELF
 #   bash tools/go/build-pulse.sh                    -> .build/go/PULSE.ELF
 #   bash tools/go/build-gputriangle.sh              -> .build/go/GPUTRIANGLE.ELF
+#   bash tools/go/build-gotabwm.sh                  -> .build/go/GOTABWM.ELF
 
-vgate_name go-top "issue #1566 M71g: GOTOP.ELF lists a live pid and kills it in Zig TABWM on VZ; #2197: `/` filter leg; #2411: `c` gpu tab over real slot-90 counters; #2421: `t` trust tab — real grant posture + receipts"
+vgate_name go-top "issue #1566 M71g: GOTOP.ELF lists a live pid and kills it in Zig TABWM on VZ; #2197: `/` filter leg; #2411: `c` gpu tab over real slot-90 counters; #2421: `t` trust tab — real grant posture + receipts; #3249: appver-1 sort+tab persistence under the Go seat"
 vgate_share seed
 vgate_runner_flags -Xswiftc -DSPIKE
 
@@ -258,6 +272,20 @@ if not os.path.exists(prof):
     cfg.setdefault("devices", {})["share"] = False
     json.dump(cfg, open(cfg_path, "w"), indent=2, sort_keys=True)
     print("minted profile fixture: base.img+.prev, 2 snapshots, ctl credential")
+# M192d runs 10/11 (issue #3249): the appver state legs seat GOTABWM — the
+# snapshot chord and SESSION.TABS restore are Go-seat features. Staging the
+# binary arms the kernel's compiled wm=gotabwm autostart on EVERY leg of
+# this spec, so wm=none keeps runs 01-09 seatless exactly as before (their
+# `tabwm start` / direct execs are unaffected); runs 10/11 exec the seat
+# from the monitor (the go-emoji/go-term idiom).
+gsrc = os.path.join(".build", "go", "GOTABWM.ELF")
+if not os.path.exists(gsrc):
+    sys.exit("GOTABWM.ELF missing (expected " + gsrc + ") - build it first: "
+             "bash tools/go/build-gotabwm.sh")
+shutil.copy(gsrc, os.path.join(share, "GOTABWM.ELF"))
+with open(os.path.join(share, "SETTINGS.TXT"), "w") as f:
+    f.write("#v2\nwm=none\n")
+print("staged GOTABWM.ELF + SETTINGS.TXT wm=none")
 PY
 
 vgate_run 01 -- \
@@ -868,3 +896,204 @@ if not m:
              % ([l for l in ser.splitlines() if "top: mount host" in l],))
 print("gotop mounts free=%d" % int(m.group(1)))
 PY
+
+
+# --- Run 10 (M192d #3249): the appver-1 envelope's SAVE half -----------------
+#
+# The go-fileman run 07 shape under the Go seat: GOTABWM seats the boot,
+# `2 2` sorts the procs tab by NAME descending (non-default column AND
+# direction), `r` dumps the live order, `m` makes mounts the active tab,
+# then ctrl-shift-s. The seat posts the kind-20 ask; GOTOP stages
+# `u8 fmtver | u8 page | u8 col | u8 dir` = 4 bytes at the rendezvous and
+# posts the request; the seat stores the blob on the tab's SESSION.TABS
+# record and republishes. The trailer is asserted byte-level: AS magic,
+# appver=1, and the exact field bytes the chords produced.
+vgate_file script-10.txt <<'EOF'
+set GOMAXPROCS=1
+vf rm SESSION.TABS
+vf rm SESSION.PANES
+vf rm SNAPSHOT.BUNDLE
+vf rm SNAPSHOT.RESTORE
+wm
+exec GOTABWM.ELF
+EOF
+
+vgate_file script2-10.txt <<'EOF'
+dui focus 0
+exec GOTOP.ELF
+EOF
+
+vgate_file script3-10.txt <<'EOF'
+wm
+dui
+echo rx-gotop-state-save-ok
+EOF
+
+vgate_run 10 -- \
+    --screen '$RUN_DIR/screen-10' \
+    --via-virtio \
+    --script '$RUN_DIR/script-10.txt' \
+    --script2 '$RUN_DIR/script2-10.txt' \
+    --script2-after 'gotabwm: win focus' \
+    --input-chords '2,2,r,m,ctrl-shift-s' \
+    --input-chords-after 'top: ready' \
+    --script3 '$RUN_DIR/script3-10.txt' \
+    --script3-after 'gotabwm: snapshot saved' \
+    --script-expect 'rx-gotop-state-save-ok' --timeout 300
+
+vgate_assert 10 serial-contains 'exec: loaded GOTABWM.ELF'
+vgate_assert 10 serial-contains 'gotabwm: registered'
+vgate_assert 10 serial-contains 'exec: loaded GOTOP.ELF'
+vgate_assert 10 serial-contains 'top: tab-aware (full-viewport)'
+vgate_assert 10 serial-contains 'top: ready'
+# A fresh tab honestly has no stored state — no restore marker may print.
+vgate_assert 10 serial-absent 'top: state restored'
+vgate_assert 10 serial-absent 'top: state refused'
+# The two sort chords and the refresh landed; the mounts tab is live.
+vgate_assert 10 serial-contains 'top: refreshed ok'
+vgate_assert 10 serial-contains 'top: tab=mounts'
+vgate_assert 10 serial-contains 'top: mounts n='
+# The SEAT's half: the snapshot chord asked the bound tab; GOTOP staged
+# 4 bytes at appver 1 (fmtver + page=mounts + col=name + dir=desc) and the
+# seat stored + republished the session carrying them.
+vgate_assert 10 serial-contains 'gotabwm: state ask id='
+vgate_assert 10 serial-contains 'gotabwm: state save id='
+vgate_assert 10 serial-contains 'len=4 ver=1'
+vgate_assert 10 serial-contains 'top: state save tab=mounts sort=name dir=desc len=4'
+vgate_assert 10 serial-contains 'gotabwm: snapshot saved '
+vgate_assert 10 serial-absent 'gotabwm: state drop'
+# Byte-level on the share: the .tabs v2 AS trailer framing and the blob's
+# own fields — byte identity is the card's claim, not a checksum.
+vgate_assert 10 python <<'PY'
+import os, sys
+b = open(os.path.join(os.environ["VG_SHARE"], "SESSION.TABS"), "rb").read()
+if b[0] != 2 or b[2] != 1:
+    sys.exit("SESSION.TABS header ver=%d count=%d" % (b[0], b[2]))
+off = 6 + 69
+if len(b) < off + 6 + 8 + 4:
+    sys.exit("SESSION.TABS too short for a state trailer: %d" % len(b))
+if b[off:off+2] != b"AS" or b[off+2] != 1 or b[off+3] != 1:
+    sys.exit("app_state header %r" % b[off:off+6])
+ent = b[off+6:off+14]
+if ent[0] != 0 or ent[1] != 1:
+    sys.exit("app_state entry index=%d appver=%d" % (ent[0], ent[1]))
+ln = int.from_bytes(ent[4:8], "little")
+blob = b[off+14:off+14+ln]
+# GOTOP blob v1: u8 fmtver | u8 page | u8 col | u8 dir.
+# page 5 = mounts, col 1 = name, dir 0 = descending.
+if blob != bytes([1, 5, 1, 0]):
+    sys.exit("blob %r is not [fmtver=1 page=5 col=1 dir=0]" % bytes(blob))
+print("SESSION.TABS app_state: idx=0 appver=1 len=%d "
+      "tab=mounts sort=name dir=desc" % ln)
+PY
+# The `r` dump after the sort chords IS the saved ordering: every dumped
+# name is >= the next under the app's case-insensitive comparator (name
+# descending — the non-default sort the blob recorded).
+vgate_assert 10 python <<'PY'
+import os, re, sys
+ser = open(os.environ["VG_SER"], errors="replace").read()
+lines = ser.splitlines()
+ref = next((i for i, l in enumerate(lines) if l.strip() == "top: refreshed ok"), None)
+if ref is None:
+    sys.exit("FAIL: no `top: refreshed ok` — the r chord never landed")
+procs = max(i for i, l in enumerate(lines[:ref]) if l.startswith("top: procs n="))
+names = [m.group(1) for l in lines[procs:ref]
+         for m in [re.search(r"top: row pid=\d+ name=(\S+)", l)] if m]
+if len(names) < 2:
+    sys.exit("FAIL: fewer than two rows dumped after the sort: %r" % names)
+if names != sorted(names, key=str.lower, reverse=True):
+    sys.exit("FAIL: post-sort dump is not name-descending: %r" % names)
+print("gotop save leg: %d rows dumped name-descending %r" % (len(names), names))
+PY
+vgate_assert 10 serial-contains 'rx-gotop-state-save-ok'
+vgate_assert 10 serial-absent '[EXC] parking:'
+vgate_assert 10 serial-absent 'exited status=139'
+
+
+# --- Run 11 (M192d #3249): the RESTORE half ---------------------------------
+#
+# A FRESH boot on the share run 10 left: the seat loads SESSION.TABS,
+# re-execs GOTOP.ELF (no argv — the recorded row carries only the bin),
+# and the app's restore_state request gets the blob back byte-intact. The
+# proof is the app's own verdicts: `state restored tab=mounts sort=name
+# dir=desc` names the round trip, and the startup row dump — printed under
+# the restored sort before any user key — lands in the same
+# name-descending order run 10 saved.
+vgate_file script-11.txt <<'EOF'
+set GOMAXPROCS=1
+vf rm SNAPSHOT.BUNDLE
+wm
+exec GOTABWM.ELF
+EOF
+
+vgate_file script2-11.txt <<'EOF'
+dui focus 0
+EOF
+
+vgate_file script3-11.txt <<'EOF'
+wm
+dui
+echo rx-gotop-state-restore-ok
+EOF
+
+vgate_run 11 -- \
+    --screen '$RUN_DIR/screen-11' \
+    --via-virtio \
+    --script '$RUN_DIR/script-11.txt' \
+    --script2 '$RUN_DIR/script2-11.txt' \
+    --script2-after 'gotabwm: win focus' \
+    --script3 '$RUN_DIR/script3-11.txt' \
+    --script3-after 'top: state restored' \
+    --script-expect 'rx-gotop-state-restore-ok' --timeout 300
+
+vgate_assert 11 serial-contains 'exec: loaded GOTABWM.ELF'
+vgate_assert 11 serial-contains 'gotabwm: registered'
+vgate_assert 11 serial-contains 'gotabwm: session load n=1 mode=restore'
+vgate_assert 11 serial-contains 'gotabwm: session reexec n=1'
+vgate_assert 11 serial-contains 'gotabwm: session exec GOTOP.ELF'
+vgate_assert 11 serial-contains 'gotabwm: session live n=1'
+# The seat's re-exec path, not the monitor `exec` builtin — the load's
+# proof is the app's own open marker (`exec: loaded` is a monitor line).
+vgate_assert 11 serial-contains 'top: open id='
+vgate_assert 11 serial-contains 'top: tab-aware (full-viewport)'
+# The seat staged the stored blob for the re-exec'd tab and the app's own
+# decode applied it — the full protocol leg: the mounts tab is active and
+# the sort is the saved name-descending.
+vgate_assert 11 serial-contains 'gotabwm: state restore id='
+vgate_assert 11 serial-contains 'len=4 ver=1'
+vgate_assert 11 serial-contains 'top: tab=mounts'
+vgate_assert 11 serial-contains 'top: state restored tab=mounts sort=name dir=desc'
+vgate_assert 11 serial-contains 'top: mounts n='
+vgate_assert 11 serial-contains 'top: procs n='
+vgate_assert 11 serial-contains 'top: ready'
+vgate_assert 11 serial-absent 'top: state refused'
+vgate_assert 11 serial-absent 'gotabwm: state drop'
+# Same ordering: the startup dump between the restore marker and `top:
+# ready` is the post-restore listing — non-increasing names, and NOT the
+# pid-ascending default a cold start would print.
+vgate_assert 11 python <<'PY'
+import os, re, sys
+ser = open(os.environ["VG_SER"], errors="replace").read()
+lines = ser.splitlines()
+res = next((i for i, l in enumerate(lines)
+            if l.strip().startswith("top: state restored")), None)
+rdy = next((i for i, l in enumerate(lines) if l.strip() == "top: ready"), None)
+if res is None or rdy is None or rdy <= res:
+    sys.exit("FAIL: restore/ready markers missing or misordered")
+names = [m.group(1) for l in lines[res:rdy]
+         for m in [re.search(r"top: row pid=\d+ name=(\S+)", l)] if m]
+if len(names) < 2:
+    sys.exit("FAIL: fewer than two rows dumped after restore: %r" % names)
+if names != sorted(names, key=str.lower, reverse=True):
+    sys.exit("FAIL: restored listing is not name-descending: %r" % names)
+pids = [int(m.group(1)) for l in lines[res:rdy]
+        for m in [re.search(r"top: row pid=(\d+)", l)] if m]
+if pids == sorted(pids):
+    sys.exit("FAIL: restored listing is pid-ascending — the default sort, "
+             "not the saved one: %r" % pids)
+print("gotop restore leg: %d rows in the saved name-desc order %r"
+      % (len(names), names))
+PY
+vgate_assert 11 serial-contains 'rx-gotop-state-restore-ok'
+vgate_assert 11 serial-absent '[EXC] parking:'
+vgate_assert 11 serial-absent 'exited status=139'

@@ -84,6 +84,13 @@ const (
 	// M173c (#3044): the audit tab's principal filter cycles on `u`.
 	markerAgentFilter = "top: agent filter="
 
+	// M192d (#3249): the appver-1 state envelope's markers — the save
+	// handoff's ack, the restore summary, and the refuse-by-name verdicts
+	// (the gofiles/goterm vocabulary: save/restored/refused).
+	markerStateSave     = "top: state save"
+	markerStateRestored = "top: state restored"
+	markerStateRefused  = "top: state refused"
+
 	// M128d (#2608): the machine-identity line — one ctl `profile-info`
 	// session through slot 93 (the kernel holds the credential). Refusals
 	// name themselves; a bare run shows "refused <code>", never silence.
@@ -126,6 +133,42 @@ const (
 	pageTrust
 	pageMounts
 )
+
+// tag is the page's lowercase marker name — the `top: tab=<name>` markers
+// and the state blob's serial vocabulary share it.
+func (p page) tag() string {
+	switch p {
+	case pageNetwork:
+		return "network"
+	case pageAgent:
+		return "agent"
+	case pageGPU:
+		return "gpu"
+	case pageTrust:
+		return "trust"
+	case pageMounts:
+		return "mounts"
+	}
+	return "procs"
+}
+
+// tabMarker is the `top: tab=<name>` line for a page — setPage announces
+// switches with it; the restore path emits it for the page it lands on.
+func tabMarker(p page) string {
+	switch p {
+	case pageNetwork:
+		return markerNetwork
+	case pageAgent:
+		return markerAgent
+	case pageGPU:
+		return markerGPU
+	case pageTrust:
+		return markerTrust
+	case pageMounts:
+		return markerMounts
+	}
+	return markerProcs
+}
 
 // Native layout (top.zig's native_* rects, so GOTOP opens where TOP opened).
 var (
@@ -211,7 +254,25 @@ func loadGuestTheme() {
 func main() {
 	loadGuestTheme()
 
-	ta := tabapp.Init(tabapp.Config{Name: appName, Title: appTitle, X: winX, Y: winY, W: natW, H: natH})
+	// M192d (#3249): the state hooks. SaveState reads the live app (the
+	// closure captures the variable, so an ask always serializes the
+	// current sort+tab); RestoreState fires inside tabapp.Init, before the
+	// app exists: it only decodes — the apply lands once the app is built
+	// and the envelope's appver has been checked below.
+	var a *app
+	var restored topState
+	var restoredOK bool
+	ta := tabapp.Init(tabapp.Config{
+		Name: appName, Title: appTitle, X: winX, Y: winY, W: natW, H: natH,
+		StateVersion: stateFmtVer,
+		SaveState: func() []byte {
+			if a == nil {
+				return nil
+			}
+			return a.encodeState()
+		},
+		RestoreState: func(b []byte) { restored, restoredOK = decodeTopState(b) },
+	})
 	if ta == nil {
 		vi.ConsoleLine("top: failed to open window")
 		vi.Exit(1)
@@ -225,7 +286,7 @@ func main() {
 		vi.ConsoleLine(markerTabShy)
 	}
 
-	a := &app{
+	a = &app{
 		ta:  ta,
 		tab: NewTable(),
 		net: NewNetView(),
@@ -236,6 +297,20 @@ func main() {
 		pg:  pageProcs,
 	}
 	a.bindFilter()
+	// A re-exec'd or reopened tab may have delivered a stored blob. The
+	// envelope's appver is the app's own stale check — a blob saved under a
+	// different format version is refused by name, never silently misread.
+	switch {
+	case ta.Restored && ta.RestoredVersion == stateFmtVer && restoredOK:
+		a.applyState(restored)
+		vi.ConsoleLine(markerStateRestored + " tab=" + a.pg.tag() +
+			" sort=" + a.tab.SortColumn().Tag() +
+			" dir=" + a.sortDir())
+	case ta.Restored && ta.RestoredVersion != stateFmtVer:
+		vi.ConsoleLine(markerStateRefused + " ver=" + vi.Itoa64(int64(ta.RestoredVersion)))
+	case ta.Restored:
+		vi.ConsoleLine(markerStateRefused + " bad blob")
+	}
 	a.refreshAll(true, false)
 
 	a.layout()
@@ -244,6 +319,17 @@ func main() {
 	vi.ConsoleLine(markerReady)
 
 	for {
+		// M192d (#3249): the seat's save_state ask is mailbox traffic, not
+		// an input event — answer it once per pass so a snapshot or
+		// tab-close ask is serviced before the window dies. The marker
+		// prints only on an acked handoff — "the seat stored the blob" —
+		// never on silence or a refused post.
+		if a.ta.PollStateAsk() {
+			vi.ConsoleLine(markerStateSave + " tab=" + a.pg.tag() +
+				" sort=" + a.tab.SortColumn().Tag() +
+				" dir=" + a.sortDir() +
+				" len=" + vi.Itoa64(int64(len(a.encodeState()))))
+		}
 		ev, r, ok := vi.PollEventRaw()
 		if !ok {
 			if r < 0 {
@@ -273,6 +359,90 @@ func main() {
 			}
 		}
 	}
+}
+
+// --- M192d (#3249): the appver-1 state envelope -----------------------------
+//
+// Sort column, sort direction and the active tab ride the M125a (#2586)
+// seat-mediated save/restore protocol — the monitor a user reopens looks
+// like the one they left. The seat owns the lifecycle (it asks on
+// snapshot and tab close, stores the blob on the tab's SESSION.TABS
+// record, hands it back on re-exec); GOTOP owns the format:
+//
+//	u8 fmtver — the blob's own version byte; also the Config's
+//	            StateVersion, so the envelope's appver and the payload
+//	            agree (a stale serialization is refused twice over)
+//	u8 page   — the active tab (pageProcs..pageMounts)
+//	u8 col    — the sort axis (ColPID..ColMem)
+//	u8 dir    — 0 descending, nonzero ascending
+//
+// Decode is total: a wrong length or a foreign fmtver refuses the WHOLE
+// blob — a torn handoff can never land half-applied. Field VALUES never
+// refuse: a page or column this build does not know clamps to the
+// defaults, so a stale-but-well-formed blob degrades to a sane monitor
+// rather than a refused session (the gofiles session.go rule).
+
+// stateFmtVer is the blob's format version — both the Config.StateVersion
+// the envelope carries and the payload's first byte.
+const stateFmtVer = 1
+
+// topState is one decoded session blob.
+type topState struct {
+	page page
+	col  Column
+	asc  bool
+}
+
+// encodeState serializes the sort+tab triple. Bounded by construction:
+// four bytes, forever under the seat's 64 KiB cap.
+func (a *app) encodeState() []byte {
+	var d byte
+	if a.tab.SortAscending() {
+		d = 1
+	}
+	return []byte{stateFmtVer, byte(a.pg), byte(a.tab.SortColumn()), d}
+}
+
+// decodeTopState is encodeState's total inverse. ok=false means the blob
+// is refused wholesale — a torn length or a foreign fmtver. Scalar fields
+// clamp rather than fail: an out-of-range page or column byte degrades to
+// the procs/pid defaults, and any nonzero dir byte reads as ascending.
+func decodeTopState(b []byte) (topState, bool) {
+	var st topState
+	if len(b) != 4 || b[0] != stateFmtVer {
+		return st, false
+	}
+	st.page = page(b[1])
+	if st.page > pageMounts {
+		st.page = pageProcs
+	}
+	st.col = Column(b[2])
+	if st.col > ColMem {
+		st.col = ColPID
+	}
+	st.asc = b[3] != 0
+	return st, true
+}
+
+// applyState lands a decoded blob on the freshly built app: the sort is
+// replayed through SetSort (absolute — not SortBy's flip) and the page
+// switches, announcing the tab marker for whichever view it lands on. The
+// first refreshAll right after sorts and samples under the restored
+// state, so the reopened monitor's first listing IS the saved ordering.
+func (a *app) applyState(st topState) {
+	a.tab.SetSort(st.col, st.asc)
+	if st.page != a.pg {
+		a.pg = st.page
+		vi.ConsoleLine(tabMarker(st.page))
+	}
+}
+
+// sortDir is the sort direction's marker spelling.
+func (a *app) sortDir() string {
+	if a.tab.SortAscending() {
+		return "asc"
+	}
+	return "desc"
 }
 
 // refreshAll takes one process + network sample and rebuilds the view.
