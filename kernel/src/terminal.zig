@@ -510,7 +510,15 @@ pub const Screen = struct {
     esc_charset_slot: u8 = 0,
     csi_params: [16]u16 = @as([16]u16, @splat(@as(u16, 0))),
     csi_count: usize = 0,
-    csi_private: bool = false,
+    /// M182a (#3150): the ECMA-48 private-parameter marker — '<' '=' '>'
+    /// '?' (0x3c-0x3f), recorded only as the FIRST byte of the parameter
+    /// section; 0 = none. A marker anywhere later, or a second marker,
+    /// sets `csi_malformed`: the sequence is consumed to its final byte
+    /// and nothing acts on it. `csi_started` is the first-byte test —
+    /// true once any parameter/intermediate byte has been consumed.
+    csi_marker: u8 = 0,
+    csi_malformed: bool = false,
+    csi_started: bool = false,
     csi_intermediate: u8 = 0,
     /// M80g (#1715): the in-flight OSC string and the effects it queued.
     /// Stream state like the CSI parser's — not swapped with the alternate
@@ -1595,7 +1603,9 @@ pub const Screen = struct {
     fn resetCsi(self: *Screen) void {
         self.csi_params = @as([self.csi_params.len]u16, @splat(@as(u16, 0)));
         self.csi_count = 1;
-        self.csi_private = false;
+        self.csi_marker = 0;
+        self.csi_malformed = false;
+        self.csi_started = false;
         self.csi_intermediate = 0;
     }
 
@@ -2031,16 +2041,29 @@ pub const Screen = struct {
 
     fn dispatchCsi(self: *Screen, final: u8) void {
         const p0 = self.csiParam(0, 0);
-        if (!self.csi_private and final == 'p' and self.csi_intermediate == '!' and
+        // M182a (#3150): a private marker out of position malforms the
+        // sequence — it was consumed to this final byte and nothing acts
+        // on it: no arms, no replies.
+        if (self.csi_malformed) return;
+        if (self.csi_marker == 0 and final == 'p' and self.csi_intermediate == '!' and
             self.csi_count == 1 and p0 == 0)
         {
             self.softReset();
             return;
         }
+        // M182a: '<' '=' '>' mark private sequences this parser has no
+        // arms for — swallowed whole and silent. DA2 (`CSI > c`) gets no
+        // reply (D17): the grid's VT100-with-AVO DA1 identity below is
+        // the answer to plain `CSI c` only.
+        if (self.csi_marker != 0 and self.csi_marker != '?') return;
+        // M182a: with any intermediate byte present (':' included — the
+        // pinned ITU sub-parameter skip) every plain and private arm is
+        // disarmed; DECSTR's exact check above is the lone exception.
+        if (self.csi_intermediate != 0) return;
         // M80f (#1723): replies are output-parser side effects. Keep them
         // bounded and ordered with other synthesised input; the session pump
         // drains this FIFO after every grid feed.
-        if (!self.csi_private) {
+        if (self.csi_marker == 0) {
             if (final == 'n' and p0 == 5 and self.csi_count == 1) self.appendReply("\x1b[0n");
             if (final == 'n' and p0 == 6 and self.csi_count == 1) self.appendReply(self.cursorReply());
             if (final == 'c' and p0 == 0 and self.csi_count == 1) {
@@ -2049,7 +2072,7 @@ pub const Screen = struct {
                 self.appendReply("\x1b[?1;2c");
             }
         }
-        if (self.csi_private) {
+        if (self.csi_marker == '?') {
             if (p0 == 6) {
                 if (final == 'h') self.setOriginMode(true);
                 if (final == 'l') self.setOriginMode(false);
@@ -2249,19 +2272,32 @@ pub const Screen = struct {
             },
             2 => {
                 if (b >= '0' and b <= '9') {
+                    self.csi_started = true;
                     const last = self.csi_count - 1;
                     self.csi_params[last] = self.csi_params[last] *% 10 +% (b - '0');
                     return;
                 }
                 if (b == ';') {
+                    self.csi_started = true;
                     if (self.csi_count < self.csi_params.len) self.csi_count += 1;
                     return;
                 }
-                if (b == '?' and self.csi_count == 1 and self.csi_params[0] == 0) {
-                    self.csi_private = true;
+                if (b >= 0x3c and b <= 0x3f) {
+                    // M182a (#3150): '<' '=' '>' '?' are ECMA-48 private
+                    // parameter markers, legal only as the FIRST byte of
+                    // the parameter section. Anywhere later — or as a
+                    // second marker — the sequence is malformed: consumed
+                    // to the final byte, nothing acts on it.
+                    if (self.csi_started) {
+                        self.csi_malformed = true;
+                    } else {
+                        self.csi_marker = b;
+                    }
+                    self.csi_started = true;
                     return;
                 }
                 if (b >= 0x20 and b <= 0x3f) {
+                    self.csi_started = true;
                     if (self.csi_intermediate == 0) self.csi_intermediate = b;
                     return;
                 }
@@ -4708,6 +4744,53 @@ test "terminal: unsupported CSI is swallowed rather than painted" {
     var s = Screen{};
     s.feed("before\x1b[999zafter");
     try std.testing.expectEqualStrings("beforeafter", s.line(0));
+}
+
+// M182a (#3150): '<' '=' '>' '?' (0x3c-0x3f) are ECMA-48 private parameter
+// markers. '?' is the only marker with arms here; the others swallow the
+// sequence whole — no SGR, no DA1 for `CSI > c` (D17).
+test "terminal: private markers other than ? swallow the sequence, no SGR" {
+    var s = Screen{};
+    s.feed("\x1b[>4;1mX");
+    try std.testing.expectEqualStrings("X", s.line(0));
+    const style = s.styleAt(0, 0);
+    try std.testing.expectEqual(default_cell_style, style);
+    try std.testing.expect(!styleBold(style));
+    try std.testing.expect(!styleUnderline(style));
+}
+
+test "terminal: private-marker queries DA2/= / < stay silent" {
+    var s = Screen{};
+    s.feed("\x1b[>c\x1b[=c\x1b[<u");
+    try std.testing.expectEqual(@as(usize, 0), s.pending_reply_len);
+    try std.testing.expectEqualStrings("", s.line(0));
+}
+
+test "terminal: a late or second private marker is malformed — nothing acts" {
+    var s = Screen{};
+    // A marker after the first parameter byte: swallowed, modes unchanged.
+    s.feed("\x1b[?25l\x1b[1?h");
+    try std.testing.expect(!s.cursor_visible);
+    // A second marker: `CSI ? ? 25 h` must not re-show the cursor.
+    s.feed("\x1b[??25h");
+    try std.testing.expect(!s.cursor_visible);
+    // The marker itself still works: `?` switches screens.
+    s.feed("\x1b[?1049h");
+    try std.testing.expect(s.alt_active);
+}
+
+test "terminal: an intermediate byte disarms plain CSI, DECSTR excepted" {
+    var s = Screen{};
+    // `CSI ! 5 n` is not DSR: the intermediate disarms the reply arm.
+    s.feed("\x1b[!5n");
+    try std.testing.expectEqual(@as(usize, 0), s.pending_reply_len);
+    // `CSI ! m` is not SGR: consumed, rendition untouched.
+    s.feed("\x1b[!4mX");
+    try std.testing.expectEqualStrings("X", s.line(0));
+    try std.testing.expect(!styleUnderline(s.styleAt(0, 0)));
+    // DECSTR keeps its exact check and still soft-resets.
+    s.feed("\x1b[?25l\x1b[!p");
+    try std.testing.expect(s.cursor_visible);
 }
 
 // M73e (#1629): DECSET 2004 state, the bracketed wrap, and the queue

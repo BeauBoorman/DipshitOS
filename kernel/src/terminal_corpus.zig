@@ -1417,10 +1417,53 @@ const esc_cases = [_]Case{
         .cursor = .{ 0, 1 },
     },
     .{
-        .name = "CSI intermediates (0x20-0x3F) are skipped, then the final decides",
+        // M182a (#3150) rename, same pin: 0x3c-0x3f are now private
+        // markers, and an intermediate disarms every arm but DECSTR's —
+        // `CSI ! p` is exactly that check.
+        .name = "CSI ! p is DECSTR — the one armed intermediate form",
         .input = "\x1b[!pX",
         .lines = &.{"X"},
         .cursor = .{ 0, 1 },
+    },
+    // M182a (#3150): '<' '=' '>' '?' are ECMA-48 private-parameter
+    // markers. Only '?' has arms here; the other markers swallow the
+    // sequence whole — no paint and no reply (DA2's `CSI > c` included,
+    // D17). A marker after the first parameter byte, or a second marker,
+    // malforms the sequence: consumed to the final byte, nothing acts.
+    .{
+        .name = "CSI > m marks a private sequence — its SGR never lands",
+        .input = "\x1b[>4;1mX",
+        .lines = &.{"X"},
+        .cursor = .{ 0, 1 },
+        .rendition = .{},
+        .styles = &.{.{ .row = 0, .col = 0, .default_exact = true }},
+    },
+    .{
+        .name = "CSI > c, CSI = c, and CSI < u paint nothing",
+        .input = "\x1b[>c\x1b[=c\x1b[<uX",
+        .lines = &.{"X"},
+        .cursor = .{ 0, 1 },
+    },
+    .{
+        .name = "a private marker after the first parameter byte is malformed",
+        .input = "\x1b[?25l\x1b[1?hX",
+        .lines = &.{"X"},
+        .cursor = .{ 0, 1 },
+        .visible = false,
+    },
+    .{
+        .name = "a second private marker is malformed — the mode arms never run",
+        .input = "\x1b[??25lX",
+        .lines = &.{"X"},
+        .cursor = .{ 0, 1 },
+        .visible = true,
+    },
+    .{
+        .name = "CSI ? 1049 h still switches to the alternate screen",
+        .input = "MAIN\x1b[?1049hALT",
+        .lines = &.{"ALT"},
+        .cursor = .{ 0, 3 },
+        .alt = true,
     },
 };
 
