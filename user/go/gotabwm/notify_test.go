@@ -170,6 +170,52 @@ func TestNotifyExpiryIsExactlyNTicks(t *testing.T) {
 	}
 }
 
+// TestDamagePassDoesNotAgeToasts pins the card #3034 contract through the
+// REAL composite paths: a damage pass owes a compose+present and nothing
+// else — the toast lane's NotifyTicks lifetime counts HEARTBEAT composites
+// only (compositeTick's own comment: "a damage pass renders toasts but
+// never ages them"). A toast must therefore survive NotifyTicks damage
+// passes with zero heartbeats, and still be alive after the first
+// heartbeat that follows them. If the damage pass advanced the expiry
+// clock, the first heartbeat sweep drops a seconds-old toast — the click
+// that was aimed at it then lands on an empty strip (observed go-wm-seat
+// runs 06/17: `notify dismiss` inside the first heartbeat flush, the
+// scripted toast click falling through to content, no focus pair / no
+// refusal act marker).
+func TestDamagePassDoesNotAgeToasts(t *testing.T) {
+	resetNotify(t)
+	savedTabs, savedDemo := tabs, demoMode
+	savedDone, savedCount := stripDone, hostTicksLeft
+	savedClock := compositeClock
+	t.Cleanup(func() {
+		tabs, demoMode = savedTabs, savedDemo
+		stripDone, hostTicksLeft = savedDone, savedCount
+		compositeClock = savedClock
+	})
+	demoMode = false
+	tabs = TabStrip{}
+	stripDone, hostTicksLeft = false, 0
+	compositeClock = 0
+	if !tabs.OpenTab(4, "files") {
+		t.Fatal("OpenTab")
+	}
+	if _, ok, _ := notifyPush(4, "copied X", compositeClock); !ok {
+		t.Fatal("push refused")
+	}
+	scan := make([]byte, vi.ScanoutWidth*vi.ScanoutHeight*4)
+	presents := 0
+	for i := 1; i <= NotifyTicks; i++ {
+		damageCompositeTick(scan, uint64(i), &presents)
+	}
+	// The first heartbeat after the damage burst must see the toast still
+	// alive: born at composite 0, one heartbeat composite painted.
+	compositeTick(scan, uint64(NotifyTicks), &presents)
+	if notifyCount() != 1 {
+		t.Fatalf("the toast left the strip after %d damage passes + 1 heartbeat: the damage pass aged it",
+			NotifyTicks)
+	}
+}
+
 // TestNotifyFadeRampHasThreeExactSteps pins the fade. The seat has no alpha
 // on its fill path (fillRect writes an opaque pixel), so the fade is three
 // named colour steps from Surface toward Bg over the last notifyFadeTicks

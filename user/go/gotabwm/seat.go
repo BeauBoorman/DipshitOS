@@ -926,11 +926,12 @@ func compositePaint(scan []byte, ticks uint64, presents *int) (presented bool) {
 // and no tick-counted budget moves: the idle ramp, the strip
 // choreography's holds, the toast lane's NotifyTicks expiry, and the
 // parked snapshot/focus-cycle releases all keep heartbeat cadence.
-// compositeClock still counts the frame — a paint is a real composite
-// pass, and that is what keeps a toast born mid-drain anchored to the
-// frame it actually landed on.
+// compositeClock stays heartbeat-only too: it is the toast lane's paint
+// clock (born/expires/fade all anchor on it), so a damage pass that also
+// bumped it would age every live toast one frame per repaint — a toast
+// dying after NotifyTicks damage passes, seconds early, and the scripted
+// click landing on an empty strip (observed go-wm-seat runs 06/17).
 func damageCompositeTick(scan []byte, ticks uint64, presents *int) {
-	compositeClock++
 	_ = compositePaint(scan, ticks, presents)
 }
 
