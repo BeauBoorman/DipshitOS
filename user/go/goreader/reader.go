@@ -26,8 +26,6 @@ const (
 // MOUSE_SCROLL twin — see scrollDown/scrollUp).
 const (
 	keyEscape  = 0x29
-	keyReturn  = 0x28
-	keyBacksp  = 0x2A
 	keyZoomIn  = 0x2E // `=` / `+`
 	keyZoomOut = 0x2D // `-` / `_`
 	keyReset   = 0x27 // `0`

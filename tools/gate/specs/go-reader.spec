@@ -10,9 +10,14 @@
 # pixels):
 #   pagedown   -> the scroll-and-flip rule turns to page 2 (`page 2/3`)
 #   =          -> one zoom-table step to 150% (`zoom z=150%`)
-#   ctrl-f Z O O return -> the find bar searches the extracted text, lands
-#     on the page-2 `ZOOKEEPER` hit and blends the accent band onto the
-#     page (`find 'ZOO' hit=1/1 page=2`), where the snapshot probe counts it.
+#   ctrl-f P A G E return return escape n N -> the shared appkit find
+#     overlay (M191c): 'PAGE' hits on pages 1 and 3 cycle
+#     (`find 'PAGE' hit=1/2 page=1`, `hit=2/2 page=3`), Escape closes the
+#     bar, and n/N repeat the search out of it
+#   ctrl-f backspace x4 Z O O return -> the bar reopens with the surviving
+#     pattern, the backspaces clear it, and 'ZOO' lands on the page-2
+#     `ZOOKEEPER` hit (`find 'ZOO' hit=1/1 page=2`), where the snapshot
+#     probe counts the accent band.
 #
 # Run 02 is the refusal leg plus the M164a (#2988) DCT leg: STROKE.PDF
 # is the M89 corpus's pinned unsupported-stroke negative; the engine's
@@ -195,7 +200,7 @@ vgate_run 01 -- \
     --screen '$RUN_DIR/screen-01' \
     --via-virtio --cvc-snap --snapshot-out '$RUN_DIR/snap-01' \
     --script '$RUN_DIR/script.txt' \
-    --input-chords 'pagedown,=,ctrl-f,Z,O,O,return' \
+    --input-chords 'pagedown,=,ctrl-f,P,A,G,E,return,return,escape,n,N,ctrl-f,backspace,backspace,backspace,backspace,Z,O,O,return' \
     --input-chords-after 'goreader: ready' \
     --script2 '$RUN_DIR/script2.txt' \
     --script2-after "goreader: find 'ZOO' hit=1/1 page=2" \
@@ -212,7 +217,12 @@ vgate_assert 01 serial-contains 'goreader: ready'
 # pagedown turned the page model, = stepped the zoom, the find hit landed.
 vgate_assert 01 serial-contains 'goreader: page 2/3'
 vgate_assert 01 serial-contains 'goreader: zoom z=150%'
+# The M191c shared overlay: ctrl-f docks the appkit bar, two Returns cycle
+# the two-page 'PAGE' hit set, Escape closes, n/N repeat the search out of
+# the bar, and the reopened bar takes backspaces + a fresh pattern.
 vgate_assert 01 serial-contains 'goreader: find bar'
+vgate_assert 01 serial-contains "goreader: find 'PAGE' hit=1/2 page=1"
+vgate_assert 01 serial-contains "goreader: find 'PAGE' hit=2/2 page=3"
 vgate_assert 01 serial-contains "goreader: find 'ZOO' hit=1/1 page=2"
 vgate_assert 01 serial-contains 'rx-reader-journey-ok'
 vgate_assert 01 serial-absent '[EXC] parking:'

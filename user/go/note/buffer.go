@@ -8,8 +8,10 @@
 // tiny, which is not academic: GOEDIT's header records that pulling the full
 // webrender package in blew the kernel's 16-region sbrk budget at runtime init.
 //
-// This is a notepad, not an editor: no find/replace, no selection, no undo
-// (the card's non-goals — GOEDIT owns the arms race).
+// This is a notepad, not an editor: no replace, no selection, no undo —
+// GOEDIT owns the arms race. The one concession is Ctrl-F find (M191c
+// #3244): the appkit overlay scans Bytes() through virelai/find and lands
+// the caret with SetCursor, both of which already exist here.
 
 package main
 

@@ -39,7 +39,7 @@ PY
 vgate_run A -- \
     --display --input --screen '$RUN_DIR/gpu-screen' \
     --script '$RUN_DIR/script.txt' \
-    --input-chords 'a,b,c,d,e,ctrl-s' \
+    --input-chords 'a,b,c,d,e,ctrl-s,ctrl-f,b,return,escape' \
     --input-chords-after 'note: ready' \
     --script3 '$RUN_DIR/script3.txt' \
     --script3-after 'note: saved ok n=5' \
@@ -51,6 +51,12 @@ vgate_assert A serial-contains 'exec: loaded GOSH.ELF'
 vgate_assert A serial-contains 'note: open id=2'
 vgate_assert A serial-contains 'note: not-tab-aware (shim or WND desktop)'
 vgate_assert A serial-contains 'note: ready'
+# M191c (#3244): the shared appkit find overlay adopts NOTE — after the
+# save (caret still at col 5 for the cursor assert below), ctrl-f docks
+# the bar, 'b' scans the typed "abcde" incrementally, Return lands the
+# caret on the hit, Escape closes.
+vgate_assert A serial-contains 'note: find bar'
+vgate_assert A serial-contains "note: find 'b' hit=1/1"
 vgate_assert A serial-contains 'note: saved ok n=5'
 vgate_assert A serial-contains 'note: cursor line=1 col=5 n=5'
 vgate_assert A serial-contains 'input: armed=1 fifo=0/64 dropped=0 events=6'

@@ -127,11 +127,9 @@ type app struct {
 	fit        bool
 	ox, oy     uint32
 	texts      []pageText
-	query      []byte
 	hits       []hitRef
 	hitIdx     int
-	hadHit     bool // a hit was jumped to — repeats step from it
-	modeFind   bool
+	find       appkit.Find       // the shared Ctrl+F overlay (M191c #3244)
 	pick       appkit.FilePicker // save-a-copy modal; .Open gates key routing
 	bmk        []int             // sorted bookmarked page indexes (≤16)
 	pend       *pendState        // decoded save_state blob, applied post-load
@@ -269,14 +267,14 @@ func readDoc(path string) ([]byte, loadState) {
 
 func (a *app) zoom() uint32 {
 	if a.fit {
-		vp := viewportRect(a.ta.W, a.ta.H, a.modeFind)
+		vp := viewportRect(a.ta.W, a.ta.H, a.find.Open)
 		return fitWidthZoom(vp.W, uint32(a.pw))
 	}
 	return zoomTable[a.zoomIdx]
 }
 
 func (a *app) maxOY() uint32 {
-	vp := viewportRect(a.ta.W, a.ta.H, a.modeFind)
+	vp := viewportRect(a.ta.W, a.ta.H, a.find.Open)
 	_, dh := displayedSize(uint32(a.pw), uint32(a.ph), a.zoom())
 	return panMax(uint32(a.ph), dh, vp.H)
 }
@@ -306,7 +304,7 @@ func (a *app) setZoom(idx int, fit bool) {
 		a.zoomIdx = idx
 	}
 	if a.zoom() != z {
-		vp := viewportRect(a.ta.W, a.ta.H, a.modeFind)
+		vp := viewportRect(a.ta.W, a.ta.H, a.find.Open)
 		dw, _ := displayedSize(uint32(a.pw), uint32(a.ph), a.zoom())
 		a.ox = clampU32(a.ox, panMax(uint32(a.pw), dw, vp.W))
 		a.oy = clampU32(a.oy, a.maxOY())
@@ -323,17 +321,17 @@ func (a *app) setZoom(idx int, fit bool) {
 // Find
 // ---------------------------------------------------------------------------
 
-// rebuildHits scans every page's extracted text for the current query.
-func (a *app) rebuildHits() {
+// findScan is the overlay's corpus seam: it scans every page's extracted
+// text for pat and reports the hit count. The overlay calls it on every
+// pattern edit and before every step.
+func (a *app) findScan(pat string) int {
 	a.hits = a.hits[:0]
-	if len(a.query) == 0 {
-		return
-	}
 	for p, pt := range a.texts {
-		for _, off := range find.All(pt.text, a.query) {
-			a.hits = append(a.hits, hitRef{p, off, off + len(a.query)})
+		for _, off := range find.All(pt.text, []byte(pat)) {
+			a.hits = append(a.hits, hitRef{p, off, off + len(pat)})
 		}
 	}
+	return len(a.hits)
 }
 
 // jumpHit makes hit i current: page jump, then scroll so the hit's first
@@ -354,7 +352,7 @@ func (a *app) jumpHit(i int) {
 	if h.page < len(a.texts) {
 		rs := mergeHitRects(a.texts[h.page].glyphs, h.start, h.end)
 		if len(rs) > 0 {
-			vp := viewportRect(a.ta.W, a.ta.H, a.modeFind)
+			vp := viewportRect(a.ta.W, a.ta.H, a.find.Open)
 			z := a.zoom()
 			dw, _ := displayedSize(uint32(a.pw), uint32(a.ph), z)
 			// The hit's top in page px, less a margin, is the new origin.
@@ -373,29 +371,20 @@ func (a *app) jumpHit(i int) {
 	a.rebuildDisp()
 }
 
-// runFind is the find bar's Return and the n/N repeats. dir is +1/-1.
-func (a *app) runFind(dir int) {
-	if len(a.query) == 0 {
-		return
-	}
-	a.rebuildHits()
-	if len(a.hits) == 0 {
-		a.pendingLog = append(a.pendingLog, markerFindMiss+string(a.query)+"'")
-		return
-	}
-	// First invocation lands on the first hit; repeats step.
-	next := a.hitIdx + dir
-	if !a.hadHit {
-		next = 0
-		if dir < 0 {
-			next = len(a.hits) - 1
-		}
-	}
-	a.hadHit = true
-	a.jumpHit(next)
+// findShow is the overlay's hit callback: hit i becomes current (jumpHit
+// does the page jump and the scroll), then the marker reports where the
+// cycling landed — the `goreader: find '<pat>' hit=N/M page=P` shape the
+// M143a bar printed, preserved verbatim.
+func (a *app) findShow(i int) {
+	a.jumpHit(i)
 	a.pendingLog = append(a.pendingLog,
-		markerFind+string(a.query)+"' hit="+vi.Itoa64(int64(a.hitIdx+1))+"/"+
+		markerFind+a.find.Pattern()+"' hit="+vi.Itoa64(int64(a.hitIdx+1))+"/"+
 			vi.Itoa64(int64(len(a.hits)))+" page="+vi.Itoa64(int64(a.pg.page+1)))
+}
+
+// findMiss is the overlay's no-hits callback — the M143a miss marker.
+func (a *app) findMiss() {
+	a.pendingLog = append(a.pendingLog, markerFindMiss+a.find.Pattern()+"'")
 }
 
 // ---------------------------------------------------------------------------
@@ -618,35 +607,21 @@ func (a *app) finishPick() {
 // ---------------------------------------------------------------------------
 
 // findKey feeds the open find bar; it reports whether the frame changed.
+// The appkit overlay owns the keyboard while it is up — Escape dismisses,
+// Enter steps (Shift-Enter back), the rest is the pattern field.
 func (a *app) findKey(ev vi.Event) bool {
-	switch ev.Arg0 {
-	case keyEscape:
-		a.modeFind = false
-		return true
-	case keyReturn:
-		a.runFind(1)
-		return true
-	case keyBacksp:
-		if len(a.query) > 0 {
-			a.query = a.query[:len(a.query)-1]
-			a.rebuildHits()
-		}
-		return true
+	k, ok := appkit.NormalizeKey(ev)
+	if !ok {
+		return false
 	}
-	// Printable input arrives in arg1 (the window event's codepoint).
-	if c := ev.Arg1; c >= 32 && c <= 126 && len(a.query) < 64 {
-		a.query = append(a.query, byte(c))
-		a.rebuildHits()
-		return true
-	}
-	return false
+	return a.find.OnKey(k)
 }
 
 func (a *app) scrollTick(down bool) {
 	if a.st != loadOkay {
 		return
 	}
-	vp := viewportRect(a.ta.W, a.ta.H, a.modeFind)
+	vp := viewportRect(a.ta.W, a.ta.H, a.find.Open)
 	step := scrollStep(vp.H, a.zoom())
 	var np int
 	var noy uint32
@@ -685,14 +660,14 @@ func (a *app) handle(ev vi.Event) bool {
 			}
 			return true
 		}
-		if a.modeFind {
+		if a.find.Open {
 			return a.findKey(ev)
 		}
 		ctrl := ev.Flags&vi.ModCtrl != 0
 		switch ev.Arg0 {
 		case keyFit:
 			if ctrl {
-				a.modeFind = true
+				a.find.Present()
 				a.pendingLog = append(a.pendingLog, markerFindBar)
 				return true
 			}
@@ -708,12 +683,12 @@ func (a *app) handle(ev vi.Event) bool {
 			a.setZoom(zoomDefaultIdx, false)
 			return true
 		case keyFindN:
-			if len(a.query) > 0 {
+			if a.find.Pattern() != "" {
 				dir := 1
 				if ev.Flags&vi.ModShift != 0 || ev.Arg1 == 'N' {
 					dir = -1
 				}
-				a.runFind(dir)
+				a.find.Step(dir)
 				return true
 			}
 			return false
@@ -736,7 +711,7 @@ func (a *app) handle(ev vi.Event) bool {
 			if a.st != loadOkay {
 				return false
 			}
-			vp := viewportRect(a.ta.W, a.ta.H, a.modeFind)
+			vp := viewportRect(a.ta.W, a.ta.H, a.find.Open)
 			z := a.zoom()
 			dw, _ := displayedSize(uint32(a.pw), uint32(a.ph), z)
 			step := scrollStep(vp.W, z)
@@ -796,6 +771,12 @@ func (s *canvasSurface) Fill(x, y, w, h int, rgb uint32) {
 	s.cv.FillRect(widgets.Rect{X: x, Y: y, W: w, H: h}, draw.Opaque(rgb))
 }
 
+// FillRect makes the adapter a widgets.RectCanvas — the find overlay's
+// whole paint contract. The 24-bit theme token still goes out opaque.
+func (s *canvasSurface) FillRect(r widgets.Rect, rgb uint32) {
+	s.Fill(r.X, r.Y, r.W, r.H, rgb)
+}
+
 const docBg = 0x3a4048 // the "desk" tone behind a smaller-than-viewport page
 
 func (a *app) draw() {
@@ -803,7 +784,7 @@ func (a *app) draw() {
 	winW, winH := int(a.ta.W), int(a.ta.H)
 	cv.FillRect(widgets.Rect{W: winW, H: winH}, draw.Opaque(theme.Current.Bg))
 	surf := &canvasSurface{cv: cv}
-	vp := viewportRect(a.ta.W, a.ta.H, a.modeFind)
+	vp := viewportRect(a.ta.W, a.ta.H, a.find.Open)
 	switch a.st {
 	case loadOkay:
 		a.blit(surf, vp)
@@ -815,8 +796,9 @@ func (a *app) draw() {
 		a.drawEmpty(surf, vp)
 	}
 	a.drawStatus(surf)
-	if a.modeFind {
-		a.drawFindBar(surf)
+	if a.find.Open {
+		a.find.R = widgets.Rect{Y: winH - findBarH, W: winW, H: findBarH}
+		a.find.Draw(surf)
 	}
 	if a.pick.Open {
 		a.pick.Draw(cv)
@@ -863,7 +845,7 @@ func (a *app) blit(s *canvasSurface, vp viewport) {
 
 func (a *app) drawStatus(s *canvasSurface) {
 	y := int(a.ta.H) - statusH
-	if a.modeFind {
+	if a.find.Open {
 		y -= findBarH
 	}
 	cv := a.ta.Canvas()
@@ -899,15 +881,6 @@ func (a *app) drawStatus(s *canvasSurface) {
 	webrender.DrawText(s, 4, y+2, webrender.UpperASCII(text), 1, false, theme.Current.Muted, clip)
 }
 
-func (a *app) drawFindBar(s *canvasSurface) {
-	y := int(a.ta.H) - findBarH
-	cv := a.ta.Canvas()
-	cv.FillRect(widgets.Rect{Y: y, W: int(a.ta.W), H: findBarH}, draw.Opaque(theme.Current.Border))
-	text := "FIND: " + string(a.query) + "_"
-	clip := webrender.Clip{X: 0, Y: y, W: int(a.ta.W), H: findBarH}
-	webrender.DrawText(s, 4, y+3, webrender.UpperASCII(text), 1, false, theme.Current.Text, clip)
-}
-
 // drawRefuse is the card's named refusal: the ADR 0040 code in the window,
 // large enough to read, with the file that asked for it.
 func (a *app) drawRefuse(s *canvasSurface, vp viewport) {
@@ -921,7 +894,7 @@ func (a *app) drawRefuse(s *canvasSurface, vp viewport) {
 	webrender.DrawText(s, max(0, int(vp.W)/2-w/2), cy, msg, 2, false, theme.Current.Danger, clip)
 	sub := webrender.UpperASCII(a.name)
 	webrender.DrawText(s, max(0, int(vp.W)/2-len(sub)*8/2), cy+28, sub, 1, false, theme.Current.Muted, clip)
-	hint := "THE ENGINE DECLINED THIS DOCUMENT (ADR 0040)"
+	hint := "THE ENGINE DECLINED THIS DOCUMENT"
 	webrender.DrawText(s, max(0, int(vp.W)/2-len(hint)*8/2), cy+44, hint, 1, false, theme.Current.Muted, clip)
 }
 
@@ -1015,6 +988,10 @@ func main() {
 	}
 
 	a := &app{path: path, name: basename(path), zoomIdx: zoomDefaultIdx, hitIdx: -1}
+	a.find = appkit.NewFind()
+	a.find.Scan = a.findScan
+	a.find.Show = a.findShow
+	a.find.Miss = a.findMiss
 	ta := tabapp.Init(tabapp.Config{
 		Name:         appName,
 		Title:        appTitle,

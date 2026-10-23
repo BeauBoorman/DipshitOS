@@ -5,8 +5,11 @@
 // The card's shape is M62h (#1406, CALC.BIN -> GOCALC.ELF) applied to the other
 // leftover binary.
 //
-// It is deliberately NOT an editor: no find/replace, no selection, no undo.
-// GOEDIT.ELF owns that arms race. What this app must have is the three things
+// It is deliberately NOT an editor: no replace, no selection, no undo —
+// GOEDIT.ELF owns that arms race. Ctrl-F find is the exception: M191c
+// (#3244) docks the shared appkit overlay, the same bar GOREADER migrates
+// to, so every text app keeps one find muscle memory. What this app must
+// have is the three things
 // the seat gates assert of a hosted tab — it declares itself tab-aware, it
 // relayouts on WIN_RESIZE, and it closes cleanly on WIN_CLOSE — plus load/save.
 // The marker names mirror the Zig app's whole lifecycle vocabulary (`note:
@@ -43,7 +46,9 @@ package main
 import (
 	"unicode/utf8"
 
+	"virelai/appkit"
 	"virelai/draw"
+	"virelai/find"
 	"virelai/tabapp"
 	"virelai/theme"
 	"virelai/vi"
@@ -108,6 +113,9 @@ const (
 	markerSaved       = "note: saved ok n="
 	markerSaveErr     = "note: save error "
 	markerCursor      = "note: cursor line="
+	markerFindBar     = "note: find bar"
+	markerFind        = "note: find '"
+	markerFindMiss    = "note: find miss '"
 	markerResize      = "note: resize relayout"
 	markerClose       = "note: win_close"
 	markerPresents    = "note: presents n="
@@ -133,6 +141,7 @@ const (
 	textOrigin = 6
 	caretW     = 2
 	statusH    = 12
+	findH      = 14 // the appkit find overlay's strip height
 )
 
 // Key codes. ADR 0009 row 1: arg0 is the HID usage / keycode and arg1 is the
@@ -155,6 +164,12 @@ const (
 	// same pair GOEDIT's save path documents.
 	keyS     = 0x73
 	keyCtrlS = 0x13
+
+	// The Ctrl-F find chord's three spellings — GOEDIT accepts the same set
+	// because the kernel can deliver any of them.
+	keyF     = 0x66
+	keyCtrlF = 0x06
+	hidF     = 0x09
 )
 
 // app is the whole state: the window, the buffer, the scroll top and the dirty
@@ -165,6 +180,16 @@ type app struct {
 	path  string
 	top   int
 	dirty bool
+
+	// The find overlay (M191c #3244): Ctrl-F docks the shared appkit bar at
+	// the bottom, its Scan walks the buffer through virelai/find and Show
+	// lands the caret on the hit the overlay picks. hits is the ordinal
+	// list the overlay indexes into. findLog is the one deferred marker —
+	// the overlay's Show/Miss fire inside key handling, before the frame
+	// they describe is painted, so the marker waits for the draw.
+	find    appkit.Find
+	hits    []int
+	findLog string
 
 	// presents counts the frames this app has put on the scanout. Draw and
 	// present are separate calls, so the only way a gate can tell a filled frame
@@ -182,16 +207,20 @@ func loadGuestTheme() {
 }
 
 // argvHeadroom wraps this image's writable memsz%4096 back into (0, 1792]
-// after importing virelai/theme (remainder 2160 observed). Same wall as
-// GOEDIT's header: a remainder above 1792 makes sbrk's first mmap collide
-// and mallocinit die.
-var argvHeadroom [2192]byte
+// after importing appkit for the find overlay (remainder 2992 observed).
+// Same wall as GOEDIT's header: a remainder above 1792 makes sbrk's first
+// mmap collide and mallocinit die.
+var argvHeadroom [3808]byte
 
 func init() { argvHeadroom[0] = 0 }
 
 func main() {
 	loadGuestTheme()
 	a := &app{buf: NewBuffer(), path: defaultPath, top: 1}
+	a.find = appkit.NewFind()
+	a.find.Scan = a.findScan
+	a.find.Show = a.findShow
+	a.find.Miss = a.findMiss
 	ta := tabapp.Init(tabapp.Config{Name: appName, Title: appTitle, X: natX, Y: natY, W: natW, H: natH})
 	if ta == nil {
 		vi.ConsoleLine(markerOpenErr + "-1")
@@ -261,6 +290,7 @@ func main() {
 		case tabapp.ActionResized:
 			a.top = a.buf.Follow(a.top, a.rowsIn())
 			a.draw()
+			a.flushFindLog()
 			vi.ConsoleLine(markerResize)
 		case tabapp.ActionNone:
 			// Dirty is set by key() itself, on the mutating arms only: the
@@ -270,6 +300,7 @@ func main() {
 			if a.key(ev) {
 				a.top = a.buf.Follow(a.top, a.rowsIn())
 				a.draw()
+				a.flushFindLog()
 			}
 		}
 	}
@@ -363,6 +394,42 @@ func (a *app) cursorMarker() string {
 		" n=" + vi.Itoa64(int64(a.buf.Len()))
 }
 
+// ---------------------------------------------------------------------------
+// Find — the appkit overlay's corpus seam (M191c #3244)
+// ---------------------------------------------------------------------------
+
+// findScan counts the buffer's hits for the overlay's pattern through the
+// shared matcher. The overlay calls it on every pattern edit and before
+// every step, so hits always describes the live buffer.
+func (a *app) findScan(pat string) int {
+	a.hits = find.All(a.buf.Bytes(), []byte(pat))
+	return len(a.hits)
+}
+
+// findShow lands the caret on hit i — the overlay picked the ordinal, the
+// draw scrolls it into view through the usual Follow. The marker waits on
+// findLog so it prints after the frame that shows the hit.
+func (a *app) findShow(i int) {
+	a.buf.SetCursor(a.hits[i])
+	a.findLog = markerFind + a.find.Pattern() + "' hit=" +
+		vi.Itoa64(int64(i+1)) + "/" + vi.Itoa64(int64(len(a.hits)))
+}
+
+// findMiss reports a step against a pattern with no hits.
+func (a *app) findMiss() {
+	a.findLog = markerFindMiss + a.find.Pattern() + "'"
+}
+
+// flushFindLog prints the deferred find marker once the frame it describes
+// is on the scanout — the same announce-after-paint rule GOREADER's
+// pendingLog keeps.
+func (a *app) flushFindLog() {
+	if a.findLog != "" {
+		vi.ConsoleLine(a.findLog)
+		a.findLog = ""
+	}
+}
+
 // rowsIn is how many text rows the canvas holds at the current size. A canvas
 // too small for even one row still reports one, so a resize cannot make the
 // view model empty and the caret disappear.
@@ -374,11 +441,19 @@ func (a *app) rowsIn() int {
 	if h <= 0 {
 		h = natH
 	}
-	rows := (h - chromeH - statusH) / lineH
+	rows := (h - chromeH - statusH - a.bottomChrome()) / lineH
 	if rows < 1 {
 		return 1
 	}
 	return rows
+}
+
+// bottomChrome is how much the open find bar lifts the status line.
+func (a *app) bottomChrome() int {
+	if a.find.Open {
+		return findH
+	}
+	return 0
 }
 
 // colsIn is how many columns fit on a row at the current width.
@@ -408,9 +483,24 @@ func (a *app) key(ev vi.Event) bool {
 	if ev.Kind != vi.EvKeyDown {
 		return false
 	}
+	if a.find.Open {
+		// The bar owns the keyboard while it is up — Escape dismisses,
+		// Enter steps, the rest is the pattern field; a key the overlay
+		// does not take is swallowed, not typed into the document.
+		k, ok := appkit.NormalizeKey(ev)
+		if !ok {
+			return false
+		}
+		return a.find.OnKey(k)
+	}
 	if isSave(ev) {
 		vi.ConsoleLine(a.save())
 		vi.ConsoleLine(a.cursorMarker())
+		return true
+	}
+	if isFind(ev) {
+		a.find.Present()
+		a.findLog = markerFindBar
 		return true
 	}
 	if ev.Flags&modCtrl != 0 {
@@ -459,6 +549,15 @@ func isSave(ev vi.Event) bool {
 	return ev.Arg1 == keyCtrlS || ev.Arg1 == keyS
 }
 
+// isFind reports whether the event is the Ctrl-F chord — the same three
+// spellings isSave accepts ('f', the 0x06 control code, the 0x09 usage).
+func isFind(ev vi.Event) bool {
+	if ev.Kind != vi.EvKeyDown || ev.Flags&modCtrl == 0 {
+		return false
+	}
+	return ev.Arg1 == keyF || ev.Arg1 == keyCtrlF || ev.Arg0 == hidF
+}
+
 // insertionFor maps a key event to the Unicode scalar it inserts. The kernel
 // puts the decoded codepoint in arg1 (ADR 0014); Return/Newline become '\n'.
 func insertionFor(ev vi.Event) (rune, bool) {
@@ -475,6 +574,12 @@ func insertionFor(ev vi.Event) (rune, bool) {
 	}
 	return 0, false
 }
+
+// fillCanvas adapts the app's own fill to widgets.RectCanvas — the find
+// overlay's whole paint contract.
+type fillCanvas struct{ a *app }
+
+func (c *fillCanvas) FillRect(r widgets.Rect, rgb uint32) { c.a.fill(r.X, r.Y, r.W, r.H, rgb) }
 
 // fill is one clamped rectangle through the bound window canvas (or the
 // FillerCanvas degradation path — tabapp.Canvas picks). draw.Opaque mirrors
@@ -559,7 +664,11 @@ func (a *app) draw() {
 
 	status := "line " + vi.Itoa64(int64(a.buf.Line())) + ":" + vi.Itoa64(int64(a.buf.Col())) +
 		"  bytes " + vi.Itoa64(int64(a.buf.Len())) + "/" + vi.Itoa64(int64(MaxBytes))
-	a.drawText(textOrigin, h-statusH, status, tok.Muted)
+	a.drawText(textOrigin, h-statusH-a.bottomChrome(), status, tok.Muted)
+	if a.find.Open {
+		a.find.R = widgets.Rect{Y: h - findH, W: w, H: findH}
+		a.find.Draw(&fillCanvas{a: a})
+	}
 	// Present puts the frame on the scanout — and flushes the degradation
 	// path's pending fills first, so the batcher semantics are unchanged. Without it the app fills its own
 	// back-buffer and NOTHING reaches the compositor -- and the serial looks
