@@ -143,6 +143,10 @@ func newTestView(h *fakeHost, stub bool) *view {
 		dir: "/host/ASSIST", status: "ready", follow: true,
 	}
 	v.prompt = appkit.NewTextField(widgets.Rect{}, promptMax)
+	// Armed like runView's prompt, minus the registry: Chain stays nil so
+	// the host tests ride the bitmap degrade, and the notdef report reads
+	// 0 — honest, since the bitmap path counts no misses.
+	v.armIME(nil)
 	v.side = appkit.NewListController(&widgets.List{RowH: 22, Sel: -1})
 	v.ring = appkit.NewFocusRing(&v.prompt, v.side)
 	v.ring.Focus(0)
@@ -893,6 +897,88 @@ func TestRestoreTitleMismatchIsNamed(t *testing.T) {
 	}
 	if !h.hasConsole(markerRestored + "C0003 turns=1 scroll=0 title=Trip plan") {
 		t.Fatalf("restored marker missing: %v", h.console)
+	}
+}
+
+// --- prompt composition (M178b #3145) ---------------------------------------
+
+// keyDown builds the key event the seat forwards for one press: usage in
+// Arg0, the translated symbol in Arg1, modifiers in Flags.
+func keyDown(usage uint32, sym rune, flags uint16) vi.Event {
+	return vi.Event{Kind: vi.EvKeyDown, Arg0: usage, Arg1: uint32(sym), Flags: flags}
+}
+
+func TestViewIMEComposesAndCommits(t *testing.T) {
+	h := newFakeHost()
+	v := newTestView(h, true)
+
+	// The toggle chord arms the prompt's composer; the serial line says so.
+	if !v.key(keyDown(0x0d, 0, vi.ModCtrl)) {
+		t.Fatal("ctrl-j must be consumed as the composition toggle")
+	}
+	if !h.hasConsole(markerIMEOn) || !v.prompt.Composing() {
+		t.Fatalf("ime on marker/composer state missing: %v", h.console)
+	}
+	// n,i,h,o,n,g,o paints the hiragana pre-edit, Return commits it.
+	for _, r := range "nihongo" {
+		v.key(keyDown(0x04, r, 0))
+	}
+	if v.prompt.Preedit() != "にほんご" {
+		t.Fatalf("preedit = %q, want にほんご", v.prompt.Preedit())
+	}
+	v.key(keyDown(0x28, 0, 0)) // return commits, does not send
+	if v.prompt.Value() != "にほんご" || v.prompt.Preedit() != "" {
+		t.Fatalf("prompt = %q preedit = %q", v.prompt.Value(), v.prompt.Preedit())
+	}
+	if !h.hasConsole(markerIMECommit + "にほんご") {
+		t.Fatalf("commit marker missing: %v", h.console)
+	}
+	if !h.hasConsole(markerNotdef + "0") {
+		t.Fatalf("notdef report missing: %v", h.console)
+	}
+	if h.hasConsole(markerSend) {
+		t.Fatal("the committing Return must not have sent")
+	}
+	// The settled Return sends the kana prompt like any other text.
+	v.key(keyDown(0x28, 0, 0))
+	if !h.hasConsole(markerSend + "C0001") {
+		t.Fatalf("send marker missing: %v", h.console)
+	}
+	d, ok := decodeConv(h.files["/host/ASSIST/C0001.CHAT"])
+	if !ok || len(d.turns) == 0 || d.turns[0].text != "にほんご" {
+		t.Fatalf("saved turn lost the kana: %+v", d)
+	}
+}
+
+func TestViewIMECycleAndCancel(t *testing.T) {
+	h := newFakeHost()
+	v := newTestView(h, true)
+	v.key(keyDown(0x0d, 0, vi.ModCtrl))
+	for _, r := range "sushi" {
+		v.key(keyDown(0x04, r, 0))
+	}
+	// Space cycles the candidate: katakana commits.
+	v.key(keyDown(0x2c, ' ', 0))
+	if v.prompt.Preedit() != "スシ" {
+		t.Fatalf("cycle: preedit = %q", v.prompt.Preedit())
+	}
+	v.key(keyDown(0x28, 0, 0))
+	if !h.hasConsole(markerIMECommit + "スシ") {
+		t.Fatalf("katakana commit missing: %v", h.console)
+	}
+	// Escape on a live pre-edit cancels the composition — it is not the
+	// app's close gesture.
+	for _, r := range "kana" {
+		v.key(keyDown(0x04, r, 0))
+	}
+	v.key(keyDown(0x29, 0, 0))
+	if v.prompt.Preedit() != "" || v.wantQuit {
+		t.Fatalf("escape must cancel the pre-edit, not the window: %v", v.wantQuit)
+	}
+	// Toggling off reports the flip and returns to plain typing.
+	v.key(keyDown(0x0d, 0, vi.ModCtrl))
+	if !h.hasConsole(markerIMEOff) || v.prompt.Composing() {
+		t.Fatalf("ime off missing: %v", h.console)
 	}
 }
 

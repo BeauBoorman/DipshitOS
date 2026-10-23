@@ -137,8 +137,18 @@ func (c *ListController) ensureVisible() {
 // (see Preedit) until the next key resolves it.
 //
 // Face is the §3.4 optional TrueType label face — nil keeps the 8x8 bitmap
-// face. Disabled drops text to the Muted role and blends the plate 50%
+// face. Chain, when set, paints ALL of the field's text through a face
+// cascade instead — a composed pre-edit's kana resolve to the Japanese
+// coverage face — and Face is ignored; nil keeps the single-face path.
+// Disabled drops text to the Muted role and blends the plate 50%
 // toward Surface (§2.3).
+//
+// IME, when non-nil, arms romaji->kana composition behind Ctrl+J: the
+// chord swaps the IME in for the dead-key stage and back, committing
+// whatever was staged first. While the IME holds a pre-edit the field
+// paints it underlined and offers its candidate forms under the plate.
+// OnIMEToggle reports each flip (true = composing) and OnIMECommit each
+// text the composition inserts; either may be nil.
 type TextField struct {
 	R           widgets.Rect
 	Buffer      linebuf.LineBuffer
@@ -148,11 +158,37 @@ type TextField struct {
 	Focused     bool
 	Disabled    bool
 	Face        *ttf.Face
+	Chain       *ttf.Chain
 	Max         int
 	Prefix      string
 	Placeholder string
+	IME         *layout.IME
+	OnIMEToggle func(on bool)
+	OnIMECommit func(text string)
 
 	stage layout.Stage
+	imeOn bool
+}
+
+// usageIMEToggle is the composition toggle's HID usage — Ctrl+J. The
+// seat's chord table (user/go/chords/table.go) binds no ctrl-j row at
+// any scope, and ADR 0009 reaches every focused app regardless.
+const usageIMEToggle = 0x0d // 'j'
+
+// composer is the pending-text engine currently driving the field: the
+// IME while composition is on, the dead-key stage otherwise. The field
+// and its painters never branch on which one is active.
+func (f *TextField) composer() layout.Composer {
+	if f.IME != nil && f.imeOn {
+		return f.IME
+	}
+	return &f.stage
+}
+
+// Composing reports whether the field's romaji->kana composer is the
+// active one.
+func (f *TextField) Composing() bool {
+	return f.IME != nil && f.imeOn
 }
 
 func NewTextField(r widgets.Rect, max int) TextField {
@@ -172,15 +208,16 @@ func (f *TextField) CaretPosition() int { return f.Buffer.Caret() }
 // Call it when the field is set up; it drops a half-typed sequence.
 func (f *TextField) SetLayout(id layout.ID) { f.stage.SetLayout(id) }
 
-// Preedit is the pending dead-key accent as the field paints it, or "" when
+// Preedit is the active composer's staged text as the field paints it —
+// a pending accent's mark or a composition's shown form — or "" when
 // nothing is staged. The text is not in Value yet.
-func (f *TextField) Preedit() string { return f.stage.Preedit() }
+func (f *TextField) Preedit() string { return f.composer().Preedit() }
 
 // SetValue replaces the text. A value longer than Max is clipped to a whole
-// rune, and a staged accent is dropped because it no longer follows the text
+// rune, and staged input is dropped because it no longer follows the text
 // it was typed after.
 func (f *TextField) SetValue(s string) {
-	f.stage.Cancel()
+	f.cancelStaged()
 	if f.Max > 0 && len(s) > f.Max {
 		cut := f.Max
 		for cut > 0 && !utf8.RuneStart(s[cut]) {
@@ -192,8 +229,18 @@ func (f *TextField) SetValue(s string) {
 }
 
 func (f *TextField) Clear() {
-	f.stage.Cancel()
+	f.cancelStaged()
 	f.Buffer.Clear()
+}
+
+// cancelStaged drops whatever either composer holds — the active one and,
+// defensively, the dormant one too, so a programmatic edit never leaves a
+// stale pre-edit waiting behind the mode it was typed in.
+func (f *TextField) cancelStaged() {
+	f.stage.Cancel()
+	if f.IME != nil {
+		f.IME.Cancel()
+	}
 }
 
 // SetFocused commits a staged accent as its literal character when the field
@@ -205,26 +252,43 @@ func (f *TextField) SetFocused(v bool) {
 	f.Focused = v
 }
 
-// OnKey reports whether the field consumed the key. A key that ends a dead-key
-// sequence without being text (Enter, Escape, an unmapped key) first types the
-// staged accent, so Value already includes it, and then returns false so the
-// caller still acts on the key. Preedit is the state to repaint from.
+// OnKey reports whether the field consumed the key. The composition toggle
+// chord is handled first: it commits whatever is staged and flips modes.
+// A key that ends a pending sequence without being text (Enter, Escape, an
+// unmapped key) first types the staged text, so Value already includes it,
+// and then returns false so the caller still acts on the key. Preedit is
+// the state to repaint from.
 func (f *TextField) OnKey(k Key) bool {
-	before, _ := f.stage.Pending()
-	step := f.stage.Feed(layout.Input{
+	if f.IME != nil && k.Ctrl && !k.Shift && !k.Alt && k.Usage == usageIMEToggle {
+		f.flush()
+		f.imeOn = !f.imeOn
+		if f.OnIMEToggle != nil {
+			f.OnIMEToggle(f.imeOn)
+		}
+		return true
+	}
+	c := f.composer()
+	composing := f.imeOn
+	before := c.Preedit()
+	step := c.Feed(layout.Input{
 		Usage: k.Usage,
 		Shift: k.Shift,
 		Chord: k.Ctrl || k.Alt,
 		Sym:   k.Rune,
 	})
 	changed := false
+	var inserted []rune
 	for _, r := range step.Commit {
 		if f.insertRune(r) {
+			inserted = append(inserted, r)
 			changed = true
 		}
 	}
-	if after, _ := f.stage.Pending(); after != before {
+	if c.Preedit() != before {
 		changed = true
+	}
+	if composing && len(inserted) > 0 && f.OnIMECommit != nil {
+		f.OnIMECommit(string(inserted))
 	}
 	if !step.Pass {
 		return changed
@@ -275,11 +339,18 @@ func (f *TextField) insertRune(r rune) bool {
 }
 
 func (f *TextField) flush() bool {
+	c := f.composer()
+	composing := f.imeOn
 	typed := false
-	for _, r := range f.stage.Flush() {
+	var inserted []rune
+	for _, r := range c.Flush() {
 		if f.insertRune(r) {
+			inserted = append(inserted, r)
 			typed = true
 		}
+	}
+	if composing && len(inserted) > 0 && f.OnIMECommit != nil {
+		f.OnIMECommit(string(inserted))
 	}
 	return typed
 }
@@ -368,14 +439,15 @@ func (f *TextField) Draw(c widgets.RectCanvas) {
 	// one-cell accent line at the caret's cell, clamped to the plate.
 	v, caret := f.Value(), f.Buffer.Caret()
 	col := utf8.RuneCountInString(f.Prefix + v[:caret])
-	if pre := f.stage.Preedit(); pre != "" {
-		// A staged accent is painted where it will land, in the accent colour
-		// and underlined, between the text before and after the caret. The
-		// text after it moves right one cell, as it will when the accent
-		// commits.
+	if pre := f.composer().Preedit(); pre != "" {
+		// A staged pre-edit is painted where it will land, in the accent
+		// colour and underlined, between the text before and after the
+		// caret. The text after it moves right by the pre-edit's cells,
+		// as it will when the form commits.
+		preW := utf8.RuneCountInString(pre)
 		widgets.DrawText(c, f.R, f.Prefix+v[:caret], fg)
 		widgets.DrawText(c, f.cellPlate(col), pre, f.Caret)
-		widgets.DrawText(c, f.cellPlate(col+1), v[caret:], fg)
+		widgets.DrawText(c, f.cellPlate(col+preW), v[caret:], fg)
 		// The underline sits one row under the glyph, where the painter puts
 		// it (centred in the inset plate, never above its top edge).
 		glyphY := f.R.Y + 2 + (f.R.H-4-8)/2
@@ -383,9 +455,9 @@ func (f *TextField) Draw(c widgets.RectCanvas) {
 			glyphY = f.R.Y + 2
 		}
 		if y := glyphY + 8; y < f.R.Bottom() {
-			c.FillRect(widgets.Rect{X: f.R.X + 2 + col*glyphW, Y: y, W: glyphW, H: 1}, f.Caret)
+			c.FillRect(widgets.Rect{X: f.R.X + 2 + col*glyphW, Y: y, W: preW * glyphW, H: 1}, f.Caret)
 		}
-		col++
+		col += preW
 	} else {
 		text := f.Prefix + v
 		if text == "" && f.Placeholder != "" {
@@ -402,6 +474,25 @@ func (f *TextField) Draw(c widgets.RectCanvas) {
 			x = f.R.X + 2
 		}
 		c.FillRect(widgets.Rect{X: x, Y: f.R.Y + 2, W: 2, H: f.R.H - 4}, f.Caret)
+	}
+	// The candidate strip: every form the staged pre-edit can commit, one
+	// row under the plate, the shown form in the accent colour and
+	// underlined. Composers without alternates report nothing.
+	if forms, sel := f.composer().Candidates(); len(forms) > 0 {
+		x := f.R.X + 2
+		y := f.R.Bottom() + 1
+		for i, s := range forms {
+			rgb := fg
+			if i == sel {
+				rgb = f.Caret
+			}
+			w := utf8.RuneCountInString(s) * glyphW
+			widgets.DrawText(c, widgets.Rect{X: x, Y: y, W: w + 4, H: 10}, s, rgb)
+			if i == sel {
+				c.FillRect(widgets.Rect{X: x + 2, Y: y + 9, W: w, H: 1}, f.Caret)
+			}
+			x += w + 4 + glyphW
+		}
 	}
 }
 
@@ -425,9 +516,16 @@ func (f *TextField) drawCanvas(c widgets.Canvas, fg, bg uint32) {
 		return
 	}
 	x0 := inner.X + th.PadXS
-	// advance measures a run in Face pixels, or in 8px cells when the bitmap
-	// fallback is painting — the preedit splits the run either way.
+	// advance measures a run the way paintRun will draw it: the chain's
+	// cascade measure when Chain is set, Face pixels otherwise, or 8px
+	// cells under the bitmap fallback — the preedit splits the run either
+	// way.
 	advance := func(s string) int {
+		if f.Chain != nil {
+			if w := f.Chain.Measure(s, labelPx); w > 0 {
+				return w
+			}
+		}
 		if f.Face == nil {
 			return utf8.RuneCountInString(s) * glyphW
 		}
@@ -440,18 +538,19 @@ func (f *TextField) drawCanvas(c widgets.Canvas, fg, bg uint32) {
 	v, caret := f.Value(), f.Buffer.Caret()
 	before, after := f.Prefix+v[:caret], v[caret:]
 	caretX := x0 + advance(before)
-	if pre := f.stage.Preedit(); pre != "" {
+	if pre := f.composer().Preedit(); pre != "" {
 		f.paintRun(c, inner, x0, before, fg)
 		f.paintRun(c, inner, x0+advance(before), pre, f.Caret)
 		f.paintRun(c, inner, x0+advance(before)+advance(pre), after, fg)
-		// The underline sits just under the staged accent — the face's
-		// descender line, or one row under the bitmap glyph like Draw does.
+		// The underline sits just under the staged text — the painting
+		// face's descender line, or one row under the bitmap glyph like
+		// Draw does.
 		uy := inner.Y + 2 + (inner.H-4-8)/2 + 8
 		if uy < inner.Y+2 {
 			uy = inner.Y + 2
 		}
-		if f.Face != nil {
-			asc, desc, _ := f.Face.LineMetrics(labelPx)
+		if m := f.faceMetrics(); m != nil {
+			asc, desc, _ := m.LineMetrics(labelPx)
 			uy = inner.Y + (inner.H-asc-desc)/2 + asc + desc
 		}
 		if uy >= inner.Bottom() {
@@ -475,13 +574,52 @@ func (f *TextField) drawCanvas(c widgets.Canvas, fg, bg uint32) {
 		}
 		c.FillRect(widgets.Rect{X: caretX, Y: inner.Y + 2, W: 2, H: inner.H - 4}, draw.Opaque(f.Caret))
 	}
+	// The candidate strip: every form the staged pre-edit can commit, one
+	// row under the plate, the shown form in the caret colour and
+	// underlined, the rest muted. Composers without alternates report
+	// nothing, so the strip only ever shows while composing.
+	if forms, sel := f.composer().Candidates(); len(forms) > 0 {
+		strip := widgets.Rect{X: x0, Y: f.R.Bottom() + 2, W: inner.Right() - x0, H: labelPx + 7}
+		x := x0
+		for i, s := range forms {
+			rgb := th.Muted
+			if i == sel {
+				rgb = f.Caret
+			}
+			f.paintRun(c, strip, x, s, rgb)
+			w := advance(s)
+			if i == sel {
+				c.FillRect(widgets.Rect{X: x, Y: strip.Bottom() - 1, W: w, H: 1}, draw.Opaque(f.Caret))
+			}
+			x += w + glyphW
+		}
+	}
 }
 
-// paintRun paints s with the pen at x through Canvas.Text. A nil face keeps
-// §3.4's bitmap degrade — which anchors at the plate's own inset, so the clip
-// is shifted to land the run at x.
+// faceMetrics is the face whose metrics govern the field's TrueType
+// painting: the chain's primary when a chain is armed and loaded, else
+// the single Face. nil means the bitmap degrade is painting.
+func (f *TextField) faceMetrics() *ttf.Face {
+	if f.Chain != nil {
+		if p := f.Chain.Primary(); p != nil {
+			return p
+		}
+	}
+	return f.Face
+}
+
+// paintRun paints s with the pen at x. A loaded Chain takes the whole run
+// through its cascade so kana reach the coverage face; a nil face keeps
+// §3.4's bitmap degrade — which anchors at the plate's own inset, so the
+// clip is shifted to land the run at x.
 func (f *TextField) paintRun(c widgets.Canvas, clip widgets.Rect, x int, s string, rgb uint32) {
 	if s == "" {
+		return
+	}
+	if f.Chain != nil && f.Chain.Primary() != nil {
+		asc, desc, _ := f.Chain.Primary().LineMetrics(labelPx)
+		y := clip.Y + (clip.H-asc-desc)/2 + asc
+		draw.TextChain(c, f.Chain, clip, x, y, labelPx, s, draw.Opaque(rgb))
 		return
 	}
 	y := 0

@@ -32,12 +32,31 @@ type Step struct {
 	Pass bool
 }
 
+// Composer is the pending-text surface a text surface consumes: Feed
+// advances by one key-down, Preedit is the staged text to paint ("" when
+// nothing is staged), Flush commits the staged text to the caret, Cancel
+// drops it, and Candidates lists the forms the staged text can take —
+// nil for a composer with exactly one form, so a painter can show the
+// list without knowing which composer is active. Stage satisfies it for
+// dead keys; IME (ime.go) satisfies it for romaji->kana composition.
+type Composer interface {
+	Feed(Input) Step
+	Preedit() string
+	Flush() []rune
+	Cancel()
+	// Candidates returns every form the staged text can commit, in the
+	// order the composer cycles them, plus the index of the form Preedit
+	// currently shows. (nil, 0) when nothing is staged or the composer
+	// has no alternates.
+	Candidates() (forms []string, sel int)
+}
+
 // Stage holds input that has been typed but not yet committed to the text: the
 // pending half of a dead-key sequence. It is deliberately the whole surface a
 // text field needs (Feed, Pending/Preedit for painting, Flush and Cancel for
 // focus changes), so an input method that stages more than one accent could
-// replace it without the field or its painter changing. That is the seam; no
-// input method is built here.
+// replace it without the field or its painter changing. That is the seam; the
+// IME lives in ime.go.
 //
 // The zero Stage has no layout and therefore no dead keys: every key passes
 // through, so a surface that never calls SetLayout behaves exactly as it did.
@@ -74,6 +93,12 @@ func (s *Stage) Preedit() string {
 
 // Cancel drops the staged accent without typing it.
 func (s *Stage) Cancel() { s.pending = 0 }
+
+// Candidates reports no alternates: a staged accent has exactly one form —
+// its mark — so the pre-edit never offers a list.
+func (s *Stage) Candidates() (forms []string, sel int) { return nil, 0 }
+
+var _ Composer = (*Stage)(nil)
 
 // Flush types the staged accent as its literal character and clears the
 // state. Call it when the sequence can no longer continue in this surface (it

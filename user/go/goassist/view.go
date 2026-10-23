@@ -18,6 +18,7 @@ import (
 	"virelai/appkit"
 	uidraw "virelai/draw"
 	"virelai/gpu3d"
+	"virelai/layout"
 	"virelai/tabapp"
 	"virelai/theme"
 	"virelai/ttf"
@@ -45,30 +46,34 @@ const (
 	// usage, since appkit's named vocabulary ends at F10.
 	keyF2 = 0x3b
 
-	markerOpen     = "goassist: open id="
-	markerDeclare  = "goassist: declare accepted"
-	markerPresent  = "goassist: present"
-	markerSend     = "goassist: send conv="
-	markerTokens   = "goassist: tokens="
-	markerAnswer   = "goassist: answer toks="
-	markerCancel   = "goassist: cancelled toks="
-	markerAbsent   = "goassist: weights absent"
-	markerUnsup    = "goassist: unsupported"
-	markerError    = "goassist: error "
-	markerSaved    = "goassist: saved "
-	markerCommit   = "goassist: committed conv="
-	markerPosted   = "goassist: state posted conv="
-	markerRestored = "goassist: state restored conv="
-	markerRefused  = "goassist: state refused"
-	markerMismatch = "goassist: state mismatch"
-	markerRenamed  = "goassist: renamed conv="
-	markerRenBad   = "goassist: rename refused conv="
-	markerDeleted  = "goassist: conv deleted "
-	markerPresets  = "goassist: presets n="
-	markerPresBad  = "goassist: presets refused"
-	markerClose    = "goassist: close"
-	markerOK       = "goassist OK"
-	markerDone     = "goassist: done"
+	markerOpen      = "goassist: open id="
+	markerDeclare   = "goassist: declare accepted"
+	markerPresent   = "goassist: present"
+	markerSend      = "goassist: send conv="
+	markerTokens    = "goassist: tokens="
+	markerAnswer    = "goassist: answer toks="
+	markerCancel    = "goassist: cancelled toks="
+	markerAbsent    = "goassist: weights absent"
+	markerUnsup     = "goassist: unsupported"
+	markerError     = "goassist: error "
+	markerSaved     = "goassist: saved "
+	markerCommit    = "goassist: committed conv="
+	markerPosted    = "goassist: state posted conv="
+	markerRestored  = "goassist: state restored conv="
+	markerRefused   = "goassist: state refused"
+	markerMismatch  = "goassist: state mismatch"
+	markerRenamed   = "goassist: renamed conv="
+	markerRenBad    = "goassist: rename refused conv="
+	markerDeleted   = "goassist: conv deleted "
+	markerPresets   = "goassist: presets n="
+	markerPresBad   = "goassist: presets refused"
+	markerClose     = "goassist: close"
+	markerIMEOn     = "goassist: ime on"
+	markerIMEOff    = "goassist: ime off"
+	markerIMECommit = "goassist: ime commit "
+	markerNotdef    = "fonts: notdef="
+	markerOK        = "goassist OK"
+	markerDone      = "goassist: done"
 )
 
 // viewConsole is the window path's serial sink (the host-test seam var).
@@ -837,6 +842,31 @@ func (v *view) handle(ev vi.Event) bool {
 	return false
 }
 
+// armIME wires the prompt's romaji->kana composition (M178b #3145): the
+// ui chain so the pre-edit's kana reach the Japanese coverage face, the
+// composer behind the field's toggle chord, and the serial markers the
+// legs assert — the flip, the committed text, and the registry's notdef
+// count proving every prompt rune found a face.
+func (v *view) armIME(reg *ttf.Registry) {
+	v.prompt.Chain = v.f.ui
+	v.prompt.IME = &layout.IME{}
+	v.prompt.OnIMEToggle = func(on bool) {
+		if on {
+			v.h.ConsoleLine(markerIMEOn)
+		} else {
+			v.h.ConsoleLine(markerIMEOff)
+		}
+	}
+	v.prompt.OnIMECommit = func(s string) {
+		v.h.ConsoleLine(markerIMECommit + s)
+		n := 0
+		if reg != nil {
+			n = reg.Notdef()
+		}
+		v.h.ConsoleLine(markerNotdef + is(n))
+	}
+}
+
 // key routes keyboard input: scrolling keys always reach the transcript,
 // Tab cycles focus, the rest go to the focused control.
 func (v *view) key(ev vi.Event) bool {
@@ -868,14 +898,17 @@ func (v *view) key(ev vi.Event) bool {
 			return true
 		}
 	}
-	// Enter in the prompt sends; the field itself never consumes it.
-	if idx == 0 && k.Named() == appkit.NamedEnter {
+	// Enter in the prompt sends; the field itself never consumes it. A
+	// live composition owns Enter first — it commits the shown form —
+	// so the send only fires once the pre-edit is settled.
+	if idx == 0 && k.Named() == appkit.NamedEnter && v.prompt.Preedit() == "" {
 		v.send()
 		return true
 	}
 	// Esc with no generation running is the close gesture (a mid-stream
-	// Esc never reaches here — onToken consumed it into the cancel).
-	if k.Named() == appkit.NamedEscape && !v.busy {
+	// Esc never reaches here — onToken consumed it into the cancel). A
+	// live pre-edit owns it first: Escape cancels the composition.
+	if k.Named() == appkit.NamedEscape && !v.busy && v.prompt.Preedit() == "" {
 		v.wantQuit = true
 		return true
 	}
@@ -1170,6 +1203,7 @@ func runView(h host, stub bool) int {
 	pf := appkit.NewTextField(widgets.Rect{}, promptMax)
 	pf.Placeholder = "Message the assistant"
 	v.prompt = pf
+	v.armIME(reg)
 	v.side = appkit.NewListController(&widgets.List{RowH: 22, Sel: -1})
 	v.ring = appkit.NewFocusRing(&v.prompt, v.side)
 	v.ring.Focus(0)

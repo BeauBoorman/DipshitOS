@@ -1,9 +1,12 @@
 package appkit
 
 import (
+	"errors"
+	"os"
 	"testing"
 
 	"virelai/layout"
+	"virelai/ttf"
 	"virelai/vi"
 	"virelai/widgets"
 )
@@ -321,6 +324,283 @@ func TestTextFieldPaintsThePendingAccentAtTheCaret(t *testing.T) {
 	f.Draw(&c)
 	if c.has(widgets.Rect{X: 10, Y: 14, W: 8, H: 1}, accent) {
 		t.Fatal("underline outlived the pending accent")
+	}
+}
+
+// --- romaji->kana composition (M178b #3145) --------------------------------
+
+// imeField is a field with the composition composer armed, the way an
+// adopting app sets it up.
+func imeField(max int) *TextField {
+	f := NewTextField(widgets.Rect{X: 0, Y: 0, W: 200, H: 20}, max)
+	f.IME = &layout.IME{}
+	return &f
+}
+
+// typeText feeds printable keys the way the event loop normalizes them.
+func typeText(f *TextField, s string) {
+	for _, r := range s {
+		f.OnKey(Key{Usage: 0x04, Rune: r})
+	}
+}
+
+func TestTextFieldIMEToggleComposesAndCommits(t *testing.T) {
+	f := imeField(64)
+	var toggles []bool
+	var commits []string
+	f.OnIMEToggle = func(on bool) { toggles = append(toggles, on) }
+	f.OnIMECommit = func(s string) { commits = append(commits, s) }
+
+	if !f.OnKey(Key{Usage: usageIMEToggle, Ctrl: true}) || !f.Composing() {
+		t.Fatal("the toggle chord must arm composition")
+	}
+	if len(toggles) != 1 || !toggles[0] {
+		t.Fatalf("toggles = %v, want [true]", toggles)
+	}
+	typeText(f, "nihongo")
+	if f.Preedit() != "にほんご" || f.Value() != "" {
+		t.Fatalf("preedit=%q value=%q, want the staged kana and an empty value", f.Preedit(), f.Value())
+	}
+	// Return commits the shown form and is consumed — the field's caller
+	// must not also see the Enter.
+	if !f.OnKey(Key{Usage: usageEnter}) {
+		t.Fatal("Return while composing must be consumed")
+	}
+	if f.Value() != "にほんご" || f.Preedit() != "" {
+		t.Fatalf("value=%q preedit=%q, want the committed kana", f.Value(), f.Preedit())
+	}
+	if len(commits) != 1 || commits[0] != "にほんご" {
+		t.Fatalf("commits = %v, want [にほんご]", commits)
+	}
+	// The next Return is the surface's own: unconsumed.
+	if f.OnKey(Key{Usage: usageEnter}) {
+		t.Fatal("Return on a settled field must pass through")
+	}
+	// Toggling back returns the field to the dead-key stage.
+	if !f.OnKey(Key{Usage: usageIMEToggle, Ctrl: true}) || f.Composing() {
+		t.Fatal("the chord must toggle composition off")
+	}
+	if len(toggles) != 2 || toggles[1] {
+		t.Fatalf("toggles = %v, want [true false]", toggles)
+	}
+	typeText(f, "x")
+	if f.Value() != "にほんごx" || f.Preedit() != "" {
+		t.Fatalf("after toggle off value=%q preedit=%q", f.Value(), f.Preedit())
+	}
+}
+
+func TestTextFieldIMECycleEditCancel(t *testing.T) {
+	f := imeField(64)
+	f.OnKey(Key{Usage: usageIMEToggle, Ctrl: true})
+	typeText(f, "sushi")
+	f.OnKey(Key{Usage: usageSpace, Rune: ' '})
+	if f.Preedit() != "スシ" {
+		t.Fatalf("cycle 1: %q, want スシ", f.Preedit())
+	}
+	f.OnKey(Key{Usage: usageSpace, Rune: ' '})
+	if f.Preedit() != "sushi" {
+		t.Fatalf("cycle 2: %q, want the raw romaji", f.Preedit())
+	}
+	// Backspace edits the romaji; Escape cancels the composition.
+	f.OnKey(Key{Usage: usageBksp})
+	if f.Preedit() != "sush" {
+		t.Fatalf("backspace: %q", f.Preedit())
+	}
+	f.OnKey(Key{Usage: usageEsc})
+	if f.Preedit() != "" || f.Value() != "" {
+		t.Fatalf("escape must cancel: value=%q preedit=%q", f.Value(), f.Preedit())
+	}
+}
+
+func TestTextFieldIMEToggleOffCommits(t *testing.T) {
+	f := imeField(64)
+	var commits []string
+	f.OnIMECommit = func(s string) { commits = append(commits, s) }
+	f.OnKey(Key{Usage: usageIMEToggle, Ctrl: true})
+	typeText(f, "ka")
+	// The toggle-off commits the staged form — typed text is never
+	// swallowed by a mode flip.
+	f.OnKey(Key{Usage: usageIMEToggle, Ctrl: true})
+	if f.Value() != "か" || f.Preedit() != "" {
+		t.Fatalf("value=%q preedit=%q, want the shown form committed", f.Value(), f.Preedit())
+	}
+	if len(commits) != 1 || commits[0] != "か" {
+		t.Fatalf("commits = %v, want [か]", commits)
+	}
+	// Losing focus and clicks flush the composition the same way.
+	f.OnKey(Key{Usage: usageIMEToggle, Ctrl: true})
+	typeText(f, "ki")
+	f.SetFocused(false)
+	if f.Value() != "かき" || f.Preedit() != "" {
+		t.Fatalf("blur: value=%q", f.Value())
+	}
+	typeText(f, "ku")
+	f.OnClick(1, 1)
+	if f.Value() != "かきく" {
+		t.Fatalf("click: value=%q", f.Value())
+	}
+}
+
+func TestTextFieldWithoutIMEIgnoresTheChord(t *testing.T) {
+	f := NewTextField(widgets.Rect{W: 100, H: 20}, 8)
+	if f.OnKey(Key{Usage: usageIMEToggle, Ctrl: true}) {
+		t.Fatal("an unarmed field must not consume the chord")
+	}
+	if f.Composing() || f.Preedit() != "" {
+		t.Fatal("an unarmed field must not compose")
+	}
+}
+
+func TestTextFieldIMECommitReportsOnlyInsertedText(t *testing.T) {
+	f := imeField(6) // room for two kana, not three
+	var commits []string
+	f.OnIMECommit = func(s string) { commits = append(commits, s) }
+	f.OnKey(Key{Usage: usageIMEToggle, Ctrl: true})
+	typeText(f, "nihongo")
+	f.OnKey(Key{Usage: usageEnter})
+	// にほんご is 9 bytes over a 6-byte bound: the marker reports what the
+	// field actually took, not what the composer produced.
+	if len(commits) != 1 || commits[0] != "にほ" {
+		t.Fatalf("commits = %v, want the inserted prefix [にほ]", commits)
+	}
+	if f.Value() != "にほ" {
+		t.Fatalf("value = %q", f.Value())
+	}
+}
+
+func TestTextFieldCandidatesPaintUnderTheField(t *testing.T) {
+	const fg, accent = 0xe6edf3, 0xffd75f
+	f := imeField(64)
+	f.Fg, f.Caret = fg, accent
+	f.OnKey(Key{Usage: usageIMEToggle, Ctrl: true})
+	typeText(f, "sushi")
+	var c recCanvas
+	f.Draw(&c)
+	// The three forms paint below the plate, the shown (hiragana) one in
+	// the accent colour with an underline.
+	if n := c.within(fg, 0, 200, 20, 40); n == 0 {
+		t.Fatal("the unselected forms did not paint under the field")
+	}
+	if n := c.within(accent, 0, 200, 20, 40); n < 2 {
+		t.Fatalf("the shown form and its underline must paint under the field: %d fills", n)
+	}
+	// Settled text paints nothing below the plate.
+	f.OnKey(Key{Usage: usageEnter})
+	c = recCanvas{}
+	f.Draw(&c)
+	if n := c.within(fg, 0, 200, 20, 40); n != 0 {
+		t.Fatalf("a settled field still shows %d fills below the plate", n)
+	}
+}
+
+// chainField builds a field whose text paints through a real cascade:
+// Inter as the ui primary, the JP face via the symbol consult — the same
+// resolution FONTS.TXT gives the guest.
+func chainField(t *testing.T, max int) *TextField {
+	t.Helper()
+	files := map[string]string{
+		"INTER.TTF":   "Inter-Regular.ttf",
+		"NOTOCJK.TTF": "NotoSansJP-Regular.ttf",
+	}
+	load := func(name string) (*ttf.Face, error) {
+		src, ok := files[name]
+		if !ok {
+			return nil, errors.New("no such staged face")
+		}
+		data, err := os.ReadFile("../../../image/fonts/" + src)
+		if err != nil {
+			return nil, err
+		}
+		return ttf.Parse(data)
+	}
+	specs := []ttf.FaceSpec{
+		{File: "INTER.TTF", Role: "ui", Order: 1, Weight: 400},
+		{File: "NOTOCJK.TTF", Role: "symbol", Order: 2, Weight: 400},
+	}
+	reg := ttf.NewRegistry(specs, load)
+	f := NewTextField(widgets.Rect{X: 0, Y: 0, W: 200, H: 26}, max)
+	f.Chain = reg.Chain(ttf.Query{Role: "ui"})
+	f.IME = &layout.IME{}
+	if f.Chain == nil {
+		t.Fatal("the fixture chain must resolve")
+	}
+	return &f
+}
+
+// fullCanvas is the recording Canvas the chain paint path needs: Text
+// runs arrive as glyph blits (BlitTinted), never as Text calls.
+type fullCanvas struct {
+	fills []fill
+	blits []fill
+	texts []string
+}
+
+func (c *fullCanvas) FillRect(r widgets.Rect, rgb uint32) {
+	c.fills = append(c.fills, fill{r, rgb})
+}
+func (c *fullCanvas) FillRoundedRect(r widgets.Rect, _ int, rgb uint32) {
+	c.fills = append(c.fills, fill{r, rgb})
+}
+func (c *fullCanvas) StrokeRoundedRect(widgets.Rect, int, int, uint32) {}
+func (c *fullCanvas) BlitTinted(src []uint32, w, h, x, y int, rgb uint32) {
+	c.blits = append(c.blits, fill{widgets.Rect{X: x, Y: y, W: w, H: h}, rgb})
+}
+func (c *fullCanvas) Text(_ *ttf.Face, _ widgets.Rect, _, _, _ int, s string, _ uint32) {
+	c.texts = append(c.texts, s)
+}
+
+func TestTextFieldPreeditPaintsThroughTheChain(t *testing.T) {
+	f := chainField(t, 64)
+	f.Caret = 0xffd75f
+	f.SetFocused(true)
+	f.OnKey(Key{Usage: usageIMEToggle, Ctrl: true})
+	typeText(f, "nihongo")
+	var c fullCanvas
+	f.Draw(&c)
+	// The kana pre-edit resolves through the cascade to the JP face and
+	// lands as real glyph masks — never as bitmap Text calls — and the
+	// same cascade paints the candidate strip under the plate.
+	if len(c.blits) == 0 {
+		t.Fatal("no glyph blits: the chain did not paint the pre-edit")
+	}
+	if len(c.texts) != 0 {
+		t.Fatalf("chain painting must not fall back to single-face Text: %v", c.texts)
+	}
+	var under bool
+	for _, b := range c.blits {
+		if b.r.Y >= f.R.Bottom() {
+			under = true
+		}
+	}
+	if !under {
+		t.Fatal("the candidate forms did not paint under the field")
+	}
+	// Committing keeps painting through the chain — the kana in Value
+	// resolve to the coverage face too.
+	f.OnKey(Key{Usage: usageEnter})
+	c = fullCanvas{}
+	f.Draw(&c)
+	if len(c.blits) == 0 || len(c.texts) != 0 {
+		t.Fatalf("committed kana left the chain: blits=%d texts=%v", len(c.blits), c.texts)
+	}
+}
+
+// A field armed but never chained keeps the single-face painter — the
+// bitmap degrade path is the unchanged one from before the chain existed.
+func TestTextFieldNoChainPaintsAsBefore(t *testing.T) {
+	f := imeField(64)
+	f.Fg, f.Caret = 0xe6edf3, 0xffd75f
+	f.OnKey(Key{Usage: usageIMEToggle, Ctrl: true})
+	typeText(f, "kana")
+	var c recCanvas
+	f.Draw(&c)
+	// The bitmap path paints the pre-edit in cells with its underline
+	// one row under the glyph, and the candidates below the plate.
+	if c.within(f.Caret, 2, 50, 6, 14) == 0 {
+		t.Fatal("no accent-coloured pre-edit in the plate")
+	}
+	if !c.has(widgets.Rect{X: 2, Y: 14, W: 16, H: 1}, f.Caret) {
+		t.Fatalf("no underline under the pre-edit: %+v", c.fills)
 	}
 }
 

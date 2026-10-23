@@ -34,6 +34,10 @@
 #   08  (M152f #2920) the restore boot's marker names the title; then
 #       tab/delete/tab/return runs the confirm dialog to Yes and the
 #       file is gone from the share.
+#   09  (M178b #3145, stub) FONTS.TXT + NOTOCJK.TTF staged: ctrl-j arms
+#       the prompt's romaji composer, n,i,h,o,n,g,o + Return commits
+#       hiragana, a second word cycles to katakana first, and the
+#       prompt's chain painting closes with fonts: notdef=0.
 #
 # The armed share persists across iterations, so per-leg python tails
 # keep each iteration honest: legs 01-04 and leg 06 clear ASSIST/*.CHAT
@@ -130,9 +134,21 @@ for name in ("GOTABWM.ELF", "GOASSIST.ELF"):
                  "bash tools/go/build-%s.sh"
                  % (name, src, name[:-4].lower()))
     shutil.copy(src, os.path.join(share, name))
+# FONTS.TXT + NOTOCJK.TTF (M178b #3145): the seed share already carries
+# the five frozen 8.3 faces, so the manifest's ui chain resolves Inter as
+# primary and reaches the JP face through the symbol consult — leg 09's
+# kana pre-edit paints real glyphs and 'fonts: notdef=0' is the honest
+# count. The absent NOTOSERF/CHROME rows degrade lazily, as designed.
+for name, dst in (("fonts.txt", "FONTS.TXT"),
+                  ("NotoSansJP-Regular.ttf", "NOTOCJK.TTF")):
+    src = os.path.join("image", "fonts", name)
+    if not os.path.exists(src):
+        sys.exit("%s missing (expected %s) - the font registry needs it"
+                 % (name, src))
+    shutil.copy(src, os.path.join(share, dst))
 with open(os.path.join(share, "SETTINGS.TXT"), "w") as f:
     f.write("#v2\nwm=none\n")
-print("staged Go seat + GOASSIST.ELF, wm=none")
+print("staged Go seat + GOASSIST.ELF + FONTS.TXT/NOTOCJK.TTF, wm=none")
 PY
 
 # The model VIW (M111c #2410's owner-approved SmolLM2-135M-Instruct,
@@ -685,3 +701,46 @@ if os.path.exists(path):
     sys.exit("the confirmed delete left %s on the share" % path)
 print("delete-with-confirm removed ASSIST/C0001.CHAT")
 PY
+
+# --- leg 09 (M178b #3145): romaji->kana composition in the prompt ---------
+# The stub leg keeps the leg deterministic like legs 02/07 — nothing here
+# needs a model answer, only the prompt field. ctrl-j arms the composer
+# (a chord the seat's table leaves free at every scope), n,i,h,o,n,g,o
+# paints the hiragana pre-edit underlined through the ui chain, and Return
+# commits the shown form — it is NOT the send, so no conversation opens
+# and no store hygiene is owed. The second word cycles once to katakana
+# before its Return. 'fonts: notdef=0' is printed at each commit: the
+# registry's running count proving every rune the prompt painted — kana
+# pre-edit, candidate strip, committed text — found a face on the chain.
+vgate_file script-rx9.txt <<'EOF'
+echo rx-assist-9-ok
+EOF
+
+vgate_run 09 -- \
+    --screen '$RUN_DIR/screen-09' \
+    --gpu3d-metal --via-virtio \
+    --script '$RUN_DIR/script-seat.txt' \
+    --script2 '$RUN_DIR/script-stub.txt' \
+    --script2-after 'gotabwm: holding seat' \
+    --input-chords 'ctrl-j,n,i,h,o,n,g,o,return,s,u,s,h,i,space,return' \
+    --input-chords-after 'goassist: present' \
+    --script3 '$RUN_DIR/script-rx9.txt' \
+    --script3-after 'goassist: ime commit スシ' \
+    --script-expect 'rx-assist-9-ok' --timeout 300
+
+vgate_assert 09 serial-contains 'gotabwm: holding seat'
+vgate_assert 09 serial-contains 'goassist: open id='
+vgate_assert 09 serial-contains 'goassist: declare accepted'
+vgate_assert 09 serial-contains 'goassist: present'
+vgate_assert 09 serial-contains 'goassist: ime on'
+vgate_assert 09 serial-contains 'goassist: ime commit にほんご'
+vgate_assert 09 serial-contains 'goassist: ime commit スシ'
+vgate_assert 09 serial-contains 'fonts: notdef=0'
+vgate_assert 09 serial-contains 'rx-assist-9-ok'
+vgate_assert 09 serial-absent 'fonts: notdef=1'
+vgate_assert 09 serial-absent 'goassist: ime off'
+vgate_assert 09 serial-absent 'goassist: conv new'
+vgate_assert 09 serial-absent 'goassist: send conv='
+vgate_assert 09 serial-absent 'goassist: error'
+vgate_assert 09 serial-absent 'gpu3d: timeout'
+vgate_assert 09 serial-absent '[EXC] parking:'
