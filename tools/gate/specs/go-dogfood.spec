@@ -1139,18 +1139,19 @@ vgate_run 04 -- \
     --script3-after 'goterm: prompt' \
     --script-expect 'dui lower: lowered=4' --timeout 300
 
-vgate_assert 04 share-contains APPS.TXT 'GOTERM.ELF | Terminal | t | dock=true'
+vgate_assert 04 share-contains APPS.TXT 'GOCALC.ELF | 64-bit Calc | c | dock=true'
 vgate_assert 04 serial-contains 'wm: autostart gotabwm (settings wm=gotabwm)'
 vgate_assert 04 serial-contains 'dogfood: seat'
 
 # --- M82a (#1768): the manifest the launcher read, and what it read --------
 # The share's APPS.TXT is the versioned schema, byte for byte: the four v1
-# positional fields first, then the v2 tail. GOTERM's own row above is
+# positional fields first, then the v2 tail. GOCALC's own row above is
 # deliberately still v1 (four fields, no `v=`) — a row that declares no
-# trailing field must be able to stay one, and this is that pin. NOTE's row
-# is the v2 shape.
+# trailing field must be able to stay one, and this is that pin (GOTERM
+# gained `v=2 | selection=primary` in M124e, ending its turn as the v1
+# pin). NOTE's row is the v2 shape.
 vgate_assert 04 share-contains APPS.TXT 'NOTE.ELF | Text Editor | n | dock=true | v=2 | opens=text'
-vgate_assert 04 share-contains APPS.TXT 'WEB.ELF | Web | w | dock=true | v=2 | caps=net | opens=http,https'
+vgate_assert 04 share-contains APPS.TXT 'WEB.ELF | Web | w | dock=true | v=2 | caps=file,window,net | opens=http,https'
 # The seat's own decode receipt, printed by the launcher as it parses
 # (apps.go SummarizeApps): every row of the share's manifest, the highest
 # row version the file declares, this build's schema, and how many rows
@@ -1177,7 +1178,11 @@ PY
 # Enter lands in the focused app's tty instead of summoning.
 vgate_assert 04 serial-contains 'gotabwm: tab close id='
 vgate_assert 04 serial-contains 'launcher open n='
-vgate_assert 04 serial-contains 'launcher filter q=term n=1'
+# n=2, not n=1: M191b extended the palette's synthetic "Search files for
+# '<q>'" hand-off row to the launcher's own face, so a non-empty filter
+# counts the one app hit (GOTERM) plus that ranked-last sentinel row.
+# The exec pin below still singles GOTERM out.
+vgate_assert 04 serial-contains 'launcher filter q=term n=2'
 vgate_assert 04 serial-contains 'launcher exec GOTERM.ELF'
 # `exec: loaded GOTERM.ELF` is deliberately not asserted: that line is
 # the SHELL exec builtin's (script-04a's NOTE prints it) and the launcher
@@ -2423,7 +2428,7 @@ PY
 #
 #     x y z          a typed run into the scratch buffer -> `goedit: dirty`
 #     ?              M121c: the app's own '?' opens the registry-fed hint
-#                    overlay -> `goedit: hints n=43` + the `hints row` dump
+#                    overlay -> `goedit: hints n=44` + the `hints row` dump
 #     down x6        nav strokes the modal consumes -- dwell so the kind-4
 #                    snapshot armed on `hints n=` streams a frame while
 #                    the plate is still up
@@ -2542,11 +2547,10 @@ vgate_assert 09 serial-contains 'goedit: dirty'
 # --- M121c leg: '?' opens the registry-fed overlay; Esc closes it ---------
 # n= is the live registry's own row count for GOEDIT (the app's 4 rows
 # plus the seat's globals): 40 at M121d, 41 once M190a's clip-menu row
-# landed, 43 with M190b's shot pair (the pin drifted one revision
-# behind across M190a — corrected here). The two rows below are the
-# journey's own chords made visible — the palette's summon and the undo
-# dispatch.
-vgate_assert 09 serial-contains 'goedit: hints n=43'
+# landed, 43 with M190b's shot pair, 44 with M190e's lock row. The two
+# rows below are the journey's own chords made visible — the palette's
+# summon and the undo dispatch.
+vgate_assert 09 serial-contains 'goedit: hints n=44'
 vgate_assert 09 serial-contains 'goedit: hints row ctrl+shift+p summon the command palette'
 vgate_assert 09 serial-contains 'goedit: hints row ctrl+z dispatch undo'
 vgate_assert 09 serial-contains 'goedit: hints close'
