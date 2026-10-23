@@ -66,4 +66,4 @@
 > syscall counts in ONE session — the milestone's "hearable" composition
 > test. A1/A2/A3 gates re-ran green with the chime in the boot path.
 
-See [`march-m15.md`](../march-m15.md) for the card tracker.
+See [`march-m15.md`](march-m15.md) for the card tracker.

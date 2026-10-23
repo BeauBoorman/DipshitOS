@@ -31,7 +31,7 @@
 //! owner triplet (when `caller.uid == entry.uid`) or the other triplet. This
 //! makes `OWNERS.TXT` canonical: no persisted mode ever has group bits set.
 //!
-//! ## Key canonicalization (ADR 0024 D4 / trust-scoping "Risks")
+//! ## Key canonicalization (ADR 0024 D4 / `docs/archive/trust-scoping.md` "Risks")
 //!
 //! The host share is a macOS folder; the default APFS volume is
 //! case-INSENSITIVE while the guest `parse_path` key is byte-exact. A

@@ -10,7 +10,7 @@
 # compiled by real zig and linked against the real zc shim
 # (user/src/lib/zc.zig), whose asm-svc functions are the actual syscalls.
 #
-# The recipe (each knob is load-bearing; see docs/line-of-sight.md):
+# The recipe (each knob is load-bearing; see docs/archive/line-of-sight.md):
 #   * sources are CONCATENATED into one root (flat container) with a
 #     `_start` epilogue appended: `export fn _start` calls the fixture's
 #     `main`, then parks on zc.exit(0) if main ever returned;

@@ -24,7 +24,7 @@
 > Virtualization.framework hardware gates (class B), the interactive gates
 > (class C), or the diagnostics (class D). Run the class-B set with
 > `just verify-vz` on a real Apple silicon host. Per-gate pass/fail status
-> lives in [`docs/status.md`](status.md); this file is the classification,
+> lives in [`docs/status.md`](../status.md); this file is the classification,
 > not the status.
 
 ## Classes

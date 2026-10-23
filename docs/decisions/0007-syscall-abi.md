@@ -1317,7 +1317,7 @@ class-A (the handler's cap / `len == 0` / `EFAULT` / non-process `EINVAL`
 contract, the no-capability gate, the table/count pin at 73, the boot-path
 call-counter-still-zero check, and the extended `syscalls` report rows) and
 the existing class-B fleet stays green; the EL0 entropy end-to-end proof
-rides SSH2's fresh-KEX-key proof (no new spec, per `docs/ssh-scoping.md`).
+rides SSH2's fresh-KEX-key proof (no new spec, per `docs/archive/ssh-scoping.md`).
 
 **M97g amendment (issue #2084):** while `!csprng.seeded()` the slot fails
 closed — `EAGAIN` (-11), nothing written — because the deterministic

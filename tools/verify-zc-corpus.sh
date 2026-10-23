@@ -18,7 +18,7 @@
 # file IO). Z4b adds the dual-RUN: each run case's host-built ELF gets its
 # own boot asserting the SAME pins, so behavior is byte-equivalent across
 # the two compilers. The dialect boundary and the host link contract live
-# in docs/line-of-sight.md — this gate is the mechanical half.
+# in docs/archive/line-of-sight.md — this gate is the mechanical half.
 #
 # Case model. One corpus "case" is one compile unit — a single fixture or a
 # multi-file group that the in-guest compiler sees as one flat namespace

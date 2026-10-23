@@ -11,7 +11,7 @@
 
 > The milestone-three plan, in canonical order (mirroring
 > `docs/status.md`'s "What comes immediately afterward" and the per-card
-> tracker [`docs/march-m3.md`](../march-m3.md)): physical allocator →
+> tracker [`docs/march-m3.md`](march-m3.md)): physical allocator →
 > exception vectors → GIC + timer → kernel tasks → EL0/SVC boundary →
 > syscall ABI → uaccess → per-task address spaces → user lifecycle → ESP
 > exec → blocking syscalls. **All cards are done** (claims 3972/5162/9746/

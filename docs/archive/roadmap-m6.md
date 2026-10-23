@@ -24,7 +24,7 @@
 > below and `docs/status.md`.
 
 Card ladder (canonical order; per-card tracker
-[`docs/march-m6.md`](../march-m6.md)):
+[`docs/march-m6.md`](march-m6.md)):
 
 - **G1 — virtio-gpu transport + framebuffer** (`kernel/src/virtio_gpu.zig`).
   ~~Discover the virtio-gpu device (spec DID 0x1050 — **[inferred]** until
@@ -81,7 +81,7 @@ Card ladder (canonical order; per-card tracker
   device (DID 0x1052) in the framework. Screen-side input is therefore a
   full USB XHCI + HID stack, split into its own milestone — see
   [**Milestone seven**](roadmap-m7.md)
-  and [`docs/march-m7.md`](../march-m7.md).
+  and [`docs/march-m7.md`](march-m7.md).
 - **G5 — Driving Award: the window manager.** ✅ **DONE 2026-08-13
   (claim 1543)** — `kernel/src/driving_award.zig`: a bounded fixed-BSS
   window registry (max 8) with z-order = array order, focus tracked by

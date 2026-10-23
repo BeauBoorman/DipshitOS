@@ -3,7 +3,7 @@
 > **Archived from `docs/status.md` on 2026-08-21 (issue #262).**
 > The canonical one-line summary now lives in `docs/status.md` Current position table.
 > This file preserves the full narrative that was previously inline in `docs/status.md`
-> so the live tracker can stay ~150–200 lines. See also [`docs/march-m3.md`](../march-m3.md) and the claim files cited below.
+> so the live tracker can stay ~150–200 lines. See also [`docs/march-m3.md`](march-m3.md) and the claim files cited below.
 
 ## One-line summary (now in `docs/status.md`)
 
@@ -12,7 +12,7 @@
 - **Close date:** 2026-08-10
 - **Claim:** 0707
 - **Tag:** `m3-userspace`
-- **March tracker:** [`docs/march-m3.md`](../march-m3.md)
+- **March tracker:** [`docs/march-m3.md`](march-m3.md)
 
 ## Full narrative as it appeared in `docs/status.md` (pre-compression)
 

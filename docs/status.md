@@ -6,17 +6,17 @@
 
 > Living status tracker. **Claims are GitHub issues labeled `claim`** (see
 > [Multiagent coordination](#multiagent-coordination)), not repo files. Keep
-> this file a compact table: per-card detail lives on the issue and its
-> `docs/march-m*.md` tracker, not here. Gates are the evidence — **observed**
+> this file a compact table: closed-milestone detail lives on the issue and
+> in its `docs/archive/march-*.md` tracker, not here. Gates are the evidence — **observed**
 > (saved gate output / CI) versus **inferred** (reasoning only). The
 > pre-compaction text (the M17–M51 gate-by-gate narrative, 2026-09-12,
 > 687 lines) is preserved in git history at `e5480c9`.
 
 ## Milestones
 
-All milestones through M52 are complete. Closed-milestone detail is under
-`docs/archive/` and in the per-arc `docs/march-m*.md` trackers; open cards, if
-any, are on the GitHub tracker.
+All milestones through M52 are complete. Closed-milestone detail is under `docs/archive/` (the per-arc `march-*.md`
+trackers and the `status-m*-detail.md` files); open cards, if any, are on the
+GitHub tracker.
 
 | # | Milestone | What it proved | Status |
 |---|-----------|----------------|--------|
@@ -208,11 +208,10 @@ Threads and their current state (the tracker is authoritative):
 | **M147 — GOIRC** | **Closed** (index #2749); all three cards landed: IRC core (#2801, PR #2832), UI/mentions/session state (#2802, PR #2844); acceptance (PR #2862): `go-irc` K=3 — TLS+consent journey, snapshot, restore. | #2749; cards #2801–#2803 |
 | **M148 — GOVAULT** | **Closed** (index #2750); both cards landed: GOVAULT.ELF (#2804, PR #2837); acceptance (PR #2843): receipts — vault's own audit file + Receipts face, K=3. | #2750; cards #2804–#2805 |
 | **M149 — Shipped-app polish** | **Closed** (index #2751); all three cards landed: GOFILES spacebar QuickLook (#2806, PR #2880), GOTERM OSC-8 links + named profiles (#2807, PR #2840), GOEDIT themes + minimap (#2808, PR #2886). | #2751; cards #2806–#2808 |
-| **M189 — Docs tell the truth** | In flight (index #3224): a registry (#3225) claimed; b litterbox census/archive (#3226) and c site render + freshness guard (#3227) open. | #3224; cards #3225–#3227 |
+| **M189 — Docs tell the truth** | In flight (index #3224): a component registry (#3225) landed; b docs litterbox (#3226) in review (PR #3231); c site render + freshness guard (#3227) and d era digest (#3228) open. | #3224; cards #3225–#3228 |
 
 > M150–M188 landed without table rows (the lag the M189 wave exists to
-> fix); their arcs live on the tracker and in `docs/march-m*.md` trackers
-> until the registry work consolidates them.
+> fix); their arcs live on the GitHub tracker.
 
 
 ## Gate status
@@ -288,8 +287,8 @@ The old file-based tracker (`docs/claims/` + `docs/logs/`) was deleted
 ## Housekeeping conventions
 
 - **This file is the single source of truth** for status, and stays a compact
-  table. Per-card detail goes on the issue; per-arc detail goes in one
-  `docs/march-m*.md` or ADR.
+  table. Per-card detail goes on the issue; closed-arc detail goes in the
+  archived tracker or an ADR.
 - **Evidence under `artifacts/`** (gitignored). No evidence ⇒ not observed.
 - **Facts vs inference:** hypotheses are tagged `(inferred)`; hardware tags flip
   only with saved logs.
@@ -305,5 +304,5 @@ The old file-based tracker (`docs/claims/` + `docs/logs/`) was deleted
 - [`architecture.md`](architecture.md) — components & data flow.
 - [`gate-inventory.md`](gate-inventory.md) · [`gate-fleet-inventory.md`](gate-fleet-inventory.md) — gate classes; generated fleet inventory.
 - [`archive/`](archive/) — closed-milestone detail (`status-m*-detail.md`), frozen designs, one-shots.
-- Per-milestone trackers: `docs/march-m*.md`.
+- Per-milestone trackers: `docs/archive/march-m*.md`.
 - Claims: `gh issue list --label claim --state open`.

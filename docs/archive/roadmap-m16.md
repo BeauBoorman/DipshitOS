@@ -27,7 +27,7 @@
 > The default VM (no flags) stays byte-identical at every card. Issues
 > **#190–#193** filed 2026-08-18 (one per card, the M14 way).
 
-See [`march-m16.md`](../march-m16.md) for the card tracker.
+See [`march-m16.md`](march-m16.md) for the card tracker.
 
 **Closed 2026-08-19 — C1 + C2 + C3 + C4 all live (claims 3805 + 8403 +
 0339 + 2714).** C4's composition capstone (`verify-live-m16-composition.sh`)

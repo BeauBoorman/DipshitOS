@@ -6,7 +6,7 @@
   #1437 (M70) · split card **#1504** (M70c-K)
 - Related: ADR 0007 (syscall ABI — unchanged), ADR 0013 D3.1 (kernel .bss
   budget), ADR 0026 (Go runtime port — D6, the loader's accepted shape),
-  ADR 0030 (Go is EL0), `docs/line-of-sight.md` (the Z0.5–Z4 ladder),
+  ADR 0030 (Go is EL0), `docs/archive/line-of-sight.md` (the Z0.5–Z4 ladder),
   #1434 (M66 — durable multi-MB staging, still open)
 
 > **Superseded in part by Amendment 2 (below):** the kernel capability this
@@ -55,7 +55,7 @@ re-measure commands are at the end.
 | host `cmd/link` | 6,878,850 B — `__TEXT` 5,423,104 B; `strip -x` → 6,503,808 B | same |
 | host `cmd/asm` | 5,341,682 B | same |
 | largest in-guest Go program today | `GOBIG.ELF` at **9,502,880 B** (the K1 fixture — 8,416,224 B of it one initialized `.data` payload); before K1 the largest was `GOSH.ELF` at 1,376,416 B, 66% of the old file bound | `.build/go/` |
-| file-channel transfer | 32 KiB reply cap, **stateless offset-carrying READ**, paths ≤255 B | `docs/host-file-channel-scoping.md` |
+| file-channel transfer | 32 KiB reply cap, **stateless offset-carrying READ**, paths ≤255 B | `docs/archive/host-file-channel-scoping.md` |
 
 ### What is observed and what is inferred
 
@@ -98,7 +98,7 @@ Two facts that keep this from being a dead end:
 **S3 is not blocked.** `user/src/zc.zig` (3,910 lines) already compiles the
 in-guest Zig dialect and `live-zc` runs its output on-machine — that is the
 self-hosting capability that exists, and the Z4b step is described in
-`docs/line-of-sight.md` as "explicitly a negotiation, not assumed", to be read
+`docs/archive/line-of-sight.md` as "explicitly a negotiation, not assumed", to be read
 before promising anything.
 
 ## Decisions

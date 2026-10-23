@@ -18,7 +18,7 @@
 > visible-focus window model with click-to-focus, and an `about`/`welcome`/
 > `sysinfo` support surface — all enforced by gates, not prose. Per-card
 > tracker + collision-free agent split:
-> [`docs/march-m8.md`](../march-m8.md). The cards, in order:
+> [`docs/march-m8.md`](march-m8.md). The cards, in order:
 
 - **U0 — Human interface guidelines (ADR 0008).** ✅ **DONE 2026-08-14
   (claim 8938).** The normative shell/window/support contract (D1 command
