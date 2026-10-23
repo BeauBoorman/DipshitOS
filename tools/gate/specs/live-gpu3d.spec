@@ -2,7 +2,7 @@
 # (GPUTRIANGLE.ELF) drives the opt-in VIR1 render device over the real seat
 # -> broker -> Metal path; the private profile's raw BGRA readback export and
 # the VZ scanout are pixel-proven by f1's independent comparator/geometry.
-# Fourteen independent boots, one leg each: 01 triangle, 02 mixed margins,
+# Fifteen independent boots, one leg each: 01 triangle, 02 mixed margins,
 # 03 resize/second generation, 04 close/reuse, 05 native-only (no render
 # device), 06 malformed/auth (invalid battery + forged kind-17), 07
 # wrong/stale fence, 08 stall/timeout + next-open drain, 09 M111b GPU
@@ -10,7 +10,9 @@
 # GOINFER stub-model inference K=5, 11 GOINFER on a device-less boot, 12
 # GOINFER weights-absent honesty, 13 GOINFER owner-approved model
 # (SmolLM2-135M-Instruct, Apache-2.0) K=5 decode when a VIW is staged, 14
-# GOINFER hostile .VIW named refusal (swapped-shape embed).
+# GOINFER hostile .VIW named refusal (swapped-shape embed), 15 the virgl
+# coverage matrix (#3176 — every attach prints the observed verdict per
+# probe; the leg asserts the pinned refusal names).
 # `wm=none`
 # is seeded so the seat is the spec's own scripted exec; every leg ends on
 # a marker only its script can print. Leg 05 RUNS FIRST: the seed share is
@@ -21,7 +23,7 @@
 # device/app never ran cannot pass. HOST PREREQUISITE (fails honestly):
 #   bash tools/go/build-gotabwm.sh tools/go/build-gputriangle.sh
 
-vgate_name live-gpu3d "M102f2 #2171: guest triangle through real VIR1/Metal into the native 2D seat, 14 legs, raw-BGRA readback + scanout pixels + fence/timeout lifecycle + M111b #2409 slot-90 compute round trip + M111c #2410 GOINFER stub-model + owner-approved SmolLM2 inference + hostile .VIW named refusal"
+vgate_name live-gpu3d "M102f2 #2171: guest triangle through real VIR1/Metal into the native 2D seat, 15 legs, raw-BGRA readback + scanout pixels + fence/timeout lifecycle + M111b #2409 slot-90 compute round trip + M111c #2410 GOINFER stub-model + owner-approved SmolLM2 inference + hostile .VIW named refusal + virgl coverage matrix #3176"
 vgate_share seed
 vgate_runner_flags -Xswiftc -DSPIKE
 
@@ -748,3 +750,51 @@ vgate_assert 14 serial-absent 'gpu3d: timeout'
 vgate_assert 14 serial-absent 'gpu3d: badresp'
 vgate_assert 14 output-contains 'compute-submits=0'
 vgate_assert 14 output-contains 'refusals=0'
+
+# --- leg 15: the virgl coverage matrix (issue #3176) ----------------------
+# Every --gpu3d-metal attach replays VirglCoverage's probe battery through
+# the real VirglStreamDecoder — the same decode MetalRenderer's
+# gpu3dSubmit runs — and prints one observed verdict per probe plus the
+# two field-space sweep rows. This boot asserts the pinned boundary: each
+# refused probe's NAMED rejection. A decoder that accepts a refused
+# command, or names a refusal differently, drops the line its assert
+# wants (or prints DRIFT) — growing the accepted set is a deliberate
+# matrix edit, never silent.
+vgate_run 15 -- \
+    --screen '$RUN_DIR/screen-15' \
+    --gpu3d-metal \
+    --script '$RUN_DIR/script-seat.txt' \
+    --script2 '$RUN_DIR/script-rx.txt' \
+    --script2-after 'gotabwm: holding seat' \
+    --script-expect 'rx-g3-ok' --timeout 180
+
+vgate_assert 15 serial-contains 'gpu3d: armed did=0x1083'
+vgate_assert 15 serial-absent 'gpu3d: timeout'
+vgate_assert 15 serial-absent 'gpu3d: badresp'
+vgate_assert 15 output-contains 'gpu3d-matrix: canonical: accepted'
+vgate_assert 15 output-contains 'gpu3d-matrix: nop-tail-4096: accepted'
+vgate_assert 15 output-contains 'gpu3d-matrix: nop-only: accepted'
+vgate_assert 15 output-contains 'gpu3d-matrix: empty: refused:empty'
+vgate_assert 15 output-contains 'gpu3d-matrix: misaligned: refused:misaligned'
+vgate_assert 15 output-contains 'gpu3d-matrix: over-cap: refused:overCap'
+vgate_assert 15 output-contains 'gpu3d-matrix: truncated: refused:truncatedCommand'
+vgate_assert 15 output-contains 'gpu3d-matrix: nop-nonzero: refused:malformedNOP'
+vgate_assert 15 output-contains 'gpu3d-matrix: nop-midstream: refused:malformedNOP'
+vgate_assert 15 output-contains 'gpu3d-matrix: unknown-cmd: refused:unknownCommand'
+vgate_assert 15 output-contains 'gpu3d-matrix: unknown-obj: refused:unknownObject'
+vgate_assert 15 output-contains 'gpu3d-matrix: dead-handle: refused:deadHandle'
+vgate_assert 15 output-contains 'gpu3d-matrix: bad-arity: refused:badArity'
+vgate_assert 15 output-contains 'gpu3d-matrix: bad-reference: refused:badReference'
+vgate_assert 15 output-contains 'gpu3d-matrix: unarmed-clear: refused:unmetPrecondition'
+vgate_assert 15 output-contains 'gpu3d-matrix: unarmed-draw: refused:unmetPrecondition'
+vgate_assert 15 output-contains 'gpu3d-matrix: bad-handle: refused:badHandle'
+vgate_assert 15 output-contains 'gpu3d-matrix: bad-field: refused:badField'
+vgate_assert 15 output-contains 'gpu3d-matrix: shader-handle-type: refused:shaderHandleType'
+vgate_assert 15 output-contains 'gpu3d-matrix: shader-framing: refused:shaderFraming'
+vgate_assert 15 output-contains 'gpu3d-matrix: shader-text: refused:shaderText'
+vgate_assert 15 output-contains 'gpu3d-matrix: object-field-set: refused:objectFieldSet'
+vgate_assert 15 output-contains 'gpu3d-matrix: second-draw: refused:unmetPrecondition'
+vgate_assert 15 output-contains 'gpu3d-matrix: leaked-object: refused:leakedObjects'
+vgate_assert 15 output-contains 'gpu3d-matrix: cmd-space handled=0,1,2,3,4,5,6,7,8,30 refused-unknownCommand=246'
+vgate_assert 15 output-contains 'gpu3d-matrix: obj-space handled=1,2,3,4,5,8 refused-unknownObject=250'
+vgate_assert 15 output-contains 'gpu3d-matrix: pinned 24/24 probes'

@@ -496,6 +496,55 @@ final class GPU3DRendererTests: XCTestCase {
         XCTAssertEqual(renderer.drawsEncoded, 0)
     }
 
+    // MARK: - The coverage matrix (M185a, issue #3176)
+
+    /// The battery's canonical builder must produce byte-identical
+    /// output to c1's committed fixture — the matrix's accepted row is
+    /// the SAME stream the guest emits, so this comparison keeps the
+    /// in-module builder honest against the guest's real encoder.
+    func testMatrixCanonicalIsTheFixture() {
+        XCTAssertEqual(VirglCoverage.canonicalStream(), fixtureStream())
+    }
+
+    /// Every probe row's observed verdict IS the pinned one, and both
+    /// field-space sweeps return exactly the profile's sets — the
+    /// class-A half of the matrix pin (live-gpu3d's matrix leg asserts
+    /// the same names on the runner's stdout class-B).
+    func testMatrixProbesAllPinned() {
+        var count = 0
+        for r in VirglCoverage.run() {
+            count += 1
+            XCTAssertTrue(r.pinned,
+                          "probe \(r.label) drifted: observed \(r.verdict)")
+        }
+        XCTAssertEqual(count, 24, "the battery covers every refusal row")
+        XCTAssertEqual(VirglCoverage.cmdSweep(), [0, 1, 2, 3, 4, 5, 6, 7, 8, 30])
+        XCTAssertEqual(VirglCoverage.objSweep(), [1, 2, 3, 4, 5, 8])
+        // The report the runner prints at attach: no DRIFT line, the
+        // pinned summary, and every row's named verdict present.
+        let report = VirglCoverage.report()
+        XCTAssertFalse(report.contains { $0.contains("DRIFT") },
+                       "report shows drift: \(report.filter { $0.contains("DRIFT") })")
+        XCTAssertTrue(report.contains("gpu3d-matrix: pinned 24/24 probes"))
+        for name in ["canonical: accepted", "empty: refused:empty",
+                     "unknown-cmd: refused:unknownCommand",
+                     "unknown-obj: refused:unknownObject",
+                     "bad-arity: refused:badArity",
+                     "bad-field: refused:badField",
+                     "bad-handle: refused:badHandle",
+                     "dead-handle: refused:deadHandle",
+                     "shader-handle-type: refused:shaderHandleType",
+                     "shader-framing: refused:shaderFraming",
+                     "shader-text: refused:shaderText",
+                     "bad-reference: refused:badReference",
+                     "object-field-set: refused:objectFieldSet",
+                     "second-draw: refused:unmetPrecondition",
+                     "leaked-object: refused:leakedObjects"] {
+            XCTAssertTrue(report.contains("gpu3d-matrix: \(name)"),
+                          "report missing row \(name)")
+        }
+    }
+
     // MARK: - Real Metal pixels
 
     /// The full happy path through the device + real Metal: upload,

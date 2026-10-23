@@ -596,6 +596,80 @@ Non-PCI platform facts:
 - The project targets Apple silicon / Virtualization.framework only; there
   is no QEMU path.
 
+## GPU3D device — the VIR1 stream coverage matrix (issue #3176)
+
+The experimental render/compute device (`--gpu3d-metal`, PCI
+`1af4:1083`, virtio device ID `0x43`) carries two private capability
+profiles inside virtio-gpu control envelopes: `VIR1` v1 (render) and
+`VIC1` v1 (compute, ADR 0053). `SUBMIT_3D` payloads are a frozen virgl
+command stream the host decodes WHOLE before any Metal work exists
+(`VirglStreamDecoder` in `host/vm-runner/Sources/VMGPU3D/VirglDecoder.swift`);
+a malformed tail executes no prefix.
+
+Every row below is **[observed]**: produced by an actual decode, never
+read out of the virgl spec. `VirglCoverage` (same file) re-encodes the
+pinned canonical stream — byte-identical to
+`test/fixtures/gpu3d/triangle.words`, which is byte-identical to what
+`kernel/src/gpu3d_stream.zig` emits — plus one hostile probe per named
+refusal, and replays them through `decode` at every `--gpu3d-metal`
+attach; the `live-gpu3d` matrix leg (run 15) pins the printed names and
+`GPU3DRendererTests` pins the same battery class-A. A decoder verdict
+that drifts fails both — growing the accepted set is a deliberate
+matrix + gate-leg edit, never silent.
+
+### Command space (opcode = header bits [7:0]; payload-word count [31:16] excludes the header)
+
+| opcode | command | verdict |
+|-------:|---------|---------|
+| 0 | NOP | **accepted** — the only sanctioned padding: exactly `0x00000000`, tail only (a nonzero field or a real command after padding is `malformedNOP`) |
+| 1 | CREATE_OBJECT | **accepted** for the six object kinds in the next table; any other kind is `unknownObject` |
+| 2 | BIND_OBJECT | **accepted** — arity 1, a live handle of the declared kind (`badArity`, `deadHandle`) |
+| 3 | DESTROY_OBJECT | **accepted** — same handle rule; the object table must return to baseline at stream end (`leakedObjects`) |
+| 4 | SET_VIEWPORT_STATE | **accepted** — arity 7, the pinned scale/translate for the surface's created extent; requires framebuffer state first (`unmetPrecondition`, else `objectFieldSet`/`badArity`/`badField`) |
+| 5 | SET_FRAMEBUFFER_STATE | **accepted** — arity 3: one cbuf naming the live surface handle, no depth surface (`badField`) |
+| 6 | SET_VERTEX_BUFFERS | **accepted** — arity 3: stride 32, offset 0, a live `target_buffer` resource (`badReference`) |
+| 7 | CLEAR | **accepted** — arity 8: `PIPE_CLEAR_COLOR0` only, depth f64 1.0, stencil 0; the RGBA words are the only free fields; requires framebuffer state (`unmetPrecondition`) |
+| 8 | DRAW_VBO | **accepted** — arity 12, verbatim the pinned non-indexed 3-vertex TRIANGLES draw; at most one per stream with every state object bound (`unmetPrecondition`) |
+| 30 | BIND_SHADER | **accepted** — arity 2, a live shader handle whose stage matches (`deadHandle`) |
+| 9–29, 31–255 | — | **`unknownCommand`** — never emitted by the guest; sweep-proven: all 256 opcode values are decoded and only the ten rows above carry a case (246 refused) |
+
+### Object space (header bits [15:8], on CREATE_OBJECT)
+
+| kind | object | pinned handle | verdict |
+|-----:|--------|--------------:|---------|
+| 1 | blend | 3 | **accepted** — arity 11: two zero words + eight identical pinned per-target words (`badField`) |
+| 2 | rasterizer | 4 | **accepted** — arity 9: pinned `s0` + the fixed float row |
+| 3 | dsa | 5 | **accepted** — arity 5: all-zero state |
+| 4 | shader | 6 vertex / 7 fragment | **accepted** — `shaderHandleType` on a handle/stage mismatch, `shaderFraming` on a bad offset/num_tokens/NUL-pad shape, `shaderText` when the text is not byte-identical to the pinned fixture for its stage, `badField` on a stage outside 0/1 |
+| 5 | vertex-elements | 2 | **accepted** — arity 9: position float4 @0 + color float4 @16, buffer 0 |
+| 8 | surface | 1 | **accepted** — arity 5: BGRA8, level 0, layer 0, naming a live `target_2d` resource of matching format (`badField`, `badHandle`) |
+| 0, 6–7, 9–255 | — | — | **`unknownObject`** — never emitted; sweep-proven refused (250 kinds) |
+
+### Stream hygiene (before/between commands)
+
+| probe | verdict |
+|-------|---------|
+| empty stream | `empty` |
+| byte count not a multiple of 4 | `misaligned` |
+| stream over the 4,096-byte bound | `overCap` |
+| a declared payload running past stream end | `truncatedCommand` |
+| NOP word with a nonzero field, or a real command after NOP padding began | `malformedNOP` |
+| live objects remaining at stream end | `leakedObjects` |
+
+### Compute vs. graphics verdict
+
+The accepted set **already admits graphics objects** — the whole pinned
+zoo (surface, blend, rasterizer, dsa, the two fixture shaders, vertex
+elements, viewport/framebuffer/vertex-buffer state, clear, and the one
+draw) — but only inside the single frozen arrangement above; it is not
+a general graphics surface. Compute never rides this stream at all:
+`COMPUTE_SUBMIT` (envelope type `0x0400`) is a separate dispatch-level
+command validated by `GPU3DDevice` (`unknownKernel`/`badKernelShape`/
+`badKernelBinding`), so this matrix governs render submissions only.
+Consequence for the consumer card (#3177): a compute consumer rides
+`sys_gpucomp` untouched by this matrix; a graphics consumer fits inside
+the pinned frame shape or the matrix changes deliberately.
+
 ## Capacity bounds (measured ceilings)
 
 M129c (#2612): every row below is a deliberate bound, not a stall — a

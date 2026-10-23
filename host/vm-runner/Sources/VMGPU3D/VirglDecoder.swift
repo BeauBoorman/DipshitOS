@@ -562,3 +562,373 @@ public enum VirglStreamDecoder {
             | UInt32(stream[at + 3]) << 24
     }
 }
+
+extension VirglStreamRejection {
+    /// The stable case name — the coverage matrix's verdict column and
+    /// the gate leg's printed report both key on it, so renaming a case
+    /// is a deliberate contract edit, not drift.
+    public var name: String {
+        switch self {
+        case .misaligned: return "misaligned"
+        case .empty: return "empty"
+        case .overCap: return "overCap"
+        case .truncatedCommand: return "truncatedCommand"
+        case .malformedNOP: return "malformedNOP"
+        case .unknownCommand: return "unknownCommand"
+        case .unknownObject: return "unknownObject"
+        case .objectFieldSet: return "objectFieldSet"
+        case .badArity: return "badArity"
+        case .badField: return "badField"
+        case .badHandle: return "badHandle"
+        case .deadHandle: return "deadHandle"
+        case .shaderHandleType: return "shaderHandleType"
+        case .shaderFraming: return "shaderFraming"
+        case .shaderText: return "shaderText"
+        case .badReference: return "badReference"
+        case .unmetPrecondition: return "unmetPrecondition"
+        case .leakedObjects: return "leakedObjects"
+        }
+    }
+}
+
+// MARK: - The coverage matrix (M185a, issue #3176)
+//
+// The virgl subset the host accepts, as executable data. `probes`
+// re-encodes the pinned canonical stream and crafts one hostile stream
+// per named refusal; `run` feeds every probe through the REAL
+// `VirglStreamDecoder.decode` (the same call `GPU3DMetalRenderer` makes
+// inside `gpu3dSubmit`) and `report` renders the observed verdicts.
+// Every matrix row in docs/hardware-contract.md is one of these
+// observations — never a row read out of the virgl spec. The runner
+// prints the report at every --gpu3d-metal attach, the live-gpu3d
+// matrix leg asserts the names, and `GPU3DRendererTests` pins the same
+// battery class-A: a decoder that starts accepting a refused command,
+// or names a refusal differently, drops the line the leg asserts.
+public enum VirglCoverage {
+
+    /// One boundary probe: a crafted stream and the verdict the decoder
+    /// must produce for it. `expected` nil means the stream must decode
+    /// (an accepted row of the matrix).
+    public struct Probe {
+        public let label: String
+        public let stream: [UInt8]
+        public let expected: VirglStreamRejection?
+    }
+
+    /// One probe's run: the pinned expectation beside the OBSERVED
+    /// decode result.
+    public struct Outcome {
+        public let label: String
+        public let expected: VirglStreamRejection?
+        public let observed: Result<VirglDecodedFrame, VirglStreamRejection>
+        /// The row holds when the observed verdict IS the expected one.
+        public var pinned: Bool {
+            switch (expected, observed) {
+            case (nil, .success): return true
+            case let (e?, .failure(o)): return e == o
+            default: return false
+            }
+        }
+        /// The rendered verdict: `accepted` or `refused:<caseName>`.
+        public var verdict: String {
+            switch observed {
+            case .success: return "accepted"
+            case .failure(let r): return "refused:" + r.name
+            }
+        }
+    }
+
+    /// The fixed resource table every probe decodes against — exactly
+    /// the pair the canonical stream names: res 1 the 256x192 BGRA8
+    /// target-2D surface, res 2 the 96-byte vertex buffer.
+    public static var probeResources: [UInt32: GPU3DWire.ResourceCreate] {
+        [
+            1: GPU3DWire.ResourceCreate(
+                resourceID: 1, target: VirglStreamConst.target2D,
+                format: VirglStreamConst.formatBGRA8, bind: 2,
+                width: 256, height: 192, depth: 1, arraySize: 1,
+                lastLevel: 0, nrSamples: 0, flags: 0),
+            2: GPU3DWire.ResourceCreate(
+                resourceID: 2, target: VirglStreamConst.targetBuffer,
+                format: 0, bind: 16,
+                width: 96, height: 1, depth: 1, arraySize: 1,
+                lastLevel: 0, nrSamples: 0, flags: 0),
+        ]
+    }
+
+    // ---- Stream construction ------------------------------------------
+
+    private static func hdr(_ cmd: UInt32, _ obj: UInt32, _ len: UInt32) -> UInt32 {
+        cmd | (obj << 8) | (len << 16)
+    }
+
+    private static func bytes(_ words: [UInt32]) -> [UInt8] {
+        var out: [UInt8] = []
+        out.reserveCapacity(words.count * 4)
+        for v in words {
+            out.append(UInt8(v & 0xff))
+            out.append(UInt8((v >> 8) & 0xff))
+            out.append(UInt8((v >> 16) & 0xff))
+            out.append(UInt8((v >> 24) & 0xff))
+        }
+        return out
+    }
+
+    /// Re-encode the pinned canonical frame stream (word list): the same
+    /// bytes kernel/src/gpu3d_stream.zig's encode_frame produces for
+    /// ctx 1 at the full 256x192 extent — the triangle.words fixture pins
+    /// them byte-for-byte and the test suite compares, so this builder
+    /// can never drift away from the guest's real stream. Every hostile
+    /// probe below is this stream with one field broken.
+    public static func canonicalWords(
+        resColor: UInt32 = 1, resVBO: UInt32 = 2,
+        width: UInt32 = 256, height: UInt32 = 192,
+        clear: SIMD4<Float> = .init(0, 0, 0, 1)
+    ) -> [UInt32] {
+        var w: [UInt32] = []
+        func emit(_ cmd: UInt32, _ obj: UInt32, _ payload: [UInt32]) {
+            w.append(hdr(cmd, obj, UInt32(payload.count)))
+            w.append(contentsOf: payload)
+        }
+        func shader(_ handle: UInt32, _ type: UInt32, _ text: String) {
+            let text = Array(text.utf8)
+            let words = (text.count + 1 + 3) / 4
+            var payload: [UInt32] = [handle, type, UInt32(words), UInt32(words), 0]
+            for i in 0..<words {
+                var v: UInt32 = 0
+                for j in 0..<4 where i * 4 + j < text.count {
+                    v |= UInt32(text[i * 4 + j]) << (8 * j)
+                }
+                payload.append(v)
+            }
+            emit(VirglStreamCmd.createObject, VirglStreamObject.shader, payload)
+        }
+        let one = Float(1).bitPattern
+        let w2 = (Float(width) / 2).bitPattern
+        let h2 = (Float(height) / 2).bitPattern
+        let C = VirglStreamCmd.self
+        let O = VirglStreamObject.self
+        let K = VirglStreamConst.self
+        emit(C.createObject, O.surface,
+             [K.handleSurface, resColor, K.formatBGRA8, 0, 0])
+        emit(C.createObject, O.vertexElements,
+             [K.handleVertexElements, 0, 0, 0, K.formatRGBA32F,
+              16, 0, 0, K.formatRGBA32F])
+        emit(C.createObject, O.blend,
+             [K.handleBlend, 0, 0]
+             + [UInt32](repeating: K.blendRTWord, count: 8))
+        emit(C.createObject, O.rasterizer,
+             [K.handleRasterizer, K.rasterizerS0, one, 0, 0, one, 0, 0, 0])
+        emit(C.createObject, O.dsa, [K.handleDSA, 0, 0, 0, 0])
+        shader(K.handleVertexShader, K.shaderVertex, K.vertexShaderText)
+        shader(K.handleFragmentShader, K.shaderFragment, K.fragmentShaderText)
+        emit(C.bindShader, 0, [K.handleVertexShader, K.shaderVertex])
+        emit(C.bindShader, 0, [K.handleFragmentShader, K.shaderFragment])
+        emit(C.bindObject, O.blend, [K.handleBlend])
+        emit(C.bindObject, O.rasterizer, [K.handleRasterizer])
+        emit(C.bindObject, O.dsa, [K.handleDSA])
+        emit(C.bindObject, O.vertexElements, [K.handleVertexElements])
+        emit(C.setFramebufferState, 0, [1, 0, K.handleSurface])
+        emit(C.setViewportState, 0, [0, w2, h2, one, w2, h2, 0])
+        emit(C.setVertexBuffers, 0, [K.vertexStride, 0, resVBO])
+        emit(C.clear, 0, [K.clearColor0, clear.x.bitPattern, clear.y.bitPattern,
+                          clear.z.bitPattern, clear.w.bitPattern,
+                          0, 0x3ff0_0000, 0])
+        emit(C.drawVbo, 0, [0, K.vertexCount, K.primTriangles,
+                            0, 1, 0, 0, 0, 0, 0, 2, 0])
+        emit(C.destroyObject, O.shader, [K.handleFragmentShader])
+        emit(C.destroyObject, O.shader, [K.handleVertexShader])
+        emit(C.destroyObject, O.dsa, [K.handleDSA])
+        emit(C.destroyObject, O.rasterizer, [K.handleRasterizer])
+        emit(C.destroyObject, O.blend, [K.handleBlend])
+        emit(C.destroyObject, O.vertexElements, [K.handleVertexElements])
+        emit(C.destroyObject, O.surface, [K.handleSurface])
+        return w
+    }
+
+    /// The canonical stream as wire bytes (660 B for the default spec).
+    public static func canonicalStream() -> [UInt8] { bytes(canonicalWords()) }
+
+    // ---- The probe battery --------------------------------------------
+
+    /// Every coverage row, in matrix order: the accepted rows first,
+    /// then one probe per named refusal the decoder can produce. The
+    /// expected values pin the FULL rejection (associated offsets
+    /// included) — the streams are fixed, so every field is stable.
+    public static var probes: [Probe] {
+        let canon = canonicalWords()
+        var out: [Probe] = []
+        func accept(_ label: String, _ words: [UInt32]) {
+            out.append(Probe(label: label, stream: bytes(words), expected: nil))
+        }
+        func refuse(_ label: String, _ stream: [UInt8], _ why: VirglStreamRejection) {
+            out.append(Probe(label: label, stream: stream, expected: why))
+        }
+        func refuseWords(_ label: String, _ words: [UInt32], _ why: VirglStreamRejection) {
+            refuse(label, self.bytes(words), why)
+        }
+        // --- accepted rows ---
+        accept("canonical", canon)
+        accept("nop-tail-4096", canon + [UInt32](repeating: 0, count: 1024 - canon.count))
+        accept("nop-only", [0])
+        // --- stream hygiene ---
+        refuse("empty", [], .empty)
+        refuse("misaligned", [0xAA, 0xAA, 0xAA], .misaligned(count: 3))
+        refuse("over-cap",
+               bytes(canon + [UInt32](repeating: 0, count: 1025 - canon.count)),
+               .overCap(count: 4100))
+        refuseWords("truncated", [hdr(VirglStreamCmd.createObject,
+                                      VirglStreamObject.surface, 5)],
+                    .truncatedCommand(offset: 0))
+        refuseWords("nop-nonzero", [hdr(VirglStreamCmd.nop, 0, 1), 0],
+                    .malformedNOP(offset: 0))
+        refuseWords("nop-midstream", [0, hdr(VirglStreamCmd.createObject,
+                                             VirglStreamObject.surface, 0)],
+                    .malformedNOP(offset: 4))
+        // --- namespace rows ---
+        refuseWords("unknown-cmd", [hdr(9, 0, 0)], .unknownCommand(cmd: 9, offset: 0))
+        refuseWords("unknown-obj", [hdr(VirglStreamCmd.createObject, 9, 0)],
+                    .unknownObject(obj: 9, offset: 0))
+        refuseWords("dead-handle", [hdr(VirglStreamCmd.bindObject,
+                                        VirglStreamObject.blend, 1), 9],
+                    .deadHandle(handle: 9, offset: 0))
+        refuseWords("bad-arity",
+                    [hdr(VirglStreamCmd.createObject, VirglStreamObject.surface, 4),
+                     1, 1, 1, 0],
+                    .badArity(cmd: VirglStreamCmd.createObject,
+                              obj: VirglStreamObject.surface,
+                              declared: 4, expected: 5, offset: 0))
+        refuseWords("bad-reference",
+                    [hdr(VirglStreamCmd.setVertexBuffers, 0, 3),
+                     VirglStreamConst.vertexStride, 0, 99],
+                    .badReference(offset: 0))
+        // --- precondition rows (single commands, nothing armed) ---
+        refuseWords("unarmed-clear",
+                    [hdr(VirglStreamCmd.clear, 0, 8),
+                     VirglStreamConst.clearColor0, 0, 0, 0, Float(1).bitPattern,
+                     0, 0x3ff0_0000, 0],
+                    .unmetPrecondition(cmd: VirglStreamCmd.clear, offset: 0))
+        refuseWords("unarmed-draw",
+                    [hdr(VirglStreamCmd.drawVbo, 0, 12),
+                     0, VirglStreamConst.vertexCount, VirglStreamConst.primTriangles,
+                     0, 1, 0, 0, 0, 0, 0, 2, 0],
+                    .unmetPrecondition(cmd: VirglStreamCmd.drawVbo, offset: 0))
+        // --- canonical mutations (field/ordering rows) ---
+        var m = canon
+        m[1] = 9 // surface create: invented handle
+        refuseWords("bad-handle", m, .badHandle(handle: 9,
+                                                obj: VirglStreamObject.surface,
+                                                offset: 0))
+        m = canon
+        m[30] = 0 // rasterizer s0
+        refuseWords("bad-field", m, .badField(cmd: VirglStreamCmd.createObject,
+                                              obj: VirglStreamObject.rasterizer,
+                                              payloadWord: 1, offset: 112))
+        m = canon
+        m[45] = VirglStreamConst.handleFragmentShader // vertex shader's handle
+        refuseWords("shader-handle-type", m,
+                    .shaderHandleType(handle: VirglStreamConst.handleFragmentShader,
+                                      type: VirglStreamConst.shaderVertex,
+                                      offset: 176))
+        m = canon
+        m[47] = 26 // vertex shader offset word (wants 27)
+        refuseWords("shader-framing", m, .shaderFraming(offset: 176))
+        m = canon
+        m[50] ^= 0xff // first vertex-shader text byte
+        refuseWords("shader-text", m, .shaderText(offset: 176))
+        m = canon
+        m[138] |= 1 << 8 // DRAW_VBO carrying an object field
+        refuseWords("object-field-set", m,
+                    .objectFieldSet(cmd: VirglStreamCmd.drawVbo, offset: 552))
+        m = Array(canon[0..<151]) + Array(canon[138..<151]) + Array(canon[151...])
+        refuseWords("second-draw", m,
+                    .unmetPrecondition(cmd: VirglStreamCmd.drawVbo, offset: 604))
+        m = Array(canon[0..<163]) + [0, 0] // surface destroy dropped, tail-padded
+        refuseWords("leaked-object", m, .leakedObjects(count: 1))
+        return out
+    }
+
+    /// Run the whole battery against `resources` — every row is the
+    /// decoder's actual verdict on a real stream.
+    public static func run(
+        resources: [UInt32: GPU3DWire.ResourceCreate] = probeResources
+    ) -> [Outcome] {
+        probes.map { p in
+            Outcome(label: p.label, expected: p.expected,
+                    observed: VirglStreamDecoder.decode(p.stream,
+                                                        resources: resources))
+        }
+    }
+
+    // ---- Field-space sweeps --------------------------------------------
+
+    /// Feed one zero-payload command header for every opcode value
+    /// (the field is 8 bits — this is the whole space). Any verdict but
+    /// `unknownCommand` means the opcode carries a decode case, so the
+    /// returned list IS the complete accepted-command set.
+    public static func cmdSweep(
+        resources: [UInt32: GPU3DWire.ResourceCreate] = probeResources
+    ) -> [UInt32] {
+        (0...255).filter { cmd in
+            let s = bytes([hdr(UInt32(cmd), 0, 0)])
+            if case .failure(let r) = VirglStreamDecoder.decode(s, resources: resources),
+               case .unknownCommand = r {
+                return false
+            }
+            return true
+        }
+    }
+
+    /// Feed CREATE_OBJECT for every object-kind value (payload len 0 —
+    /// an allowed kind lands on its arity check, proving the kind has a
+    /// decode case). The returned list IS the complete accepted-object
+    /// set; every other kind refuses `unknownObject`.
+    public static func objSweep(
+        resources: [UInt32: GPU3DWire.ResourceCreate] = probeResources
+    ) -> [UInt32] {
+        (0...255).filter { obj in
+            let s = bytes([hdr(VirglStreamCmd.createObject, UInt32(obj), 0)])
+            if case .failure(let r) = VirglStreamDecoder.decode(s, resources: resources),
+               case .unknownObject = r {
+                return false
+            }
+            return true
+        }
+    }
+
+    // ---- The report the runner prints ---------------------------------
+
+    /// The battery as output lines — `gpu3d-matrix:` prefixed so the
+    /// gate leg greps them. A probe whose observed verdict is not the
+    /// pinned one prints `DRIFT` with both verdicts instead of the row
+    /// line, so a regression fails the leg's asserts loudly.
+    public static func report(
+        resources: [UInt32: GPU3DWire.ResourceCreate] = probeResources
+    ) -> [String] {
+        var lines: [String] = []
+        var pinned = 0
+        let results = run(resources: resources)
+        for r in results {
+            if r.pinned {
+                pinned += 1
+                lines.append("gpu3d-matrix: \(r.label): \(r.verdict)")
+            } else {
+                let want = r.expected.map { "refused:" + $0.name } ?? "accepted"
+                lines.append("gpu3d-matrix: DRIFT \(r.label): want \(want), got \(r.verdict)")
+            }
+        }
+        let cmds = cmdSweep(resources: resources)
+        let objs = objSweep(resources: resources)
+        lines.append("gpu3d-matrix: cmd-space handled=\(cmds.map(String.init).joined(separator: ",")) refused-unknownCommand=\(256 - cmds.count)")
+        lines.append("gpu3d-matrix: obj-space handled=\(objs.map(String.init).joined(separator: ",")) refused-unknownObject=\(256 - objs.count)")
+        lines.append("gpu3d-matrix: pinned \(pinned)/\(results.count) probes")
+        return lines
+    }
+
+    /// Print the report — the attach path's evidence line set.
+    public static func printReport(
+        resources: [UInt32: GPU3DWire.ResourceCreate] = probeResources
+    ) {
+        for line in report(resources: resources) { print(line) }
+    }
+}

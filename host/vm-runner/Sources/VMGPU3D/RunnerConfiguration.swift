@@ -18,7 +18,8 @@
 //     never a software/non-MIT/QEMU substitute.
 //   * `--gpu3d-test-mode` completion-fault selection exists only under
 //     SPIKE compilation; the ordinary build rejects the knob by name.
-//   * Reporting is identity + lifecycle counters only — never token
+//   * Reporting is identity + lifecycle counters + the virgl coverage
+//     matrix (#3176 — verdict lines at attach) only — never token
 //     contents, never guest memory bytes.
 //
 // The VZ/guest-memory glue at the bottom compiles only under -DSPIKE
@@ -276,8 +277,14 @@ public final class GPU3DRunnerAttachment {
             if let mode = options.testMode {
                 GPU3DRunnerConfiguration.applyTestMode(mode, to: renderer)
             }
-            return .success(GPU3DRunnerAttachment(host: host, renderer: renderer,
-                                                  memory: memory, options: options))
+            let attachment = GPU3DRunnerAttachment(host: host, renderer: renderer,
+                                                   memory: memory, options: options)
+            // M185a (issue #3176): every attach re-derives the virgl
+            // coverage matrix through the real decoder — the printed
+            // verdict lines are gate evidence, and a decoder drift
+            // lands as a DRIFT line the live-gpu3d matrix leg fails on.
+            VirglCoverage.printReport()
+            return .success(attachment)
         }
     }
 
