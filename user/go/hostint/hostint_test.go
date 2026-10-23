@@ -154,7 +154,7 @@ func TestDecodeRefusals(t *testing.T) {
 		"short":      good[:HeaderLen+MACLen-1],
 		"oversize":   make([]byte, RecordMax+1),
 		"bad magic":  append(append([]byte{}, "BAD!"...), good[4:]...),
-		"bad tag":    append(append([]byte{}, good[:4]...), append([]byte{9, 0, 0, 0}, good[8:]...)...),
+		"bad tag":    append(append([]byte{}, good[:4]...), append([]byte{250, 0, 0, 0}, good[8:]...)...),
 		"plen drift": append(append([]byte{}, good[:16]...), append([]byte{5, 0}, good[18:]...)...),
 	}
 	for name, raw := range cases {

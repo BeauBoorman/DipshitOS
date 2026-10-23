@@ -25,7 +25,7 @@ import "virelai/shlib"
 //	0..3    magic  "VHI1"
 //	4       tag    u8: 0=ARMED 1=CLIP_OUT 2=CLIP_IN 3=NOTIFY_OUT 4=DROP
 //	               5=OUTBOX 6=NOTIFY_FOCUS (v2) 7=CLIP_OUT_T 8=CLIP_IN_T
-//	               (M124c typed clipboard)
+//	               (M124c typed clipboard) 9=DRAGOUT (M184b)
 //	5       flags  u8: bit0 TRUNCATED; bits 1-7 reserved (writer sends 0)
 //	6..7    sender_id u16le — the kernel window id the record is about;
 //	        v1 wrote reserved zeros, so v1 records carry 0 here and a v1
@@ -74,7 +74,11 @@ const (
 	// shape (the same call ParseName already makes per file).
 	TagClipOutT uint8 = 7 // g→h seat → runner: mime_len|mime|blob
 	TagClipInT  uint8 = 8 // h→g runner → seat: mime_len|mime|blob
-	tagCount           = 9
+	// M184b (#3175): the drag-out notice — a held drag's payload staged
+	// in OUTBOX/, signed like an OUTBOX record and riding the same lane
+	// bit; the sender is the source window id (the V2-D1 correlation).
+	TagDragOut uint8 = 9 // g→h seat → runner: the DROP shape, reversed
+	tagCount          = 10
 )
 
 // FlagTruncated is the record flags bit0: the producer cut the payload at
@@ -174,6 +178,8 @@ func tagStem(tag uint8) string {
 		return "CLIPTOUT"
 	case TagClipInT:
 		return "CLIPTIN"
+	case TagDragOut:
+		return "DRAGOUT"
 	}
 	return ""
 }
@@ -199,6 +205,8 @@ func stemTag(stem string) (uint8, bool) {
 		return TagClipOutT, true
 	case "CLIPTIN":
 		return TagClipInT, true
+	case "DRAGOUT":
+		return TagDragOut, true
 	}
 	return 0, false
 }
@@ -219,6 +227,8 @@ func LaneName(tag uint8) string {
 		return "notify"
 	case TagOutbox:
 		return "outbox"
+	case TagDragOut:
+		return "dragout"
 	}
 	return ""
 }
@@ -233,7 +243,7 @@ func LaneBit(tag uint8) uint8 {
 		return LaneDrop
 	case TagNotifyOut, TagNotifyFocus:
 		return LaneNotify
-	case TagOutbox:
+	case TagOutbox, TagDragOut:
 		return LaneOutbox
 	}
 	return 0

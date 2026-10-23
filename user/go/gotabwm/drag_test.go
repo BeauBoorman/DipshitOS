@@ -12,6 +12,7 @@ import (
 	"strings"
 	"testing"
 
+	"virelai/hostint"
 	"virelai/vi"
 )
 
@@ -34,6 +35,7 @@ func (f *dragFixture) install(t *testing.T) {
 	t.Helper()
 	f.files = map[string][]byte{}
 	oldRead, oldWrite, oldDel := dragFileRead, dragFileWrite, dragFileDelete
+	oldOutW, oldOutD, oldOutE := dragOutWrite, dragOutDelete, dragOutExists
 	oldPost, oldLog := dragPost, dragLog
 	oldTabs := tabs
 	oldBind := rpcBindings
@@ -42,6 +44,7 @@ func (f *dragFixture) install(t *testing.T) {
 	oldDrag := drag
 	t.Cleanup(func() {
 		dragFileRead, dragFileWrite, dragFileDelete = oldRead, oldWrite, oldDel
+		dragOutWrite, dragOutDelete, dragOutExists = oldOutW, oldOutD, oldOutE
 		dragPost, dragLog = oldPost, oldLog
 		tabs = oldTabs
 		rpcBindings = oldBind
@@ -67,6 +70,21 @@ func (f *dragFixture) install(t *testing.T) {
 			return 0
 		}
 		return -2
+	}
+	dragOutWrite = func(path string, b []byte) int64 {
+		f.files[path] = append([]byte(nil), b...)
+		return 0
+	}
+	dragOutDelete = func(path string) int64 {
+		if _, ok := f.files[path]; ok {
+			delete(f.files, path)
+			return 0
+		}
+		return -vi.ErrENOENT
+	}
+	dragOutExists = func(path string) bool {
+		_, ok := f.files[path]
+		return ok
 	}
 	dragPost = func(target uint32, b []byte) int64 {
 		if m, ok := vi.DecodeWmRpc(b); ok {
@@ -462,5 +480,165 @@ func TestDragGhostPaints(t *testing.T) {
 	}
 	if _, once := dragGhostPaintMarker(true, true); once {
 		t.Fatal("the ghost marker is per-drag, not per-tick")
+	}
+}
+
+// M184b (#3175): a held-drag sample pinned on the scanout edge hands the
+// armed drag's payload to the host — the seat stages the blob into
+// OUTBOX/ under a minted name, signs a DRAGOUT record on the outbox
+// lane, and receipts the source delivered (applied=0: no guest window).
+func TestDragOutEdgeHandsOffToHost(t *testing.T) {
+	f := &dragFixture{}
+	f.install(t)
+	h := newHostintFixture(t, strings.Repeat("b7", 32))
+	hostintSeatInit()
+	h.plantArmed(0xBEEF, hostint.LaneOutbox)
+	hostintSeatTick()
+
+	f.hostTab(7, "GOFILES.ELF", 0, RailHeight, 400, 300)
+	rpcBindings[7] = rpcBinding{pid: 21, token: 0xAAAA}
+
+	blob := []byte("through the glass")
+	f.stage(7, "text/plain", blob)
+	if !applyRPC(dragBeginReq(7, "text/plain")) {
+		t.Fatal("drag_begin refused")
+	}
+	// The held sample pins x to the right scanout edge: the handoff.
+	handleDragPointer(vi.ScanoutWidth-1, 400, false)
+	if drag.armed {
+		t.Fatal("the drag stayed armed after the edge handoff")
+	}
+	// The staged payload: minted name from the mime, byte-equal blob.
+	staged, ok := f.files["/host/OUTBOX/GuestDrag.txt"]
+	if !ok || !bytes.Equal(staged, blob) {
+		t.Fatalf("staged = %v %x", ok, staged)
+	}
+	// The signed record: DRAGOUT-00000001, sender = the source window.
+	rec, rok := hostint.DecodeRecord(h.files["DRAGOUT-00000001"])
+	if !rok || rec.Tag != hostint.TagDragOut || rec.Seq != 1 ||
+		rec.Epoch != 0xBEEF || rec.Sender != 7 || !rec.Verify(h.key) {
+		t.Fatalf("record = %+v ok=%v", rec, rok)
+	}
+	name, size, ok := dropPayload(rec.Payload)
+	if !ok || name != "GuestDrag.txt" || size != uint64(len(blob)) {
+		t.Fatalf("payload = %q %d %v", name, size, ok)
+	}
+	if !h.hasLog(MarkerHostintDragOut+"seq=1 name=GuestDrag.txt") {
+		t.Fatalf("no emit marker: %v", h.logs)
+	}
+	// The source's receipt: Seq=1, applied=0 — delivered to no guest
+	// window, i.e. the host took it.
+	if len(f.notices) != 1 || f.notices[0].Kind != vi.WmRpcKindDragDrop ||
+		f.notices[0].Seq != 1 || f.notices[0].Applied != 0 ||
+		vi.WmAuth(f.notices[0]) != 0xAAAA {
+		t.Fatalf("notices = %+v", f.notices)
+	}
+}
+
+// Every boundary pixel counts as the edge: left column, top row, right
+// column, bottom row.
+func TestDragOutAtEdgeBounds(t *testing.T) {
+	for _, p := range [][2]uint32{{0, 400}, {400, 0},
+		{vi.ScanoutWidth - 1, 400}, {400, vi.ScanoutHeight - 1}} {
+		if !dragOutAtEdge(p[0], p[1]) {
+			t.Fatalf("(%d,%d) not an edge", p[0], p[1])
+		}
+	}
+	for _, p := range [][2]uint32{{1, 400}, {400, 1},
+		{vi.ScanoutWidth - 2, 400}, {400, vi.ScanoutHeight - 2}, {640, 360}} {
+		if dragOutAtEdge(p[0], p[1]) {
+			t.Fatalf("(%d,%d) an edge", p[0], p[1])
+		}
+	}
+}
+
+// No armed lane: the edge is an undelivered ending named "edge" — byte
+// silence holds (nothing staged, nothing emitted), the source gets the
+// cancel notice.
+func TestDragOutEdgeWithoutLaneAborts(t *testing.T) {
+	f := &dragFixture{}
+	f.install(t)
+	oldEng := hostintEngine
+	hostintEngine = nil
+	t.Cleanup(func() { hostintEngine = oldEng })
+
+	f.hostTab(7, "GOFILES.ELF", 0, RailHeight, 400, 300)
+	rpcBindings[7] = rpcBinding{pid: 21, token: 0xAAAA}
+	f.stage(7, "text/plain", []byte("x"))
+	applyRPC(dragBeginReq(7, "text/plain"))
+	handleDragPointer(vi.ScanoutWidth-1, 400, false)
+	if drag.armed {
+		t.Fatal("the drag stayed armed with no lane")
+	}
+	if !f.hasLog(MarkerDragCancel + "7 edge") {
+		t.Fatalf("no edge marker: %v", f.logs)
+	}
+	for path := range f.files {
+		if strings.HasPrefix(path, "/host/OUTBOX/") {
+			t.Fatalf("a payload staged with no lane: %s", path)
+		}
+	}
+	if len(f.notices) != 1 || f.notices[0].Kind != vi.WmRpcKindDragCancel {
+		t.Fatalf("notices = %+v", f.notices)
+	}
+}
+
+// An armed mask without lane_outbox: the emit refuses lane_disabled and
+// the staged payload is deleted before the abort — no partial file.
+func TestDragOutEdgeLaneDisabledCleansStage(t *testing.T) {
+	f := &dragFixture{}
+	f.install(t)
+	h := newHostintFixture(t, strings.Repeat("b7", 32))
+	hostintSeatInit()
+	h.plantArmed(3, hostint.LaneClip) // armed, but not the outbox bit
+	hostintSeatTick()
+
+	f.hostTab(7, "GOFILES.ELF", 0, RailHeight, 400, 300)
+	rpcBindings[7] = rpcBinding{pid: 21, token: 0xAAAA}
+	f.stage(7, "text/plain", []byte("x"))
+	applyRPC(dragBeginReq(7, "text/plain"))
+	handleDragPointer(vi.ScanoutWidth-1, 400, false)
+	if drag.armed {
+		t.Fatal("the drag stayed armed after the refusal")
+	}
+	if !h.hasLog(hostintMarkerPrefix + " refuse lane=dragout reason=" +
+		hostint.RefuseLaneDisabled) {
+		t.Fatalf("no lane_disabled refusal: %v", h.logs)
+	}
+	if _, ok := f.files["/host/OUTBOX/GuestDrag.txt"]; ok {
+		t.Fatal("a refused emit left its staged payload behind")
+	}
+	if _, ok := f.files["DRAGOUT-00000001"]; ok {
+		t.Fatal("a refused emit published a record")
+	}
+	if !f.hasLog(MarkerDragCancel + "7 edge") {
+		t.Fatalf("no edge marker: %v", f.logs)
+	}
+}
+
+// A name already parked in OUTBOX/ (an in-flight REQ export) gets the
+// landing suffix — the staged payload can never clobber it.
+func TestDragOutNameCollisionSuffixes(t *testing.T) {
+	f := &dragFixture{}
+	f.install(t)
+	h := newHostintFixture(t, strings.Repeat("b7", 32))
+	hostintSeatInit()
+	h.plantArmed(5, hostint.LaneOutbox)
+	hostintSeatTick()
+
+	f.files["/host/OUTBOX/GuestDrag.png"] = []byte("the pending export")
+	f.hostTab(7, "GOFILES.ELF", 0, RailHeight, 400, 300)
+	rpcBindings[7] = rpcBinding{pid: 21, token: 0xAAAA}
+	f.stage(7, "image/png", []byte{0x89, 'P', 'N', 'G'})
+	applyRPC(dragBeginReq(7, "image/png"))
+	handleDragPointer(vi.ScanoutWidth-1, 400, false)
+	if _, ok := f.files["/host/OUTBOX/GuestDrag-2.png"]; !ok {
+		t.Fatalf("no suffixed stage: %v", f.files)
+	}
+	if got := f.files["/host/OUTBOX/GuestDrag.png"]; string(got) != "the pending export" {
+		t.Fatalf("the pending export was clobbered: %q", got)
+	}
+	if !h.hasLog("name=GuestDrag-2.png") {
+		t.Fatalf("marker missed the suffix: %v", h.logs)
 	}
 }

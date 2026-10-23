@@ -191,6 +191,14 @@ func dragNotice(id uint32, kind, seq, applied uint8, mime string) bool {
 // path, so a drag can never click a toast or the rail.
 func handleDragPointer(px, py uint32, up bool) {
 	drag.x, drag.y = px, py
+	// M184b (#3175): a held-drag sample pinned on the scanout boundary
+	// is the pointer leaving the glass — hand the payload to the host
+	// lane and end the guest gesture. The release edge never reaches
+	// here once handed off (the session is already cleared).
+	if !up && dragOutAtEdge(px, py) {
+		dragOutHandoff()
+		return
+	}
 	tgt, hit := dragTargetAt(px, py)
 	accept := hit && opensAccepts(dragOpensFor(tgt), drag.mime)
 	if tgt != drag.hover || accept != drag.accept {

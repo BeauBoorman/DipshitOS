@@ -310,6 +310,12 @@ shutil.copy("tests/fixtures/qoi/viewer_160x120.qoi",
             os.path.join(run, "drop-src", "TRIP.QOI"))
 os.makedirs(os.path.join(run, "dest05"), exist_ok=True)
 open(os.path.join(run, "agent-hmac-sentinel.txt"), "w").write(AKEY + "\n")
+# M184b run 06: the drag-out source — one file in its own dir so the
+# pointer press is unambiguous (list row 0).
+dx = os.path.join(share, "DRAGX")
+os.makedirs(dx, exist_ok=True)
+open(os.path.join(dx, "EDGE.TXT"), "w").write("off the glass\n")
+
 print("staged v2 journey: +4 ELFs, agentd keyring + audit lane, DOCS/NFY"
       " fixtures, TRIP.QOI + dest05")
 PY
@@ -862,4 +868,60 @@ for secret in (
         sys.exit("FAIL: a key reached runner stdout")
 print("run-05 journey: %d receipts verified, drop-open + sender focus +"
       " export landing + lane pause/resume all held" % len(rcpts))
+PY
+
+# ---- 06: M184b (#3175) — drag a file out of a guest window -----------------
+# GOFILES on /host/DRAGX arms a drag on EDGE.TXT (the held-move ?1002 arm —
+# go-drag.spec's gesture); the pointer stays held to the right scanout edge,
+# where the seat runs the drag-out handoff: the blob stages into OUTBOX/
+# under the minted name, a signed DRAGOUT record (lane_outbox, sender=win)
+# crosses on the same poll cadence, and the runner moves the payload to
+# DRAGOUT/ staging — the host-visible artifact a live session's next
+# leftMouseDragged would feed beginDraggingSession. Byte-equality is the
+# leg: the staged file carries the source's exact bytes.
+vgate_file script2-06.txt <<'EOF2'
+exec GOFILES.ELF /host/DRAGX
+EOF2
+
+vgate_run 06 -- \
+    --screen '$RUN_DIR/screen-06' \
+    --via-virtio \
+    --script '$RUN_DIR/script-seat.txt' \
+    --script2 '$RUN_DIR/script2-06.txt' --script2-after 'gotabwm: hostint armed' \
+    --host-outbox --host-outbox-dir '$RUN_DIR/dest06' \
+    --pointer-virtio '40,62,d;300,120;700,200;1279,300;1279,300,u' \
+    --pointer-virtio-after 'gofiles: ready' \
+    --script-expect 'gofiles: drag end delivered' --script-expect-tail 8 --timeout 300
+
+vgate_assert 06 serial-contains 'gofiles: ready'
+vgate_assert 06 serial-contains 'gofiles: list /host/DRAGX n=1'
+vgate_assert 06 output-contains 'host-int: armed lanes=outbox epoch='
+vgate_assert 06 serial-contains 'lanes=outbox'
+vgate_assert 06 serial-contains 'gofiles: drag arm EDGE.TXT text/plain'
+vgate_assert 06 serial-contains 'gotabwm: drag arm id='
+# The handoff: seat staged + signed, host consumed + moved to staging.
+vgate_assert 06 serial-contains 'gotabwm: hostint dragout seq=1 name=GuestDrag.txt'
+vgate_assert 06 serial-contains 'gofiles: drag end delivered'
+vgate_assert 06 output-contains 'host-dragout: staged seq=1 name=GuestDrag.txt'
+vgate_assert 06 serial-absent '[EXC] parking:'
+vgate_assert 06 python <<'PY'
+import os, sys
+run = os.environ["RUN_DIR"]
+share = os.environ.get("VG_SHARE") or os.path.join(run, "share")
+# Byte-equal landing: the staged artifact carries the source's bytes.
+src = os.path.join(share, "DRAGX", "EDGE.TXT")
+got = os.path.join(share, "DRAGOUT", "GuestDrag.txt")
+if not os.path.isfile(got):
+    sys.exit("FAIL: DRAGOUT/GuestDrag.txt missing")
+if open(got, "rb").read() != open(src, "rb").read():
+    sys.exit("FAIL: staged payload not byte-equal")
+# The guest still has its source (copy semantics); OUTBOX holds nothing
+# but the staging dir's own population — no partial file either side.
+if not os.path.isfile(src):
+    sys.exit("FAIL: guest source file vanished")
+ob = [x for x in os.listdir(os.path.join(share, "OUTBOX"))
+      if not x.endswith("~")]
+if "GuestDrag.txt" in ob:
+    sys.exit("FAIL: the payload stayed in OUTBOX after staging")
+print("run-06 drag-out: edge handoff, signed record, byte-equal stage")
 PY

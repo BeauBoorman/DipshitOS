@@ -67,6 +67,10 @@ enum HostInt {
         // Dedicated tags keep raw-text records byte-identical.
         case clipOutT = 7    // g→h seat → runner:  typed clipboard item
         case clipInT = 8     // h→g runner → seat:  typed clipboard item
+        // M184b (#3175): the drag-out notice — the DROP shape reversed,
+        // naming a payload the seat staged in OUTBOX/; sender is the
+        // source window id. Rides the outbox lane bit.
+        case dragOut = 9     // g→h seat → runner:  the DROP shape, reversed
 
         var stem: String {
             switch self {
@@ -79,6 +83,7 @@ enum HostInt {
             case .notifyFocus: return "NFOCUS"
             case .clipOutT: return "CLIPTOUT"
             case .clipInT: return "CLIPTIN"
+            case .dragOut: return "DRAGOUT"
             }
         }
 
@@ -90,6 +95,7 @@ enum HostInt {
             case .drop: return "drop"
             case .notifyOut, .notifyFocus: return "notify"
             case .outbox: return "outbox"
+            case .dragOut: return "dragout"
             case .armed: return ""
             }
         }
@@ -101,7 +107,7 @@ enum HostInt {
             case .clipIn, .clipOut, .clipInT, .clipOutT: return HostInt.laneClip
             case .drop: return HostInt.laneDrop
             case .notifyOut, .notifyFocus: return HostInt.laneNotify
-            case .outbox: return HostInt.laneOutbox
+            case .outbox, .dragOut: return HostInt.laneOutbox
             case .armed: return 0
             }
         }
@@ -117,6 +123,7 @@ enum HostInt {
             case "NFOCUS": return .notifyFocus
             case "CLIPTOUT": return .clipOutT
             case "CLIPTIN": return .clipInT
+            case "DRAGOUT": return .dragOut
             default: return nil
             }
         }
