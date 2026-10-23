@@ -224,6 +224,16 @@ var Global = Table{
 		"open the find bar", "#1485-era (M20 U3)", false},
 	{Chord{ModCtrl, UsageG}, "GOEDIT.ELF", AppScope("GOEDIT.ELF"), "",
 		"open the goto-line bar", "#1485-era (M20 U3)", false},
+	// M191a (#3242): GOTERM's scrollback find. ctrl+shift+g is free at
+	// every scope — the kernel's frozen letter rows are c,v,f,k,r — and
+	// ctrl+shift+f was refused twice over: the seat's freeze-badge row
+	// fires on it regardless of focus (the M124e #2584 precedent), and
+	// the kernel's terminal-search row owns it at its own scope. The
+	// kernel's tty encoder folds shift out of ctrl-letters, so the chord
+	// reaches the bound app as BEL and the app opens the bar itself.
+	{Chord{ModCtrl | ModShift, UsageG}, "GOTERM.ELF", AppScope("GOTERM.ELF"), "",
+		"open the scrollback find bar over the capture-ring corpus",
+		"#3242 (M191a)", false},
 	{Chord{ModCtrl, UsageS}, "NOTE.ELF", AppScope("NOTE.ELF"), "",
 		"save the note", "#1485 (M66c)", false},
 	// M82c rebase note: this chord was ctrl+shift+s when #1770 was written;
