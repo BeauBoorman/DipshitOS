@@ -31,7 +31,7 @@
 # transcript of the wire bytes.
 #
 # HOST PREREQUISITES:
-#   bash tools/go/build-web.sh gomail GOMAIL --gate -> .build/go/GOMAIL-GATE.ELF
+#   bash tools/go/build-gomail.sh --gate -> .build/go/GOMAIL-GATE.ELF
 # GOMAIL-GATE is the virelai_gate_roots build (the GOIRC-GATE pattern):
 # the TLS legs anchor on the pinned leaf.example.com chain, so the gate
 # binary is what every run execs under the GOMAIL.ELF name. Fixture
