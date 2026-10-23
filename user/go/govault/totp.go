@@ -14,7 +14,7 @@
 //	            secret= parameter; stored CANONICAL (uppercase, unpadded)
 //	            so the file format and the display see one spelling.
 //
-// The seed is a shared secret, not a code: it lives in entry.totp as []byte
+// The seed is a shared secret, not a code: it lives in vaultlib.Entry.totp as []byte
 // and is zeroed on lock with the rest.
 package main
 
@@ -23,6 +23,7 @@ import (
 	"crypto/sha1"
 	"encoding/base32"
 	"strings"
+	"virelai/vaultlib"
 )
 
 // totpStep is RFC 6238's default 30-second step.
@@ -45,7 +46,7 @@ func hotp(key []byte, counter uint64) uint32 {
 	off := sum[len(sum)-1] & 0x0f
 	v := uint32(sum[off]&0x7f)<<24 | uint32(sum[off+1])<<16 |
 		uint32(sum[off+2])<<8 | uint32(sum[off+3])
-	zero(sum)
+	vaultlib.Zero(sum)
 	return v
 }
 
@@ -78,7 +79,7 @@ func totpLeft(epoch int64) int {
 	return int(totpStep - epoch%totpStep)
 }
 
-// decodeSeed turns the canonical base32 text an entry stores into the key
+// decodeSeed turns the canonical base32 text an vaultlib.Entry stores into the key
 // bytes hotp wants. The copy is the caller's to zero.
 func decodeSeed(b32text []byte) ([]byte, bool) {
 	key, err := b32.DecodeString(string(b32text))
@@ -92,7 +93,7 @@ func decodeSeed(b32text []byte) ([]byte, bool) {
 // base32 seed ("GEZD..."), or an otpauth:// URI whose secret= parameter
 // carries it ("otpauth://totp/a?secret=GEZD...&issuer=x"). Whitespace and
 // case are normalized; padding is tolerated and dropped. The return is the
-// canonical base32 text — what entry.totp stores — or ok=false when the
+// canonical base32 text — what vaultlib.Entry.totp stores — or ok=false when the
 // text does not decode.
 func parseOTPSecret(in []byte) ([]byte, bool) {
 	s := strings.TrimSpace(string(in))
@@ -132,7 +133,7 @@ func parseOTPSecret(in []byte) ([]byte, bool) {
 		b.WriteByte(byte(c))
 	}
 	t := b.String()
-	if t == "" || len(t) > maxTotp {
+	if t == "" || len(t) > vaultlib.MaxTotp {
 		return nil, false
 	}
 	key, err := b32.DecodeString(t)
@@ -140,9 +141,9 @@ func parseOTPSecret(in []byte) ([]byte, bool) {
 	// empty or whose canonical re-encode differs is not a seed a peer's
 	// authenticator would agree on — refuse it at intake, not at render.
 	if err != nil || len(key) == 0 || b32.EncodeToString(key) != t {
-		zero(key)
+		vaultlib.Zero(key)
 		return nil, false
 	}
-	zero(key)
+	vaultlib.Zero(key)
 	return []byte(t), true
 }

@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"errors"
 	"testing"
+	"virelai/vaultlib"
 )
 
 // RFC 6238 Appendix B: the SHA-1 column, T0=0, 30 s step, 8 digits, and the
@@ -92,82 +93,72 @@ func mustSeed(t *testing.T, s string) []byte {
 // The GVLX round trip: export under its own passphrase, open through the
 // bundle door, and the entries — totp field included — come back whole.
 func TestGVLXRoundTrip(t *testing.T) {
-	entries := []entry{
-		{name: []byte("mail"), secret: []byte("letmein"), note: []byte("work"),
-			totp: []byte("GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ")},
+	entries := []vaultlib.Entry{
+		{Name: []byte("mail"), Secret: []byte("letmein"), Note: []byte("work"), Totp: []byte("GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ")},
 	}
-	key, err := deriveKey(testPass, testSalt, testIters)
+	key, err := vaultlib.DeriveKey(testPass, testSalt, testIters)
 	if err != nil {
-		t.Fatalf("deriveKey: %v", err)
+		t.Fatalf("vaultlib.DeriveKey: %v", err)
 	}
-	defer zero(key)
-	bundle, err := sealWithKey(exportMagic, fileVersion, key, testSalt, testNonce, testIters, entries)
+	defer vaultlib.Zero(key)
+	bundle, err := vaultlib.SealWithKey(vaultlib.ExportMagic, vaultlib.FileVersion, key, testSalt, testNonce, testIters, entries)
 	if err != nil {
-		t.Fatalf("sealWithKey(GVLX): %v", err)
+		t.Fatalf("vaultlib.SealWithKey(GVLX): %v", err)
 	}
-	if string(bundle[:4]) != exportMagic {
+	if string(bundle[:4]) != vaultlib.ExportMagic {
 		t.Fatalf("bundle magic = %q, want GVLX", bundle[:4])
 	}
-	got, ikey, _, _, err := openExport(testPass, bundle)
+	got, ikey, _, _, err := vaultlib.OpenExport(testPass, bundle)
 	if err != nil {
-		t.Fatalf("openExport: %v", err)
+		t.Fatalf("vaultlib.OpenExport: %v", err)
 	}
-	defer zero(ikey)
-	if len(got) != 1 || string(got[0].totp) != "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ" {
+	defer vaultlib.Zero(ikey)
+	if len(got) != 1 || string(got[0].Totp) != "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ" {
 		t.Fatalf("entries = %+v", got)
 	}
 	// The doors do not cross: a bundle under the vault magic (and vice
 	// versa) is a bad file, named before a passphrase is spent.
-	if _, _, _, _, err := open(testPass, bundle); !errors.Is(err, errBadFile) {
-		t.Fatalf("GVLX under the GVLT door: %v, want errBadFile", err)
+	if _, _, _, _, err := vaultlib.Open(testPass, bundle); !errors.Is(err, vaultlib.ErrBadFile) {
+		t.Fatalf("GVLX under the GVLT door: %v, want vaultlib.ErrBadFile", err)
 	}
-	vault, err := sealWithKey(fileMagic, fileVersion, key, testSalt, testNonce, testIters, entries)
+	vault, err := vaultlib.SealWithKey(vaultlib.FileMagic, vaultlib.FileVersion, key, testSalt, testNonce, testIters, entries)
 	if err != nil {
-		t.Fatalf("sealWithKey(GVLT): %v", err)
+		t.Fatalf("vaultlib.SealWithKey(GVLT): %v", err)
 	}
-	if _, _, _, _, err := openExport(testPass, vault); !errors.Is(err, errBadFile) {
-		t.Fatalf("GVLT under the GVLX door: %v, want errBadFile", err)
+	if _, _, _, _, err := vaultlib.OpenExport(testPass, vault); !errors.Is(err, vaultlib.ErrBadFile) {
+		t.Fatalf("GVLT under the GVLX door: %v, want vaultlib.ErrBadFile", err)
 	}
 	// And the bundle's own wrong passphrase is the same shared refusal.
-	if _, _, _, _, err := openExport([]byte("wrong"), bundle); !errors.Is(err, errUnlock) {
-		t.Fatalf("wrong bundle pass: %v, want errUnlock", err)
+	if _, _, _, _, err := vaultlib.OpenExport([]byte("wrong"), bundle); !errors.Is(err, vaultlib.ErrUnlock) {
+		t.Fatalf("wrong bundle pass: %v, want vaultlib.ErrUnlock", err)
 	}
 }
 
 // v1 still reads: a body sealed at the old field set decodes with an empty
 // totp, so vaults written before the card open under v2.
 func TestV1DecodeStillReads(t *testing.T) {
-	body := encodeBody(testEntries(), 1)
-	entries, err := decodeBody(body, 1)
-	if err != nil {
-		t.Fatalf("v1 decodeBody: %v", err)
-	}
-	if len(entries) != 2 || len(entries[0].totp) != 0 {
-		t.Fatalf("v1 entries = %+v", entries)
-	}
 	// A v1 frame end to end: header version 1 parses, the body opens.
-	key, err := deriveKey(testPass, testSalt, testIters)
+	// (The v1 body decode itself is vaultlib's test now — the codec moved
+	// with M190e #3240.)
+	key, err := vaultlib.DeriveKey(testPass, testSalt, testIters)
 	if err != nil {
-		t.Fatalf("deriveKey: %v", err)
+		t.Fatalf("vaultlib.DeriveKey: %v", err)
 	}
-	defer zero(key)
-	file, err := sealWithKey(fileMagic, 1, key, testSalt, testNonce, testIters, testEntries())
+	defer vaultlib.Zero(key)
+	file, err := vaultlib.SealWithKey(vaultlib.FileMagic, 1, key, testSalt, testNonce, testIters, testEntries())
 	if err != nil {
-		t.Fatalf("sealWithKey v1: %v", err)
+		t.Fatalf("vaultlib.SealWithKey v1: %v", err)
 	}
-	got, k2, _, iters, err := open(testPass, file)
+	got, k2, _, iters, err := vaultlib.Open(testPass, file)
 	if err != nil {
 		t.Fatalf("open v1 file: %v", err)
 	}
-	defer zero(k2)
-	if iters != testIters || len(got) != 2 || string(got[0].name) != "wifi" {
+	defer vaultlib.Zero(k2)
+	if iters != testIters || len(got) != 2 || string(got[0].Name) != "wifi" {
 		t.Fatalf("v1 open: iters=%d entries=%+v", iters, got)
 	}
-	// A v1 body handed to the v2 decoder is a structural lie — the count
-	// and its fields are proven before a passphrase is spent either way.
-	if _, err := decodeBody(body, 2); !errors.Is(err, errBadFile) {
-		t.Fatalf("v1 body as v2: %v, want errBadFile", err)
-	}
+	// A v1 body handed to the v2 decoder is a structural lie — that refusal
+	// is vaultlib's own test now (the codec moved with M190e #3240).
 }
 
 // The merge rule: new names append, a held name keeps the vault's copy and
@@ -175,10 +166,10 @@ func TestV1DecodeStillReads(t *testing.T) {
 func TestMergeRules(t *testing.T) {
 	m := &model{}
 	m.unlocked(testEntries(), make([]byte, 32), make([]byte, 16), testIters, 0)
-	imported := []entry{
-		{name: []byte("wifi"), secret: []byte("attacker")}, // held name: skip
-		{name: []byte("mail"), secret: []byte("letmein"), totp: []byte("GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ")},
-		{name: []byte(""), secret: []byte("x")}, // nameless: skip
+	imported := []vaultlib.Entry{
+		{Name: []byte("wifi"), Secret: []byte("attacker")}, // held name: skip
+		{Name: []byte("mail"), Secret: []byte("letmein"), Totp: []byte("GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ")},
+		{Name: []byte(""), Secret: []byte("x")}, // nameless: skip
 	}
 	added, skipped := m.mergeEntries(imported)
 	if added != 1 || skipped != 2 {
@@ -187,15 +178,15 @@ func TestMergeRules(t *testing.T) {
 	if len(m.entries) != 3 {
 		t.Fatalf("entries = %d, want 3", len(m.entries))
 	}
-	if string(m.entries[0].secret) != "s3cr3t" {
-		t.Fatal("the held 'wifi' entry was overwritten — the merge must keep it")
+	if string(m.entries[0].Secret) != "s3cr3t" {
+		t.Fatal("the held 'wifi' vaultlib.Entry was overwritten — the merge must keep it")
 	}
-	if string(m.entries[2].name) != "mail" || len(m.entries[2].totp) == 0 {
-		t.Fatalf("imported entry = %+v", m.entries[2])
+	if string(m.entries[2].Name) != "mail" || len(m.entries[2].Totp) == 0 {
+		t.Fatalf("imported vaultlib.Entry = %+v", m.entries[2])
 	}
 	// The merge is name-keyed, not order-keyed: re-adding the imported name
 	// now collides and skips.
-	again := []entry{{name: []byte("mail"), secret: []byte("x")}}
+	again := []vaultlib.Entry{{Name: []byte("mail"), Secret: []byte("x")}}
 	if a, s := m.mergeEntries(again); a != 0 || s != 1 {
 		t.Fatalf("re-merge = %d/%d, want 0/1", a, s)
 	}

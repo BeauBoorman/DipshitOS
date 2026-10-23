@@ -2,7 +2,7 @@
 // (#2805), M156c (#2933): the secrets store gets a face, a bundle format and
 // a state hook. One unlock-gated vault file (GVLT framing, PBKDF2-HMAC-SHA256
 // -> AES-256-GCM, written through vi.WriteFileSafe so a crash keeps the old
-// file), a masked passphrase field, a per-entry reveal, a copy that expires,
+// file), a masked passphrase field, a per-vaultlib.Entry reveal, a copy that expires,
 // an idle lock, and a plaintext receipts file with its own read-only face.
 // M156c adds: GVLX export/import bundles (same frame, distinct magic, their
 // own passphrase) through the shared picker, a merge that never overwrites,
@@ -23,7 +23,7 @@
 // that refuses (no opt-in, no seat) the copy reports its named refusal and
 // nothing is armed.
 //
-// Secrets discipline: entry fields stay in []byte end to end so lock() can
+// Secrets discipline: vaultlib.Entry fields stay in []byte end to end so lock() can
 // zero them; the passphrase buffer is zeroed on every outcome; the clipboard
 // compare runs against a sha256 tag, never a kept plaintext; and no serial
 // marker ever carries a name, a secret, a note or a passphrase — the
@@ -42,6 +42,7 @@ import (
 	"virelai/draw"
 	"virelai/tabapp"
 	"virelai/theme"
+	"virelai/vaultlib"
 	"virelai/vi"
 	"virelai/vsys"
 	"virelai/webrender/font"
@@ -63,7 +64,7 @@ const (
 	vaultPath = "/host/GOVAULT/VAULT.BIN"
 
 	// receiptPath is the vault's own receipts file (M148b): plaintext rows
-	// of time, action and entry name — never secret material, and never
+	// of time, action and vaultlib.Entry name — never secret material, and never
 	// inside the seal (a failed unlock holds no key to write with).
 	receiptPath = "/host/GOVAULT/RECEIPTS.TXT"
 
@@ -157,7 +158,7 @@ var (
 	// principal must not even read the ciphertext. fileMode is the
 	// owner-only slot-69 chmod; the daemon owns the file it publishes.
 	fileMode = vi.FileMode
-	notifyFn  = func(ta *tabapp.TabApp, text string) bool { return ta.Notify(text) }
+	notifyFn = func(ta *tabapp.TabApp, text string) bool { return ta.Notify(text) }
 )
 
 // field is one input row. buf holds UTF-8; masked fields paint one '*' per
@@ -192,14 +193,14 @@ func (f *field) backspace() bool {
 		return false
 	}
 	_, n := utf8.DecodeLastRune(f.buf)
-	zero(f.buf[len(f.buf)-n:])
+	vaultlib.Zero(f.buf[len(f.buf)-n:])
 	f.buf = f.buf[:len(f.buf)-n]
 	return true
 }
 
 // clear zeroes and empties the buffer.
 func (f *field) clear() {
-	zero(f.buf)
+	vaultlib.Zero(f.buf)
 	f.buf = f.buf[:0]
 }
 
@@ -273,10 +274,10 @@ func main() {
 		pass: newField("passphrase", 64, true),
 		conf: newField("confirm", 64, true),
 	}
-	a.add[0] = newField("name", maxName, false)
-	a.add[1] = newField("secret", maxSecret, true)
-	a.add[2] = newField("note", maxNote, false)
-	a.add[3] = newField("totp", maxTotp, true)
+	a.add[0] = newField("name", vaultlib.MaxName, false)
+	a.add[1] = newField("secret", vaultlib.MaxSecret, true)
+	a.add[2] = newField("note", vaultlib.MaxNote, false)
+	a.add[3] = newField("totp", vaultlib.MaxTotp, true)
 
 	ta := tabapp.Init(tabapp.Config{
 		Name:         appName,
@@ -343,7 +344,7 @@ func main() {
 // re-read between faces (and a file changed under the app is the next
 // process's problem, not this boot's).
 func (a *app) load() {
-	data, rc := readAll(a.path, maxFile+1)
+	data, rc := readAll(a.path, vaultlib.MaxFile+1)
 	if rc < 0 {
 		if rc == -int64(vi.ErrENOENT) {
 			a.m.scr = scrNew
@@ -354,7 +355,7 @@ func (a *app) load() {
 		vi.ConsoleLine(markerLoadErr + vi.Itoa64(rc))
 		return
 	}
-	if _, _, _, _, _, err := parseHeader(data, fileMagic); err != nil {
+	if _, _, _, _, _, err := vaultlib.ParseHeader(data, vaultlib.FileMagic); err != nil {
 		a.m.scr = scrBadFile
 		vi.ConsoleLine(markerBad)
 		return
@@ -468,7 +469,7 @@ func (a *app) expireClip() {
 	a.m.dl.stopClip()
 	buf, ok := a.pullSel()
 	kept := ok && !a.m.ctag.holds(buf)
-	zero(buf)
+	vaultlib.Zero(buf)
 	a.m.ctag.wipe()
 	if kept {
 		vi.ConsoleLine(markerKept)
@@ -538,17 +539,17 @@ func (a *app) lockSession(idle bool) {
 // unlock proved, with a fresh nonce per publish, through WriteFileSafe — a
 // crash keeps the old file, never a half-written one.
 func (a *app) save() bool {
-	nonce := make([]byte, nonceLen)
+	nonce := make([]byte, vaultlib.NonceLen)
 	if !randFill(nonce) {
 		vi.ConsoleLine(markerSaveErr + vi.Itoa64(-int64(vi.ErrENOSYS)))
 		return false
 	}
-	file, err := sealWithKey(fileMagic, fileVersion, a.m.key, a.m.salt, nonce, a.m.iters, a.m.entries)
+	file, err := vaultlib.SealWithKey(vaultlib.FileMagic, vaultlib.FileVersion, a.m.key, a.m.salt, nonce, a.m.iters, a.m.entries)
 	if err != nil {
 		vi.ConsoleLine(markerSaveErr + vi.Itoa64(-int64(vi.ErrEINVAL)))
 		return false
 	}
-	defer zero(file)
+	defer vaultlib.Zero(file)
 	if rc := writeSafe(a.path, file); rc < 0 {
 		vi.ConsoleLine(markerSaveErr + vi.Itoa64(rc))
 		return false
@@ -563,7 +564,7 @@ func (a *app) save() bool {
 	}
 	// The published frame is also the bytes a same-session unlock opens:
 	// on the create path nothing ever read the file off disk, so without
-	// this a lock->unlock pair meets parseHeader(nil) -> bad file. It is
+	// this a lock->unlock pair meets vaultlib.ParseHeader(nil) -> bad file. It is
 	// the sealed text — ciphertext is not secret material to shed.
 	a.file = append(a.file[:0], file...)
 	vi.ConsoleLine(markerSaved)
@@ -641,10 +642,10 @@ func (a *app) keyLocked(ev vi.Event) bool {
 // tampered seal are the same answer by design.
 func (a *app) unlock() {
 	pass := append([]byte(nil), a.pass.buf...)
-	defer zero(pass)
-	entries, key, salt, iters, err := open(pass, a.file)
+	defer vaultlib.Zero(pass)
+	entries, key, salt, iters, err := vaultlib.Open(pass, a.file)
 	a.pass.clear()
-	if err == errBadFile {
+	if err == vaultlib.ErrBadFile {
 		a.m.scr = scrBadFile
 		vi.ConsoleLine(markerBad)
 		return
@@ -669,7 +670,7 @@ func (a *app) unlock() {
 // count (~1 s of PBKDF2 on this VM, recorded in the header), CSPRNG salt and
 // nonce, sealed and published.
 func (a *app) create() {
-	if !equalBytes(a.pass.buf, a.conf.buf) || len(a.pass.buf) == 0 {
+	if !vaultlib.EqualBytes(a.pass.buf, a.conf.buf) || len(a.pass.buf) == 0 {
 		a.pass.clear()
 		a.conf.clear()
 		a.focus = 0
@@ -678,34 +679,34 @@ func (a *app) create() {
 		return
 	}
 	pass := append([]byte(nil), a.pass.buf...)
-	defer zero(pass)
+	defer vaultlib.Zero(pass)
 	a.pass.clear()
 	a.conf.clear()
 
-	salt := make([]byte, saltLen)
-	nonce := make([]byte, nonceLen)
+	salt := make([]byte, vaultlib.SaltLen)
+	nonce := make([]byte, vaultlib.NonceLen)
 	if !randFill(salt) || !randFill(nonce) {
 		vi.ConsoleLine(markerSaveErr + vi.Itoa64(-int64(vi.ErrENOSYS)))
 		return
 	}
-	// The measurement is one calibration derive; calibrateIterations scales
+	// The measurement is one calibration derive; vaultlib.CalibrateIterations scales
 	// it to about a second and clamps it honest.
 	start := nowFn()
-	probe, err := deriveKey(pass, salt, calibrateIters)
-	iters := calibrateIterations(nowFn() - start)
-	zero(probe)
+	probe, err := vaultlib.DeriveKey(pass, salt, vaultlib.CalibrateIters)
+	iters := vaultlib.CalibrateIterations(nowFn() - start)
+	vaultlib.Zero(probe)
 	if err != nil {
 		vi.ConsoleLine(markerSaveErr + vi.Itoa64(-int64(vi.ErrEINVAL)))
 		return
 	}
-	key, err := deriveKey(pass, salt, iters)
+	key, err := vaultlib.DeriveKey(pass, salt, iters)
 	if err != nil {
 		vi.ConsoleLine(markerSaveErr + vi.Itoa64(-int64(vi.ErrEINVAL)))
 		return
 	}
 	if !ensureDirs(a.path) {
 		// ensureDirs already printed the refusal with its rc.
-		zero(key)
+		vaultlib.Zero(key)
 		return
 	}
 	a.m.unlocked(nil, key, salt, iters, nowFn())
@@ -768,7 +769,7 @@ func (a *app) keyList(ev vi.Event) bool {
 	case 'r', codeReturn, codeNewline:
 		if a.m.toggleReveal() {
 			if a.m.revealed(a.m.sel) {
-				a.receipt(actReveal, a.m.entries[a.m.sel].name)
+				a.receipt(actReveal, a.m.entries[a.m.sel].Name)
 				vi.ConsoleLine(markerRevealed)
 				a.clockMarker()
 			} else {
@@ -876,7 +877,7 @@ func (a *app) keyImport(ev vi.Event) bool {
 // the GVLX frame through WriteFileSafe at the picked path. Marker per the
 // card: 'govault: export n=<entries> bytes=<n>'.
 func (a *app) exportBundle() {
-	if !equalBytes(a.pass.buf, a.conf.buf) || len(a.pass.buf) == 0 {
+	if !vaultlib.EqualBytes(a.pass.buf, a.conf.buf) || len(a.pass.buf) == 0 {
 		a.pass.clear()
 		a.conf.clear()
 		a.focus = 0
@@ -887,35 +888,35 @@ func (a *app) exportBundle() {
 	pass := append([]byte(nil), a.pass.buf...)
 	a.pass.clear()
 	a.conf.clear()
-	defer zero(pass)
+	defer vaultlib.Zero(pass)
 
-	salt := make([]byte, saltLen)
-	nonce := make([]byte, nonceLen)
+	salt := make([]byte, vaultlib.SaltLen)
+	nonce := make([]byte, vaultlib.NonceLen)
 	if !randFill(salt) || !randFill(nonce) {
 		vi.ConsoleLine(markerExportErr + vi.Itoa64(-int64(vi.ErrENOSYS)))
 		return
 	}
 	start := nowFn()
-	probe, err := deriveKey(pass, salt, calibrateIters)
-	iters := calibrateIterations(nowFn() - start)
-	zero(probe)
+	probe, err := vaultlib.DeriveKey(pass, salt, vaultlib.CalibrateIters)
+	iters := vaultlib.CalibrateIterations(nowFn() - start)
+	vaultlib.Zero(probe)
 	if err != nil {
 		vi.ConsoleLine(markerExportErr + vi.Itoa64(-int64(vi.ErrEINVAL)))
 		return
 	}
-	key, err := deriveKey(pass, salt, iters)
+	key, err := vaultlib.DeriveKey(pass, salt, iters)
 	if err != nil {
 		vi.ConsoleLine(markerExportErr + vi.Itoa64(-int64(vi.ErrEINVAL)))
 		return
 	}
-	bundle, err := sealWithKey(exportMagic, fileVersion, key, salt, nonce, iters, a.m.entries)
-	zero(key)
+	bundle, err := vaultlib.SealWithKey(vaultlib.ExportMagic, vaultlib.FileVersion, key, salt, nonce, iters, a.m.entries)
+	vaultlib.Zero(key)
 	if err != nil {
 		vi.ConsoleLine(markerExportErr + vi.Itoa64(-int64(vi.ErrEINVAL)))
 		return
 	}
 	if rc := writeSafe(a.pickPath, bundle); rc < 0 {
-		zero(bundle)
+		vaultlib.Zero(bundle)
 		vi.ConsoleLine(markerExportErr + vi.Itoa64(rc))
 		a.status = "export refused"
 		return
@@ -923,7 +924,7 @@ func (a *app) exportBundle() {
 	a.receipt(actExport, nil)
 	vi.ConsoleLine(markerExport + vi.Itoa64(int64(len(a.m.entries))) +
 		" bytes=" + vi.Itoa64(int64(len(bundle))))
-	zero(bundle)
+	vaultlib.Zero(bundle)
 	a.m.scr = scrList
 	a.status = "exported " + vi.Itoa64(int64(len(a.m.entries))) + " entries"
 }
@@ -936,17 +937,17 @@ func (a *app) exportBundle() {
 func (a *app) importBundle() {
 	pass := append([]byte(nil), a.pass.buf...)
 	a.pass.clear()
-	defer zero(pass)
+	defer vaultlib.Zero(pass)
 
-	data, rc := readAll(a.pickPath, maxFile+1)
+	data, rc := readAll(a.pickPath, vaultlib.MaxFile+1)
 	if rc < 0 {
 		vi.ConsoleLine(markerImportErr + vi.Itoa64(rc))
 		a.status = "import refused"
 		return
 	}
-	entries, key, _, _, err := openExport(pass, data)
-	zero(key)
-	if err == errBadFile {
+	entries, key, _, _, err := vaultlib.OpenExport(pass, data)
+	vaultlib.Zero(key)
+	if err == vaultlib.ErrBadFile {
 		vi.ConsoleLine(markerImportBad)
 		a.status = "import: not a GVLX bundle"
 		return
@@ -957,7 +958,7 @@ func (a *app) importBundle() {
 		return
 	}
 	added, skipped := a.m.mergeEntries(entries)
-	zeroEntries(entries)
+	vaultlib.ZeroEntries(entries)
 	a.receipt(actImport, []byte("added="+vi.Itoa64(int64(added))+" skipped="+vi.Itoa64(int64(skipped))))
 	a.save()
 	vi.ConsoleLine(markerImport + "added=" + vi.Itoa64(int64(added)) +
@@ -977,7 +978,7 @@ func (a *app) copy() {
 	if a.m.sel < 0 || a.m.sel >= len(a.m.entries) {
 		return
 	}
-	secret := a.m.entries[a.m.sel].secret
+	secret := a.m.entries[a.m.sel].Secret
 	if !a.publishSel(secret) {
 		vi.ConsoleLine(markerCopyErr)
 		a.status = "copy refused"
@@ -986,7 +987,7 @@ func (a *app) copy() {
 	a.m.ctag = setClipTag(secret)
 	a.m.dl.armClip(nowFn())
 	a.rearm()
-	a.receipt(actCopy, a.m.entries[a.m.sel].name)
+	a.receipt(actCopy, a.m.entries[a.m.sel].Name)
 	vi.ConsoleLine(markerCopied)
 	a.status = "copied — clears in 30 s"
 	notifyFn(a.ta, "copied; clears 30s")
@@ -1038,10 +1039,10 @@ func (a *app) keyAdd(ev vi.Event) bool {
 	return false
 }
 
-// commitAdd stores the four fields as an entry and publishes the vault. The
+// commitAdd stores the four fields as an vaultlib.Entry and publishes the vault. The
 // field buffers are cleared (zeroed) either way — the session copy is the
-// entry's own clone. A non-empty totp field must parse: the refusal names
-// itself and keeps the entry unstored, so a mistyped seed never lands half
+// vaultlib.Entry's own clone. A non-empty totp field must parse: the refusal names
+// itself and keeps the vaultlib.Entry unstored, so a mistyped seed never lands half
 // in the vault.
 func (a *app) commitAdd() {
 	var totp []byte
@@ -1061,7 +1062,7 @@ func (a *app) commitAdd() {
 		totp = t
 	}
 	ok := a.m.addEntry(a.add[0].buf, a.add[1].buf, a.add[2].buf, totp)
-	zero(totp)
+	vaultlib.Zero(totp)
 	a.add[0].clear()
 	a.add[1].clear()
 	a.add[2].clear()
@@ -1079,7 +1080,7 @@ func (a *app) commitAdd() {
 }
 
 // receipt appends one row to the vault's own receipts file: time, action,
-// entry name — never secret material (M148b). The write is a real append,
+// vaultlib.Entry name — never secret material (M148b). The write is a real append,
 // not a rewrite — the file is a log, and WriteFilePublish's append arm never
 // truncates it. The /host/GOVAULT directory already exists at every receipt
 // site (a vault file lives there, or create() just made it), so no mkdir
@@ -1137,7 +1138,7 @@ func (a *app) keyReceipts(ev vi.Event) bool {
 // --- save_state (M125a, hooked M156c) -----------------------------------------
 
 // saveBlob is the Config.SaveState hook: the open vault's path and nothing
-// else. Never a passphrase, key, entry or revealed secret — the blob is a
+// else. Never a passphrase, key, vaultlib.Entry or revealed secret — the blob is a
 // convenience pointer, and a restored vault starts locked because the path
 // is all it learned.
 func (a *app) saveBlob() []byte {
@@ -1305,7 +1306,7 @@ func (a *app) drawBadFile(cv widgets.Canvas, w, h int) {
 	a.text(cv, pad, h-32, "esc quit", tok.Muted)
 }
 
-// drawList paints the entry rows. A hidden secret is a FIXED bullet width —
+// drawList paints the vaultlib.Entry rows. A hidden secret is a FIXED bullet width —
 // the length of a secret is information too — and only the revealed row's
 // own bytes are painted.
 func (a *app) drawList(cv widgets.Canvas, w, h int) {
@@ -1323,30 +1324,30 @@ func (a *app) drawList(cv widgets.Canvas, w, h int) {
 			a.fill(cv, 0, y, 3, rowH, tok.Accent)
 		}
 		e := &a.m.entries[i]
-		name := string(e.name)
+		name := string(e.Name)
 		if len(name) > 20 {
 			name = name[:20]
 		}
 		a.text(cv, pad, y+3, name, tok.Text)
 		secret := "********"
 		if a.m.revealed(i) {
-			secret = string(e.secret)
+			secret = string(e.Secret)
 		}
 		a.text(cv, pad+176, y+3, secret, tok.Muted)
-		// M156c: a seeded entry shows its live six-digit code and the
+		// M156c: a seeded vaultlib.Entry shows its live six-digit code and the
 		// seconds left in the step — the code is a render of the seed, not
 		// the stored text, so a stale frame can never show a dead code.
-		if len(e.totp) > 0 {
+		if len(e.Totp) > 0 {
 			code := "------ --s"
-			if key, ok := decodeSeed(e.totp); ok {
+			if key, ok := decodeSeed(e.Totp); ok {
 				if v, ok := totpAt(key, timeFn(), 6); ok {
 					code = sixDigits(v) + " " + vi.Itoa64(int64(totpLeft(timeFn()))) + "s"
 				}
-				zero(key)
+				vaultlib.Zero(key)
 			}
 			a.text(cv, pad+288, y+3, code, tok.Accent)
 		}
-		note := string(e.note)
+		note := string(e.Note)
 		if len(note) > 14 {
 			note = note[:14]
 		}
@@ -1404,7 +1405,7 @@ func (a *app) drawReceipts(cv widgets.Canvas, w, h int) {
 
 func (a *app) drawAdd(cv widgets.Canvas, w, h int) {
 	tok := theme.Current
-	a.text(cv, pad, chromeH+16, "New entry", tok.Text)
+	a.text(cv, pad, chromeH+16, "New vaultlib.Entry", tok.Text)
 	a.fieldRow(cv, chromeH+44, &a.add[0], a.focus == 0)
 	a.fieldRow(cv, chromeH+44+fieldH+10, &a.add[1], a.focus == 1)
 	a.fieldRow(cv, chromeH+44+2*(fieldH+10), &a.add[2], a.focus == 2)

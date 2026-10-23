@@ -195,6 +195,8 @@ func TestSeatRowsAreTheSeatSurface(t *testing.T) {
 		"sel-paste": 1, "close": 1, "move-left": 1, "move-right": 1,
 		"undo":      1,
 		"clip-menu": 1,
+		// M190e (#3240): the screen lock — ctrl+shift+l.
+		"lock": 1,
 		// M190b (#3237): the guest's own camera — full scanout and the
 		// focused window's rect of it.
 		"shot-full": 1, "shot-window": 1,

@@ -8,11 +8,12 @@ package main
 import (
 	"testing"
 
+	"virelai/vaultlib"
 	"virelai/vi"
 )
 
 // The row is "<epoch> <action> <name>" with the name as the rest of the
-// line — a multi-word entry name round-trips without escaping, and a
+// line — a multi-word vaultlib.Entry name round-trips without escaping, and a
 // vault-level action records "-".
 func TestReceiptLineShape(t *testing.T) {
 	line := receiptLine(1729440000, actReveal, "wifi router")
@@ -58,7 +59,7 @@ func TestParseReceipts(t *testing.T) {
 }
 
 // receipt() appends through the file seam: the row carries the seam-injected
-// time, the action and the entry name — and never the secret.
+// time, the action and the vaultlib.Entry name — and never the secret.
 func TestReceiptAppends(t *testing.T) {
 	oldTime, oldAppend := timeFn, rcptAppend
 	defer func() {
@@ -150,7 +151,7 @@ func TestReceiptsKeys(t *testing.T) {
 		t.Fatal("esc must return to the list")
 	}
 	a.m.scr = scrReceipts
-	a.m.unlocked([]entry{{name: []byte("w"), secret: []byte("s")}},
+	a.m.unlocked([]vaultlib.Entry{{Name: []byte("w"), Secret: []byte("s")}},
 		[]byte("k"), []byte("s"), testIters, 0)
 	a.m.scr = scrReceipts
 	a.keyReceipts(vi.Event{Kind: vi.EvKeyDown, Flags: modCtrl, Arg1: keyCtrlL})
@@ -160,7 +161,7 @@ func TestReceiptsKeys(t *testing.T) {
 }
 
 // lock() drops the loaded receipts too — the view reloads from the file on
-// entry, so a locked vault holds no stale copy.
+// vaultlib.Entry, so a locked vault holds no stale copy.
 func TestLockClearsReceipts(t *testing.T) {
 	m := &model{}
 	m.unlocked(nil, make([]byte, 32), make([]byte, 16), testIters, 0)

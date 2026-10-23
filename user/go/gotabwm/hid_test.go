@@ -1458,7 +1458,8 @@ func TestChordSummaryCounts(t *testing.T) {
 	// rows (R4–R6) landed ahead of their handlers.
 	// M190a (#3236): n=66→67, seat=36→37 — the clip-menu summon row.
 	// M190b (#3237): n=67→69, seat=37→39 — the shot-full/shot-window pair.
-	want := "gotabwm: chords n=69 seat=39 kernel=12 app=18"
+	// M190e (#3240): n=69→70, seat=39→40 — the lock chord.
+	want := "gotabwm: chords n=70 seat=40 kernel=12 app=18"
 	if got != want {
 		t.Fatalf("chordSummary = %q want %q", got, want)
 	}

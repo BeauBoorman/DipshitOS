@@ -63,18 +63,21 @@ func TestPowerMenuRectAndRow(t *testing.T) {
 	if y < RailHeight || x < chromeInset {
 		t.Fatal("menu out of bounds")
 	}
-	// M120d: two rows — Suspend on top, Snapshot under it, same
-	// geometry the paint loop and the pointer path share.
+	// M120d: two rows — Suspend on top, Snapshot under it — plus M190e's
+	// Lock row, same geometry the paint loop and the pointer path share.
 	if r := powerMenuRowAt(uint32(x+1), uint32(y+4), vi.ScanoutWidth, vi.ScanoutHeight); r != 0 {
 		t.Fatalf("row 0 miss: %d", r)
 	}
 	if r := powerMenuRowAt(uint32(x+w-1), uint32(y+3+powerRowH), vi.ScanoutWidth, vi.ScanoutHeight); r != 1 {
 		t.Fatalf("row 1 miss: %d", r)
 	}
+	if r := powerMenuRowAt(uint32(x+w-1), uint32(y+3+2*powerRowH), vi.ScanoutWidth, vi.ScanoutHeight); r != 2 {
+		t.Fatalf("row 2 miss: %d", r)
+	}
 	if powerMenuRowAt(uint32(x-1), uint32(y), vi.ScanoutWidth, vi.ScanoutHeight) >= 0 ||
 		powerMenuRowAt(uint32(x), uint32(y+h), vi.ScanoutWidth, vi.ScanoutHeight) >= 0 ||
 		powerMenuRowAt(uint32(x+1), uint32(y+2), vi.ScanoutWidth, vi.ScanoutHeight) >= 0 ||
-		powerMenuRowAt(uint32(x+1), uint32(y+3+2*powerRowH+2), vi.ScanoutWidth, vi.ScanoutHeight) >= 0 {
+		powerMenuRowAt(uint32(x+1), uint32(y+3+3*powerRowH+2), vi.ScanoutWidth, vi.ScanoutHeight) >= 0 {
 		t.Fatal("row hit outside")
 	}
 }
@@ -227,13 +230,18 @@ func TestPowerKeysSelectSnapshot(t *testing.T) {
 	if powerSel != 1 {
 		t.Fatalf("sel=%d after Down", powerSel)
 	}
+	handlePowerKey(vi.Event{Kind: vi.EvWmKey, Arg0: 0x51}) // Down
+	if powerSel != 2 {
+		t.Fatalf("sel=%d after second Down", powerSel)
+	}
 	handlePowerKey(vi.Event{Kind: vi.EvWmKey, Arg0: 0x51}) // Down clamps
-	if powerSel != 1 {
+	if powerSel != 2 {
 		t.Fatalf("sel=%d past the end", powerSel)
 	}
 	handlePowerKey(vi.Event{Kind: vi.EvWmKey, Arg0: 0x52}) // Up
+	handlePowerKey(vi.Event{Kind: vi.EvWmKey, Arg0: 0x52}) // Up
 	if powerSel != 0 {
-		t.Fatalf("sel=%d after Up", powerSel)
+		t.Fatalf("sel=%d after Up x2", powerSel)
 	}
 	handlePowerKey(vi.Event{Kind: vi.EvWmKey, Arg0: 0x51})
 	handlePowerKey(vi.Event{Kind: vi.EvWmKey, Arg0: 0x28}) // Enter

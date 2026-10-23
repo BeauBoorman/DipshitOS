@@ -579,6 +579,10 @@ func runSeatAction(action string, c chords.Chord) {
 		shotChord(true)
 	case "undo":
 		_ = applyUndo()
+	case "lock":
+		// M190e (#3240): ctrl+shift+l drops the vault-credential lock
+		// curtain (lockcurtain.go).
+		requestLock()
 	}
 }
 

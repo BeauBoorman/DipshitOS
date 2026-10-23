@@ -38,8 +38,9 @@ const (
 )
 
 // The menu's rows: Suspend is the M115d verb (first, the Enter default);
-// M120d's Snapshot row launches or focuses GOSNAP.ELF's snapshot window.
-var powerRows = [2]string{"Suspend", "Snapshot"}
+// M120d's Snapshot row launches or focuses GOSNAP.ELF's snapshot window;
+// M190e's Lock row drops the vault-credential lock curtain (#3240).
+var powerRows = [3]string{"Suspend", "Snapshot", "Lock"}
 
 // gosnapBin is the binary the Snapshot row drives.
 const gosnapBin = "GOSNAP.ELF"
@@ -52,7 +53,7 @@ const (
 	powerMenuW   = 88
 	powerRowH    = 20
 	powerMenuGap = 4
-	powerMenuH   = 2*powerRowH + 6
+	powerMenuH   = 3*powerRowH + 6
 )
 
 // power state. sink is the focus-stealing invisible window; 0 when none.
@@ -215,6 +216,11 @@ func runPowerRow(i int) {
 	switch i {
 	case 1:
 		requestSnapshot()
+	case 2:
+		// M190e: Lock's modal is the curtain, not the menu — dismiss first
+		// so the PWR sink's focus hands cleanly to the lock's own sink.
+		dismissPowerMenu()
+		requestLock()
 	default:
 		requestSuspend()
 	}

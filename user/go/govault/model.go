@@ -22,7 +22,11 @@
 // locked vault holds no secret material at all.
 package main
 
-import "crypto/sha256"
+import (
+	"crypto/sha256"
+
+	"virelai/vaultlib"
+)
 
 const (
 	// idleLockNs is five idle minutes in Nanotime units.
@@ -130,7 +134,7 @@ func (c clipTag) empty() bool { return c.len == 0 }
 // wipe clears the tag (it names no secret material, but a clean shutdown is
 // a clean shutdown).
 func (c *clipTag) wipe() {
-	zero(c.sum[:])
+	vaultlib.Zero(c.sum[:])
 	c.len = 0
 }
 
@@ -146,9 +150,9 @@ const (
 	// It offers no unlock attempt — spending a passphrase on a file that is
 	// not a vault teaches nothing and risks nothing worth the risk.
 	scrBadFile
-	// scrList is the unlocked face: the entry list with per-entry reveal.
+	// scrList is the unlocked face: the vaultlib.Entry list with per-vaultlib.Entry reveal.
 	scrList
-	// scrAdd is the add-entry face: name, masked secret, note.
+	// scrAdd is the add-vaultlib.Entry face: name, masked secret, note.
 	scrAdd
 	// scrReceipts is the receipts face: the vault's own receipts file
 	// listed back, read-only (M148b).
@@ -171,16 +175,16 @@ type model struct {
 	// it. salt and iters are not secret (they sit in the plaintext header);
 	// they are kept so a save re-seals under the SAME header the unlock
 	// proved, while key IS the session secret.
-	entries []entry
+	entries []vaultlib.Entry
 	key     []byte
 	salt    []byte
 	iters   uint32
 	sel     int
-	shown   map[int]bool // per-entry reveal
+	shown   map[int]bool // per-vaultlib.Entry reveal
 
 	// rcpts is the loaded receipts view (M148b): metadata rows, never
 	// secret material. It is cleared on lock anyway — the view reloads
-	// from the file on entry, so a locked vault holds no stale copy.
+	// from the file on vaultlib.Entry, so a locked vault holds no stale copy.
 	rcpts []receipt
 
 	dl    deadlines
@@ -192,9 +196,9 @@ type model struct {
 // The clip deadline survives: the clipboard is still holding the plaintext
 // we put there, locked or not.
 func (m *model) lock() {
-	zeroEntries(m.entries)
+	vaultlib.ZeroEntries(m.entries)
 	m.entries = nil
-	zero(m.key)
+	vaultlib.Zero(m.key)
 	m.key = nil
 	m.shown = nil
 	m.sel = 0
@@ -210,7 +214,7 @@ func (m *model) lock() {
 // unlocked installs a freshly opened session. key and salt are retained for
 // saves; the idle deadline starts from the unlock itself (creating and then
 // walking away is still idle).
-func (m *model) unlocked(entries []entry, key, salt []byte, iters uint32, now int64) {
+func (m *model) unlocked(entries []vaultlib.Entry, key, salt []byte, iters uint32, now int64) {
 	m.entries = entries
 	m.key = key
 	m.salt = salt
@@ -221,7 +225,7 @@ func (m *model) unlocked(entries []entry, key, salt []byte, iters uint32, now in
 	m.dl.activity(now)
 }
 
-// toggleReveal flips the selected entry's reveal. Reveal is per entry by
+// toggleReveal flips the selected vaultlib.Entry's reveal. Reveal is per vaultlib.Entry by
 // contract — one row's secret on screen, never the column.
 func (m *model) toggleReveal() bool {
 	if m.scr != scrList || m.sel < 0 || m.sel >= len(m.entries) {
@@ -231,7 +235,7 @@ func (m *model) toggleReveal() bool {
 	return true
 }
 
-// revealed reports whether entry i is face-up.
+// revealed reports whether vaultlib.Entry i is face-up.
 func (m *model) revealed(i int) bool { return m.shown[i] }
 
 // move clamps the selection inside the list.
@@ -253,25 +257,22 @@ func (m *model) move(delta int) bool {
 	return true
 }
 
-// addEntry appends a bounded entry. The name is required — an entry you
-// cannot name is an entry you cannot find. Copies are taken so the caller's
+// addEntry appends a bounded vaultlib.Entry. The name is required — an vaultlib.Entry you
+// cannot name is an vaultlib.Entry you cannot find. Copies are taken so the caller's
 // field buffers can be cleared without aliasing session material. totp is
 // the canonical base32 seed parseOTPSecret produced — never validated here,
 // the intake face owns that refusal.
 func (m *model) addEntry(name, secret, note, totp []byte) bool {
-	if len(name) == 0 || len(name) > maxName || len(secret) > maxSecret ||
-		len(note) > maxNote || len(totp) > maxTotp || len(m.entries) >= maxEntries {
+	if len(name) == 0 || len(name) > vaultlib.MaxName || len(secret) > vaultlib.MaxSecret ||
+		len(note) > vaultlib.MaxNote || len(totp) > vaultlib.MaxTotp || len(m.entries) >= vaultlib.MaxEntries {
 		return false
 	}
-	e := entry{
-		name:   append([]byte(nil), name...),
-		secret: append([]byte(nil), secret...),
-	}
+	e := vaultlib.Entry{Name: append([]byte(nil), name...), Secret: append([]byte(nil), secret...)}
 	if len(note) > 0 {
-		e.note = append([]byte(nil), note...)
+		e.Note = append([]byte(nil), note...)
 	}
 	if len(totp) > 0 {
-		e.totp = append([]byte(nil), totp...)
+		e.Totp = append([]byte(nil), totp...)
 	}
 	m.entries = append(m.entries, e)
 	m.sel = len(m.entries) - 1
@@ -283,20 +284,20 @@ func (m *model) addEntry(name, secret, note, totp []byte) bool {
 // the imported row is counted skipped — nothing is silently overwritten.
 // Callers zero the source slice afterwards; the fields merge keeps are
 // cloned, so wiping the import copy strands nothing live.
-func (m *model) mergeEntries(imported []entry) (added, skipped int) {
+func (m *model) mergeEntries(imported []vaultlib.Entry) (added, skipped int) {
 	for _, e := range imported {
 		dup := false
 		for i := range m.entries {
-			if equalBytes(m.entries[i].name, e.name) {
+			if vaultlib.EqualBytes(m.entries[i].Name, e.Name) {
 				dup = true
 				break
 			}
 		}
-		if dup || len(e.name) == 0 {
+		if dup || len(e.Name) == 0 {
 			skipped++
 			continue
 		}
-		if !m.addEntry(e.name, e.secret, e.note, e.totp) {
+		if !m.addEntry(e.Name, e.Secret, e.Note, e.Totp) {
 			skipped++
 			continue
 		}
@@ -305,11 +306,11 @@ func (m *model) mergeEntries(imported []entry) (added, skipped int) {
 	return added, skipped
 }
 
-// hasTotp reports whether any entry carries a seed — the repaint tick's arm
+// hasTotp reports whether any vaultlib.Entry carries a seed — the repaint tick's arm
 // condition and the draw path's column decision share this one answer.
 func (m *model) hasTotp() bool {
 	for i := range m.entries {
-		if len(m.entries[i].totp) > 0 {
+		if len(m.entries[i].Totp) > 0 {
 			return true
 		}
 	}

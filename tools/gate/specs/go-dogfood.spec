@@ -298,6 +298,7 @@ for name, how in (("GOTABWM.ELF", "build-gotabwm.sh"),
                   ("GOSOUND.ELF", "build-gosound.sh"),
                   ("GOEDIT.ELF", "build-goedit.sh"),
                   ("GOVIEW.ELF", "build-goview.sh"),
+                  ("GOVAULT.ELF", "build-govault.sh"),
                   ("GOSET.ELF", "build-goset.sh")):
     src = os.path.join(".build", "go", name)
     if not os.path.exists(src):
@@ -312,7 +313,7 @@ if os.path.exists(os.path.join(share, "SETTINGS.TXT")):
     sys.exit("SETTINGS.TXT already present in the share; the dogfood beat must "
              "boot with no persisted `wm`")
 print("staged GOTABWM/GOSH/NOTE/GOCALC/WEB/GOTERM/CHARMHELLO/GOFILES/GOSOUND/"
-      "GOEDIT/GOVIEW/GOSET + DOGFOOD.HTML from the pinned gate-page.html fixture")
+      "GOEDIT/GOVIEW/GOVAULT/GOSET + DOGFOOD.HTML from the pinned gate-page.html fixture")
 PY
 
 # M82d2 (#1785): boot 05's notice sender is GOFILES.ELF (its completed copy
@@ -3032,3 +3033,123 @@ for y in (360, 600):
 print("%s %dx%d ctype=%d: rows 360,600 byte-equal to the scanout (%s)"
       % (os.path.basename(path), w, h, ct, os.path.basename(snaps[0])))
 PY
+
+# ---------------------------------------------------------------------------
+# M190e (#3240): the screen lock over the vault credential. Two boots.
+#
+#   boot 11  refusal leg: no VAULT.BIN on the share -> ctrl+shift+l names
+#            'gotabwm: lock refused no_credential' and the screen stays live
+#   boot 12  the leg: GOVAULT mints hunter2 -> the chord drops the curtain ->
+#            typed keys reach nothing hosted -> wrong pass refuses -> right
+#            pass unlocks -> the restored prompt answers an Enter
+#
+# The seat reads /host/GOVAULT/VAULT.BIN directly (uid_user reads its own
+# 0600) and verifies through virelai/vaultlib — the same codec GOVAULT
+# opens with. The swallow is the sink window holding kernel focus: ADR
+# 0009's KEY_DOWN fan-out lands on the seat's own window, so `ls` + the
+# passphrases typed while locked never reach GOSH — asserted as no
+# 'gosh: line' row between 'gotabwm: locked' and 'gotabwm: unlocked'.
+# ---------------------------------------------------------------------------
+
+vgate_file script-11a.txt <<'EOF'
+vf rm GOVAULT/VAULT.BIN
+EOF
+
+vgate_file script-11b.txt <<'EOF'
+echo rx-dogfood-11-ok
+EOF
+
+vgate_run 11 -- \
+    --via-virtio \
+    --script '$RUN_DIR/script-11a.txt' \
+    --script-after 'gosh: prompt' \
+    --input-chords 'ctrl-shift-l' \
+    --input-chords-after 'vf: rm GOVAULT/VAULT.BIN' \
+    --script2 '$RUN_DIR/script-11b.txt' \
+    --script2-after 'gotabwm: lock refused no_credential' \
+    --script-expect 'rx-dogfood-11-ok' --timeout 240
+
+vgate_assert 11 serial-contains 'wm: autostart gotabwm (settings wm=gotabwm)'
+vgate_assert 11 serial-contains 'gotabwm: mode live'
+vgate_assert 11 serial-contains 'gosh: prompt'
+# The named refusal, and the honest never-locked: no curtain, no unlock.
+vgate_assert 11 serial-contains 'gotabwm: lock refused no_credential'
+vgate_assert 11 serial-absent 'gotabwm: locked'
+vgate_assert 11 serial-absent 'gotabwm: unlock failed'
+vgate_assert 11 serial-absent 'gotabwm: unlocked'
+# The refusal is a UI-surface marker itself (the power row's name + serial);
+# the refusal-pair audit must not flag it as serial-only.
+vgate_assert 11 serial-contains 'rx-dogfood-11-ok'
+vgate_assert 11 serial-absent '[EXC] parking:'
+vgate_assert 11 serial-absent 'exited status=139'
+
+vgate_file script-12a.txt <<'EOF'
+exec GOVAULT.ELF
+EOF
+
+vgate_file script-12b.txt <<'EOF'
+echo rx-dogfood-12-ok
+EOF
+
+vgate_run 12 -- \
+    --via-virtio \
+    --script '$RUN_DIR/script-12a.txt' \
+    --script-after 'gosh: prompt' \
+    --input-chords 'h,u,n,t,e,r,2,return,h,u,n,t,e,r,2,return' \
+    --input-chords-after 'govault: new vault' \
+    --input-chords2 'ctrl-shift-l' \
+    --input-chords2-after 'govault: saved' \
+    --input-string $'ls\nbadpass\nhunter2\n' \
+    --input-string-after 'gotabwm: locked' \
+    --pointer-virtio '100,11,c' \
+    --pointer-virtio-after 'gotabwm: unlocked' \
+    --input-key 36 \
+    --input-key-after 'gotabwm: rail-click' \
+    --script2 '$RUN_DIR/script-12b.txt' \
+    --script2-after 'gotabwm: unlocked' --script2-delay 4 \
+    --script-expect 'rx-dogfood-12-ok' --timeout 300
+
+vgate_assert 12 serial-contains 'wm: autostart gotabwm (settings wm=gotabwm)'
+vgate_assert 12 serial-contains 'gotabwm: mode live'
+vgate_assert 12 serial-contains 'gosh: prompt'
+
+# The credential leg: GOVAULT minted the vault the seat locks over.
+vgate_assert 12 serial-contains 'exec: loaded GOVAULT.ELF'
+vgate_assert 12 serial-contains 'govault: new vault'
+vgate_assert 12 serial-contains 'govault: saved'
+
+# The leg itself: chord locked, ls\n + badpass\n both refused, hunter2\n
+# unlocked — and nothing typed under the curtain produced a shell line.
+vgate_assert 12 serial-contains 'gotabwm: locked'
+vgate_assert 12 serial-count 'gotabwm: unlock failed' 2
+vgate_assert 12 serial-contains 'gotabwm: unlocked'
+vgate_assert 12 serial-absent 'gosh: line ls'
+vgate_assert 12 serial-absent 'gosh: line badpass'
+vgate_assert 12 serial-absent 'gotabwm: lock refused'
+vgate_assert 12 python <<'PY'
+import os, sys
+lines = open(os.environ["VG_SER"], errors="replace").read().splitlines()
+def at(marker):
+    for i, l in enumerate(lines):
+        if marker in l:
+            return i
+    sys.exit("missing marker: %r" % marker)
+locked, unlocked = at("gotabwm: locked"), at("gotabwm: unlocked")
+# No hosted-app line while locked: the sink held kernel focus, so ADR 0009
+# had nowhere to deliver — the passphrase field is the seat's alone.
+for i in range(locked, unlocked):
+    if lines[i].startswith("gosh: line") or lines[i].startswith("govault: rcpt"):
+        sys.exit("input reached a hosted app under the curtain: %r" % lines[i])
+# The prompt is live after unlock: unlock restored focus to GOVAULT (the
+# tab the chord found focused), the rail click handed it back to GOSH, and
+# the one Return keyDown answered with an empty 'gosh: line ' submit.
+for l in lines[unlocked:]:
+    if l.rstrip() == "gosh: line":
+        print("lock leg: no hosted input under the curtain; prompt live after unlock")
+        break
+else:
+    sys.exit("no 'gosh: line ' after 'gotabwm: unlocked' — prompt never answered")
+PY
+vgate_assert 12 serial-contains 'rx-dogfood-12-ok'
+vgate_assert 12 serial-absent '[EXC] parking:'
+vgate_assert 12 serial-absent 'exited status=139'

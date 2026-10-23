@@ -149,6 +149,11 @@ func idleAdvance(ticks uint64) {
 	if idleAfter == 0 || ticks < lastInputTick {
 		return
 	}
+	// M190e (#3240): the lock curtain owns the frame — the idle ramp stays
+	// parked while it is up (its input pinning already holds lastInputTick).
+	if lockActive {
+		return
+	}
 	// A wake still owed its presented frame cannot be regressed by
 	// heartbeats counted while the paint was deferred (#2730): the drain
 	// may consume newer ticks after the input that anchors to seatTick,
@@ -866,11 +871,17 @@ func compositePaint(scan []byte, ticks uint64, presents *int) (presented bool) {
 	// — the gesture owns the frame while the button is held — and under
 	// the idle curtain like the rest (the curtain is visual, not input).
 	ghostPainted := paintDragGhost(scan)
-	switch idleState {
-	case idleDim:
-		_ = paintIdleDim(scan, vi.ScanoutWidth, vi.ScanoutHeight)
-	case idleCurtain:
-		_ = paintIdleCurtain(scan, vi.ScanoutWidth, vi.ScanoutHeight)
+	// M190e (#3240): the lock curtain is the topmost layer and owns the
+	// frame outright while it is up — the idle overlay never paints under it.
+	if lockActive {
+		_ = paintLockCurtain(scan, vi.ScanoutWidth, vi.ScanoutHeight)
+	} else {
+		switch idleState {
+		case idleDim:
+			_ = paintIdleDim(scan, vi.ScanoutWidth, vi.ScanoutHeight)
+		case idleCurtain:
+			_ = paintIdleCurtain(scan, vi.ScanoutWidth, vi.ScanoutHeight)
+		}
 	}
 	if !demoMode {
 		syncSeatChrome(scan)
@@ -1055,8 +1066,22 @@ func consumeSeatEvent(e vi.Event) bool {
 	if e.Kind != vi.EvCompositeTick {
 		lastActivityTick = seatTick
 	}
+	// M190e (#3240): while the lock curtain is up every input kind feeds
+	// the curtain or nothing at all — the kind-1 KEY_DOWN lands here
+	// because the lock's sink window holds kernel focus (its owner's queue
+	// is the seat's), the kind-21 mirror is swallowed before the chord
+	// dispatch, and pointer samples die on the same boundary.
+	if lockActive && e.Kind == vi.EvKeyDown {
+		lastInputTick = seatTick
+		lockKeyDown(e)
+		return false
+	}
 	if e.Kind == vi.EvWmPointer {
 		vi.ConsoleLine(MarkerPtr)
+		if lockActive {
+			lastInputTick = seatTick
+			return false
+		}
 		if idleInput(seatTick) {
 			return false
 		}
@@ -1066,6 +1091,10 @@ func consumeSeatEvent(e vi.Event) bool {
 	}
 	if e.Kind == vi.EvWmKey {
 		vi.ConsoleLine(MarkerKey)
+		if lockActive {
+			lastInputTick = seatTick
+			return false
+		}
 		if idleInput(seatTick) {
 			return false
 		}

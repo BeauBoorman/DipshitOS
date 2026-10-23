@@ -178,6 +178,12 @@ var Global = Table{
 		"summon the emoji picker — launch GOEMOJI.ELF by name " +
 			"(M146a ships the target)",
 		"#2752 (M132a)", false},
+	// M190e (#3240): the screen lock. ctrl+shift+l is free at every scope —
+	// the kernel's frozen letter rows are c,v,f,k,r and plain ctrl+l is
+	// GOSH's clear-screen, a dispatch point the seat row never preempts.
+	{Chord{ModCtrl | ModShift, UsageL}, "seat", ScopeSeat, "lock",
+		"drop the lock curtain — unlock re-auths the vault passphrase",
+		"#3240 (M190e)", false},
 
 	// --- apps: each app's own chords, live while that app is focused
 	// (ADR 0009 KEY_DOWN). GOSH's are the shlib line editor's

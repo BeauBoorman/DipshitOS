@@ -6,8 +6,26 @@ package main
 import (
 	"testing"
 
+	"virelai/vaultlib"
 	"virelai/vi"
 )
+
+// The codec fixtures moved with the codec (vaultlib, M190e #3240) — the
+// app's model/receipt/TOTP tests still build sessions over a pinned
+// salt/nonce/iterations so a sealed blob is reproducible.
+var (
+	testSalt  = []byte("0123456789abcdef")
+	testNonce = []byte("fedcba987654")
+	testPass  = []byte("correct horse")
+	testIters = uint32(50_000)
+)
+
+func testEntries() []vaultlib.Entry {
+	return []vaultlib.Entry{
+		{Name: []byte("wifi"), Secret: []byte("s3cr3t"), Note: []byte("home")},
+		{Name: []byte("bank"), Secret: []byte("hunter2")},
+	}
+}
 
 // The compare rule: the expiry clears ONLY when the clipboard still holds
 // exactly our secret — a different body (longer, shorter, different bytes)
@@ -99,15 +117,15 @@ func TestDeadlineCeiling(t *testing.T) {
 }
 
 // Lock wipes every byte of session material: the derived key, every field of
-// every entry, the passphrase-side state — and the clip lease survives (the
+// every vaultlib.Entry, the passphrase-side state — and the clip lease survives (the
 // shared buffer still holds our copy; clearing it is not the vault's choice
 // to unmake).
 func TestLockZeroesSession(t *testing.T) {
 	m := &model{}
 	key := []byte("0123456789abcdef0123456789abcdef")
 	salt := []byte("fedcba9876543210")
-	entries := []entry{
-		{name: []byte("wifi"), secret: []byte("s3cr3t"), note: []byte("home")},
+	entries := []vaultlib.Entry{
+		{Name: []byte("wifi"), Secret: []byte("s3cr3t"), Note: []byte("home")},
 	}
 	m.unlocked(entries, key, salt, testIters, 0)
 	m.sel = 0
@@ -130,10 +148,10 @@ func TestLockZeroesSession(t *testing.T) {
 			t.Fatalf("key byte %d survived lock", i)
 		}
 	}
-	for _, f := range [][]byte{keptEntry.name, keptEntry.secret, keptEntry.note} {
+	for _, f := range [][]byte{keptEntry.Name, keptEntry.Secret, keptEntry.Note} {
 		for i, b := range f {
 			if b != 0 {
-				t.Fatalf("entry field byte %d survived lock", i)
+				t.Fatalf("vaultlib.Entry field byte %d survived lock", i)
 			}
 		}
 	}
@@ -148,23 +166,23 @@ func TestLockZeroesSession(t *testing.T) {
 	}
 }
 
-// Reveal is per entry: one row face-up, the rest still masked; a lock drops
+// Reveal is per vaultlib.Entry: one row face-up, the rest still masked; a lock drops
 // every reveal with the session.
 func TestRevealIsPerEntry(t *testing.T) {
 	m := &model{}
-	entries := []entry{
-		{name: []byte("a"), secret: []byte("sa")},
-		{name: []byte("b"), secret: []byte("sb")},
+	entries := []vaultlib.Entry{
+		{Name: []byte("a"), Secret: []byte("sa")},
+		{Name: []byte("b"), Secret: []byte("sb")},
 	}
 	m.unlocked(entries, make([]byte, 32), make([]byte, 16), testIters, 0)
 	m.sel = 1
 	m.toggleReveal()
 	if !m.revealed(1) || m.revealed(0) {
-		t.Fatal("reveal must be per-entry: sel 1 up, sel 0 down")
+		t.Fatal("reveal must be per-vaultlib.Entry: sel 1 up, sel 0 down")
 	}
 	m.toggleReveal()
 	if m.revealed(1) {
-		t.Fatal("second toggle must hide the entry again")
+		t.Fatal("second toggle must hide the vaultlib.Entry again")
 	}
 	m.sel = 0
 	m.toggleReveal()
@@ -238,16 +256,16 @@ func TestAddEntryClones(t *testing.T) {
 	m := &model{}
 	name, secret, note := []byte("n"), []byte("s"), []byte("t")
 	if !m.addEntry(name, secret, note, nil) {
-		t.Fatal("addEntry refused a valid entry")
+		t.Fatal("addEntry refused a valid vaultlib.Entry")
 	}
-	zero(name)
-	zero(secret)
-	zero(note)
-	if string(m.entries[0].secret) != "s" {
-		t.Fatal("the stored entry must not alias the field buffer")
+	vaultlib.Zero(name)
+	vaultlib.Zero(secret)
+	vaultlib.Zero(note)
+	if string(m.entries[0].Secret) != "s" {
+		t.Fatal("the stored vaultlib.Entry must not alias the field buffer")
 	}
 	if m.addEntry(nil, []byte("s"), nil, nil) {
-		t.Fatal("a nameless entry must refuse")
+		t.Fatal("a nameless vaultlib.Entry must refuse")
 	}
 	if m.sel != 0 {
 		t.Fatalf("sel=%d, want the new row selected", m.sel)
