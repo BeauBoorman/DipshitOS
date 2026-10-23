@@ -229,6 +229,29 @@ func (b *ActionButton) OnClick(x, y int) bool {
 	return b.OnActivate()
 }
 
+// Outline renders the ring as the window's control outline: every item's
+// subtree at depth, in ring order — the same order Tab walks, so a
+// published outline's focus path is the key path the user drives. The
+// item at the ring's current index receives the focus verdict. An item
+// that does not implement Accessible still appears — RoleUnknown with no
+// name — so a gap in the outline is visible rather than silent.
+func (r *FocusRing) Outline(depth int) []Node {
+	_, idx := r.Current()
+	out := make([]Node, 0, len(r.items))
+	for i, item := range r.items {
+		if a, ok := item.(Accessible); ok {
+			out = append(out, a.A11yTree(depth, i == idx)...)
+			continue
+		}
+		var st State
+		if i == idx {
+			st = StateFocused
+		}
+		out = append(out, Node{Depth: depth, Role: RoleUnknown, State: st})
+	}
+	return out
+}
+
 // HandleClick focuses the first matching control and then lets it consume the
 // click. Later controls can overlap a button's label, so registration order is
 // the documented z-order for this small primitive.

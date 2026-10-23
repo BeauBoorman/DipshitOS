@@ -42,7 +42,7 @@ GOWELCOME.ELF	-	file,window,memory,process,debug	surface: ReadFileAll for the SE
 GOTOP.ELF	file,window,memory,process,debug	file,window,memory,process,debug,net	surface: NetStats* pane — slot 62 sys_net_stats is net-grouped (user/go/top)
 GOSET.ELF	window,memory,process,debug	file,window,audio,memory,process,debug	declared caps=file; surface: the audio_volume row applies through slot 44 — vi.AudioVolume (user/go/goset)
 GODIFF.ELF	memory,process,debug	file,memory,process,debug	declared caps=file; a diff tool reads both inputs
-GOVIEW.ELF	window,memory,process,debug	file,window,memory,process,debug	opens=image handler contract; no image was handed in the audit window
+GOVIEW.ELF	window,memory,process,debug	file,window,timer,memory,process,debug	opens=image handler contract; no image was handed in the audit window; surface: TimerSetNs playback arm + EvTimer dispatch (user/go/view/main.go)
 GOSOUND.ELF	window,memory,process,debug	file,window,audio,memory,process,debug	declared caps=file,window,audio + opens=audio; playback was not exercised
 GOSTORE.ELF	window,memory,process,debug	file,window,memory,process,debug,net	declared caps=file,net; the install/fetch path (Dial + WriteFileSafe) was not exercised
 GOTABWM.ELF	window,memory,process,debug	file,window,audio,memory,process,debug,net	surface: the seat reads /host/APPS.TXT + settings (File*/ReadFileAll), drives AudioStream*, and holds the Listen/TCP* remote lane (user/go/gotabwm)
@@ -74,3 +74,4 @@ GOIRC.ELF	file,window,memory,process,debug,net	file,window,memory,process,debug,
 GOVAULT.ELF	file,window,timer,memory,process,debug	file,window,timer,memory,process,debug	-
 GOPAINT.ELF	file,window,memory,process,debug	file,window,memory,process,debug	-
 GOMAIL.ELF	file,net	file,net	-
+GOA11Y.ELF	-	file,window,timer,memory,process,debug	not audited — M177b (#3143) new app; declared caps=file,window,timer + the observed Go-runtime ambient set (debug,memory,process); surface ReadFileAll outline read + TimerSetNs poll + WmWindows kind-16 query (user/go/goa11y)

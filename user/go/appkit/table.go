@@ -6,7 +6,10 @@ package appkit
 // virtualizes rows, the controller only ever moves Sel and the two scroll
 // offsets, so a sheet-sized model costs nothing per keystroke.
 
-import "virelai/widgets"
+import (
+	"virelai/vi"
+	"virelai/widgets"
+)
 
 // TableController drives a widgets.Table. Row/Col on the widget are the
 // focused cell — the selection. OnActivate fires on Enter over a cell and
@@ -165,6 +168,42 @@ func (c *TableController) OnClick(x, y int) bool {
 		return true
 	}
 	return false
+}
+
+// A11yTree reports the grid's outline (M177b #3143): the control node,
+// one row node per column header, and one row node naming the focused
+// cell's row — "row <i> of <n>" carries the index and the row count, the
+// only data the outline is allowed to leak (D2: labels, never contents).
+// The focused row is the focused item when the verdict lands here.
+func (c *TableController) A11yTree(depth int, focused bool) []Node {
+	self := Node{Depth: depth, Role: RoleTable, Name: "Table"}
+	var t *widgets.Table
+	if c != nil {
+		t = c.Table
+	}
+	if t != nil && t.Disabled {
+		self.State |= StateDisabled
+	}
+	hasCell := t != nil && t.Rows > 0 && t.Row >= 0 && t.Col >= 0
+	if focused && !hasCell {
+		self.State |= StateFocused
+	}
+	out := []Node{self}
+	if t == nil {
+		return out
+	}
+	for _, col := range t.Cols {
+		out = append(out, Node{Depth: depth + 1, Role: RoleRow, Name: col.Title})
+	}
+	if hasCell {
+		rn := Node{Depth: depth + 1, Role: RoleRow, State: StateSelected,
+			Name: "row " + vi.Itoa64(int64(t.Row+1)) + " of " + vi.Itoa64(int64(t.Rows))}
+		if focused {
+			rn.State |= StateFocused
+		}
+		out = append(out, rn)
+	}
+	return out
 }
 
 func (c *TableController) Bounds() widgets.Rect       { return c.Table.Bounds() }

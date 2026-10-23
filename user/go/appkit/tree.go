@@ -440,6 +440,43 @@ func (c *TreeController) OnClick(x, y int) bool {
 	return changed
 }
 
+// A11yTree reports the outline's own shape (M177b #3143): the control
+// node, then every flattened row as a treeitem at its model depth — a
+// nested outline reads exactly the way it paints. The selected row is the
+// focused item when the focus verdict lands on this control; a control
+// with no selected row keeps the focus on its own node.
+func (c *TreeController) A11yTree(depth int, focused bool) []Node {
+	self := Node{Depth: depth, Role: RoleTree, Name: "Tree"}
+	sel := -1
+	if c != nil && c.View != nil {
+		sel = c.View.Sel
+		if c.View.Disabled {
+			self.State |= StateDisabled
+		}
+	}
+	if focused && sel < 0 {
+		self.State |= StateFocused
+	}
+	out := []Node{self}
+	if c == nil || c.View == nil {
+		return out
+	}
+	for i, row := range c.View.Rows {
+		n := Node{Depth: depth + 1 + row.Depth, Role: RoleTreeItem, Name: row.Label}
+		if row.HasKids && row.Expanded {
+			n.State |= StateExpanded
+		}
+		if i == sel {
+			n.State |= StateSelected
+			if focused {
+				n.State |= StateFocused
+			}
+		}
+		out = append(out, n)
+	}
+	return out
+}
+
 func (c *TreeController) Bounds() widgets.Rect       { return c.View.Bounds() }
 func (c *TreeController) HitTest(x, y int) bool      { return c.View.HitTest(x, y) }
 func (c *TreeController) Draw(cv widgets.RectCanvas) { c.View.Draw(cv) }

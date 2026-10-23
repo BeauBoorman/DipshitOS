@@ -922,12 +922,12 @@ test "sexiburger manifest: the real image/apps.txt decodes whole under the v1 fo
     // additive change is invisible to the Zig seats.
     var out: [64]MenuApp = undefined;
     const n = parse_apps_manifest(text, &out);
-    try std.testing.expectEqual(@as(usize, 30), n);
+    try std.testing.expectEqual(@as(usize, 31), n);
 
     // The dock set is what the mirrors claim about this file. WND.BIN's
     // god-menu selection test says "8 dock + dup stems past the cutoff" and
     // the kernel dock renderer says "first 5 from image/apps.txt" — the
-    // first number is only true while this file has exactly 8 docked rows,
+    // first number is only true while this file has exactly 9 docked rows,
     // so it is pinned here against the real file rather than left to a
     // synthetic 22-entry fixture that can drift from it unnoticed.
     var dock: usize = 0;
@@ -936,7 +936,7 @@ test "sexiburger manifest: the real image/apps.txt decodes whole under the v1 fo
         try std.testing.expect(app.name.len > 0);
         try std.testing.expect(app.desc.len > 0);
     }
-    try std.testing.expectEqual(@as(usize, 8), dock);
+    try std.testing.expectEqual(@as(usize, 9), dock);
 
     // The manifest's own contract: a v2 row declares its version in field 5,
     // which no reader above looks at, and every row still has a name and a

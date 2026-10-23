@@ -457,6 +457,62 @@ func (b *MenuBar) OnClick(x, y int) bool {
 	return b.Close()
 }
 
+// A11yTree reports the bar's outline (M177b #3143): the bar node, one
+// menu node per title, and — only while a menu is open — that menu's
+// items, so the outline is the structure the user can reach, not a dump
+// of every menu's contents. The focused node is the highlighted item in
+// an open menu, the highlighted title while menu mode is engaged, or the
+// bar itself on a plain ring focus.
+func (b *MenuBar) A11yTree(depth int, focused bool) []Node {
+	bar := Node{Depth: depth, Role: RoleMenuBar, Name: "Menu bar"}
+	if b.Active {
+		bar.State |= StateExpanded
+	}
+	if focused && !b.Active {
+		bar.State |= StateFocused
+	}
+	out := []Node{bar}
+	for i := range b.Menus {
+		title, _, _ := mnemonic(b.Menus[i].Title)
+		mn := Node{Depth: depth + 1, Role: RoleMenu, Name: title}
+		open := b.Open && i == b.Bar
+		if b.Active && i == b.Bar {
+			mn.State |= StateSelected
+			switch {
+			case open:
+				mn.State |= StateExpanded
+				// An open menu with no hovered item keeps the focus on
+				// its title node.
+				if b.Hover < 0 && focused {
+					mn.State |= StateFocused
+				}
+			case focused:
+				mn.State |= StateFocused
+			}
+		}
+		out = append(out, mn)
+		if !open {
+			continue
+		}
+		for j := range b.Menus[i].Items {
+			it := &b.Menus[i].Items[j]
+			label, _, _ := mnemonic(it.Label)
+			in := Node{Depth: depth + 2, Role: RoleMenuItem, Name: label}
+			if it.Disabled {
+				in.State |= StateDisabled
+			}
+			if j == b.Hover {
+				in.State |= StateSelected
+				if focused {
+					in.State |= StateFocused
+				}
+			}
+			out = append(out, in)
+		}
+	}
+	return out
+}
+
 // runText paints one clipped run with the pen at x — through Canvas.Text on
 // a full canvas (nil face degrades inside it), or the bitmap painter on a
 // fill-only surface.

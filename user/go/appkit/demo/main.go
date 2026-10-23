@@ -180,6 +180,33 @@ func main() {
 		},
 	}
 
+	// M177b (#3143): the opt-in outline. The window's control tree is
+	// serialized on every focus or structural change the loop drives —
+	// never per frame — and the write is skipped entirely when the bytes
+	// would be identical to the last publish, so an unhandled key costs
+	// nothing.
+	var lastOutline string
+	publish := func() {
+		nodes := []appkit.Node{{Role: appkit.RoleWindow, Name: "Dialog"}}
+		// While menu mode owns the keyboard the focused node lives in the
+		// bar's subtree; the ring keeps its own truth otherwise.
+		nodes = append(nodes, bar.A11yTree(1, bar.Active)...)
+		ringNodes := ring.Outline(1)
+		if bar.Active {
+			for i := range ringNodes {
+				ringNodes[i].State &^= appkit.StateFocused
+			}
+		}
+		nodes = append(nodes, ringNodes...)
+		enc := string(appkit.EncodeOutline(nodes))
+		if enc == lastOutline {
+			return
+		}
+		lastOutline = enc
+		appkit.PublishOutline(uint32(id), nodes)
+	}
+	publish()
+
 	painted := false
 	for running {
 		draw.FillRect(c, widgets.Rect{W: w, H: h}, draw.Opaque(theme.Current.Bg))
@@ -220,9 +247,12 @@ func main() {
 				continue
 			}
 			if bar.OnKey(k) {
+				publish()
 				continue
 			}
-			ring.HandleKey(k)
+			if ring.HandleKey(k) {
+				publish()
+			}
 		case vi.EvMouseDown:
 			x, y := int(ev.Arg0), int(ev.Arg1)
 			if d.Open {
@@ -230,11 +260,15 @@ func main() {
 				continue
 			}
 			if bar.OnClick(x, y) {
+				publish()
 				continue
 			}
-			ring.HandleClick(x, y)
+			if ring.HandleClick(x, y) {
+				publish()
+			}
 		}
 	}
+	_ = appkit.UnpublishOutline(uint32(id))
 	vi.WinClose(id)
 	vi.ConsoleLine("godialog: done")
 }
