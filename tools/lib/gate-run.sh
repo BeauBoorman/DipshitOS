@@ -199,6 +199,11 @@ gate_seed_share_contents() {
     elif [ -f FONTS-CHOOSE/Fira_Code_v6.2/ttf/FiraCode-Regular.ttf ]; then
         cp FONTS-CHOOSE/Fira_Code_v6.2/ttf/FiraCode-Regular.ttf "$SHARE/FIRACODE.TTF"
     fi
+    # 5b. The kana->kanji dictionary (M186c #3180): the packed JMdict
+    #     subset (CC BY-SA 4.0) layout.IME reads at /host/KANADICT.BIN.
+    if [ -f image/kanadict/KANADICT.BIN ]; then
+        cp image/kanadict/KANADICT.BIN "$SHARE/KANADICT.BIN"
+    fi
     echo "gate-run: share seeded at $SHARE ($(find "$SHARE" -maxdepth 1 -type f | wc -l | tr -d ' ') files, $(grep -cE '^[A-Z]' "$SHARE/APPS.TXT" 2>/dev/null || echo 0) APPS.TXT entries)"
 }
 

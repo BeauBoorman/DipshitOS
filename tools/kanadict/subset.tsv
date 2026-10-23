@@ -1,0 +1,184 @@
+# subset.tsv -- the pinned kana->kanji dictionary source (M186c #3180).
+#
+# Provenance: every row is a (reading, surface) pair as it appears in
+# JMdict (https://www.edrdg.org/wiki/index.php/JMdict-EDICT_Dictionary_Project),
+# the Electronic Dictionary Research and Development Group's Japanese
+# dictionary. JMdict is distributed under the Creative Commons
+# Attribution-ShareAlike Licence 4.0 (CC BY-SA 4.0) — admissible here
+# because the repo ban is GPL-family only; the licence is recorded in
+# user/go/ime/THIRD-PARTY.txt and the text ships beside the packed
+# artifact at image/kanadict/CC-BY-SA-4.0.txt.
+#
+# Coverage note (what this subset is, and is not):
+#   * ~120 of the most common JMdict entries — the card's "smallest
+#     useful subset", not the full ~190k-entry JMdict.
+#   * One row per (reading, surface). `rank` is the frequency proxy the
+#     card requires: 1 is the most common surface for that reading
+#     (JMdict's common-word / news>ichi>spec marking), higher is rarer.
+#   * Kanji the staged guest face (image/fonts/NotoSansJP-Regular.ttf —
+#     kana + kyoiku kanji + symbols, ~1900 glyphs) cannot draw are
+#     EXCLUDED so a committed candidate never paints .notdef: 寿司 猫
+#     誰 彼 涼しい 狭い 遅い 嬉しい 鮨 箸 端 突き 蛙 and friends are
+#     absent on purpose, not by accident.
+#   * Out by design: kana-only entries, okurigana variants, multiword
+#     segmentation, readings outside this file. A reading absent here
+#     yields kana-only candidates — never a wrong kanji.
+#
+# Fields: reading <TAB> surface <TAB> rank
+# Pack with: python3 tools/kanadict/pack.py  (writes image/kanadict/KANADICT.BIN)
+
+にほんご	日本語	1
+にほん	日本	1
+かんじ	漢字	1
+とうきょう	東京	1
+がっこう	学校	1
+じかん	時間	1
+おんな	女	1
+おとこ	男	1
+げんき	元気	1
+しんぶん	新聞	1
+じしょ	辞書	1
+ひと	人	1
+きょう	今日	1
+あした	明日	1
+きのう	昨日	1
+えき	駅	1
+でんしゃ	電車	1
+たべる	食べる	1
+のむ	飲む	1
+みる	見る	1
+いく	行く	1
+くる	来る	1
+いぬ	犬	1
+やま	山	1
+かわ	川	1
+そら	空	1
+みず	水	1
+ひ	火	1
+き	木	1
+き	気	2
+かね	金	1
+つち	土	1
+ほん	本	1
+くるま	車	1
+おんがく	音楽	1
+えいが	映画	1
+しゃしん	写真	1
+てんき	天気	1
+あめ	雨	1
+ゆき	雪	1
+はな	花	1
+とり	鳥	1
+さかな	魚	1
+にく	肉	1
+ちゃ	茶	1
+さけ	酒	1
+あさ	朝	1
+よる	夜	1
+いえ	家	1
+くに	国	1
+わたし	私	1
+せんせい	先生	1
+がくせい	学生	1
+かいしゃ	会社	1
+しごと	仕事	1
+でんわ	電話	1
+とけい	時計	1
+かう	買う	1
+うる	売る	1
+よむ	読む	1
+かく	書く	1
+はなす	話す	1
+きく	聞く	1
+あるく	歩く	1
+はしる	走る	1
+かえる	帰る	1
+かえる	変える	2
+おおきい	大きい	1
+ちいさい	小さい	1
+あたらしい	新しい	1
+ふるい	古い	1
+よい	良い	1
+わるい	悪い	1
+たかい	高い	1
+やすい	安い	1
+あかい	赤い	1
+あおい	青い	1
+しろい	白い	1
+くろい	黒い	1
+あかるい	明るい	1
+ながい	長い	1
+みじかい	短い	1
+ひろい	広い	1
+おおい	多い	1
+すくない	少ない	1
+はやい	早い	1
+はやい	速い	2
+つよい	強い	1
+よわい	弱い	1
+おもい	重い	1
+かるい	軽い	1
+あつい	暑い	1
+さむい	寒い	1
+あたたかい	暖かい	1
+おいしい	美味しい	1
+たのしい	楽しい	1
+かなしい	悲しい	1
+おもしろい	面白い	1
+むずかしい	難しい	1
+やさしい	易しい	1
+やさしい	優しい	2
+うつくしい	美しい	1
+ただしい	正しい	1
+ほしい	欲しい	1
+あい	愛	1
+こころ	心	1
+こえ	声	1
+め	目	1
+みみ	耳	1
+くち	口	1
+て	手	1
+あし	足	1
+あたま	頭	1
+かお	顔	1
+ちから	力	1
+なまえ	名前	1
+ともだち	友達	1
+かぞく	家族	1
+ちち	父	1
+はは	母	1
+あに	兄	1
+あね	姉	1
+おとうと	弟	1
+いもうと	妹	1
+こども	子供	1
+なに	何	1
+まいにち	毎日	1
+きょねん	去年	1
+ことし	今年	1
+こんしゅう	今週	1
+せんしゅう	先週	1
+らいしゅう	来週	1
+ごぜん	午前	1
+ごご	午後	1
+いち	一	1
+に	二	1
+さん	三	1
+よん	四	1
+ご	五	1
+ろく	六	1
+なな	七	1
+はち	八	1
+きゅう	九	1
+じゅう	十	1
+ひゃく	百	1
+せん	千	1
+まん	万	1
+えん	円	1
+ねん	年	1
+つき	月	1
+つき	付き	2
+にち	日	1
+ふん	分	1
+びょう	秒	1
+はし	橋	1

@@ -38,6 +38,9 @@
 #       the prompt's romaji composer, n,i,h,o,n,g,o + Return commits
 #       hiragana, a second word cycles to katakana first, and the
 #       prompt's chain painting closes with fonts: notdef=0.
+#   10  (M186c #3180, stub) KANADICT.BIN staged: nihongo + one Space
+#       converts to the dict's top kanji (日本語) and commits it; a
+#       reading outside the subset commits kana-only — the honest bound.
 #
 # The armed share persists across iterations, so per-leg python tails
 # keep each iteration honest: legs 01-04 and leg 06 clear ASSIST/*.CHAT
@@ -146,9 +149,17 @@ for name, dst in (("fonts.txt", "FONTS.TXT"),
         sys.exit("%s missing (expected %s) - the font registry needs it"
                  % (name, src))
     shutil.copy(src, os.path.join(share, dst))
+# KANADICT.BIN (M186c #3180): the packed JMdict subset the prompt's
+# composer reads at /host/KANADICT.BIN. Leg 10's conversions come from
+# it; leg 09's words are outside the subset, so its pins hold either way.
+kd = os.path.join("image", "kanadict", "KANADICT.BIN")
+if not os.path.exists(kd):
+    sys.exit("%s missing - regenerate it: python3 tools/kanadict/pack.py"
+             % kd)
+shutil.copy(kd, os.path.join(share, "KANADICT.BIN"))
 with open(os.path.join(share, "SETTINGS.TXT"), "w") as f:
     f.write("#v2\nwm=none\n")
-print("staged Go seat + GOASSIST.ELF + FONTS.TXT/NOTOCJK.TTF, wm=none")
+print("staged Go seat + GOASSIST.ELF + FONTS.TXT/NOTOCJK.TTF/KANADICT.BIN, wm=none")
 PY
 
 # The model VIW (M111c #2410's owner-approved SmolLM2-135M-Instruct,
@@ -744,3 +755,44 @@ vgate_assert 09 serial-absent 'goassist: send conv='
 vgate_assert 09 serial-absent 'goassist: error'
 vgate_assert 09 serial-absent 'gpu3d: timeout'
 vgate_assert 09 serial-absent '[EXC] parking:'
+
+# --- leg 10 (M186c #3180): kana->kanji conversion through the field ----
+# Same deterministic stub shape as leg 09 — the prompt field is the whole
+# stage. With KANADICT.BIN staged (setup hook), 'nihongo' stages the
+# hiragana pre-edit and ONE Space converts to the dictionary's top
+# surface: 'ime commit 日本語' is the kanji reaching the text, and the
+# absent kana commit proves the kana did not just pass through. The
+# second word is a reading outside the curated subset: no conversion is
+# offered, so Return commits the hiragana — the card's honest bound.
+# 'fonts: notdef=0' again proves every painted rune (pre-edit, candidate
+# strip, committed kanji) found a face on the staged chain.
+vgate_file script-rx10.txt <<'EOF'
+echo rx-assist-10-ok
+EOF
+
+vgate_run 10 -- \
+    --screen '$RUN_DIR/screen-10' \
+    --gpu3d-metal --via-virtio \
+    --script '$RUN_DIR/script-seat.txt' \
+    --script2 '$RUN_DIR/script-stub.txt' \
+    --script2-after 'gotabwm: holding seat' \
+    --input-chords 'ctrl-j,n,i,h,o,n,g,o,space,return,h,u,g,a,h,u,g,a,return' \
+    --input-chords-after 'goassist: present' \
+    --script3 '$RUN_DIR/script-rx10.txt' \
+    --script3-after 'goassist: ime commit ふがふが' \
+    --script-expect 'rx-assist-10-ok' --timeout 300
+
+vgate_assert 10 serial-contains 'gotabwm: holding seat'
+vgate_assert 10 serial-contains 'goassist: present'
+vgate_assert 10 serial-contains 'goassist: ime on'
+vgate_assert 10 serial-contains 'goassist: ime commit 日本語'
+vgate_assert 10 serial-contains 'goassist: ime commit ふがふが'
+vgate_assert 10 serial-contains 'fonts: notdef=0'
+vgate_assert 10 serial-contains 'rx-assist-10-ok'
+vgate_assert 10 serial-absent 'goassist: ime commit にほんご'
+vgate_assert 10 serial-absent 'goassist: ime off'
+vgate_assert 10 serial-absent 'goassist: conv new'
+vgate_assert 10 serial-absent 'goassist: send conv='
+vgate_assert 10 serial-absent 'goassist: error'
+vgate_assert 10 serial-absent 'gpu3d: timeout'
+vgate_assert 10 serial-absent '[EXC] parking:'

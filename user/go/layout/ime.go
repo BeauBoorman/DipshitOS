@@ -1,16 +1,24 @@
 package layout
 
-// ime.go — M178b (#3145): a romaji->kana composer behind the Composer
-// seam stage.go names. Typed romaji accumulates as a live pre-edit shown
-// in hiragana; Space cycles the shown form hiragana -> katakana -> the
-// raw romaji; Return commits the shown form; Escape drops the buffer;
-// Backspace shortens it; any other non-text key commits the shown form
-// and then does its own job, the same don't-swallow rule Stage follows.
+import "virelai/ime"
+
+// ime.go — M178b (#3145) + M186c (#3180): a romaji->kana composer behind
+// the Composer seam stage.go names. Typed romaji accumulates as a live
+// pre-edit shown in hiragana; Space cycles the shown form hiragana ->
+// dictionary candidates -> katakana -> the raw romaji; Return commits
+// the shown form; Escape drops the buffer; Backspace shortens it; any
+// other non-text key commits the shown form and then does its own job,
+// the same don't-swallow rule Stage follows.
 //
 // The table is Hepburn plus the common kunrei spellings (si/ti/tu/hu,
 // zi/di/du, the sya/tya rows), the small-kana x/l spellings, doubled
-// consonants to the small tsu, and n/nn/n' to ん. Kanji conversion is
-// refused by design: there is no dictionary (D7).
+// consonants to the small tsu, and n/nn/n' to ん.
+//
+// Kanji conversion (M186c): when a packed dictionary is available the
+// committed reading (a pending n resolved to ん) looks up its surfaces
+// and they join the candidate cycle right after hiragana — Space is the
+// conversion key. An absent dictionary or an absent reading is the
+// honest bound: the three always-available forms, never a wrong kanji.
 
 // usageSpace is the USB HID usage for the spacebar — the candidate-cycle
 // key while a pre-edit is staged.
@@ -83,32 +91,75 @@ var kanaTable = map[string]string{
 // IME is a romaji->kana composer: the second Composer the field's seam
 // was cut for. Its buffer is the raw romaji the user typed; the shown
 // pre-edit is that buffer converted to hiragana, katakana, or echoed raw
-// — Space walks the three forms while a buffer is staged. The zero value
-// is a ready composer.
+// — Space walks the forms while a buffer is staged, with dictionary
+// candidates inserted after hiragana when a Dict resolves the reading.
+// The zero value is a ready composer.
 type IME struct {
 	buf []rune
-	sel int // 0 hiragana, 1 katakana, 2 raw romaji
+	sel int // index into the candidate list
+	// Dict overrides the staged dictionary. nil falls back to
+	// ime.Default() — /host/KANADICT.BIN — and an absent or corrupt file
+	// means kana-only candidates.
+	Dict *ime.Dict
+}
+
+// dict is the dictionary a lookup consults: the explicit Dict field, or
+// the staged default.
+func (i *IME) dict() *ime.Dict {
+	if i.Dict != nil {
+		return i.Dict
+	}
+	return ime.Default()
+}
+
+// forms is the candidate list in cycle order: hiragana first (the
+// always-right form), then the dictionary's surfaces for the committed
+// reading, then katakana, then the raw romaji. final resolves a pending
+// trailing n to ん in the kana forms; the dictionary always keys on the
+// resolved reading so a half-typed syllable never gates a conversion.
+func (i *IME) forms(final bool) []string {
+	if len(i.buf) == 0 {
+		return nil
+	}
+	h := convertKana(i.buf, final)
+	f := []string{h}
+	if d := i.dict(); d != nil {
+		f = append(f, d.Lookup(convertKana(i.buf, true))...)
+	}
+	return append(f, toKatakana(h), string(i.buf))
+}
+
+// clampSel brings the selection back inside the candidate list after the
+// buffer changed under it (a backspace can shorten the reading out of
+// the dictionary, shrinking the list a spaced selection pointed into).
+func (i *IME) clampSel(f []string) {
+	if i.sel >= len(f) {
+		i.sel = 0
+	}
 }
 
 // Preedit is the form the staged buffer currently shows, "" when the
 // buffer is empty. The pending half of a syllable stays romaji — "nihon"
 // shows にほn until the next letter resolves the n.
 func (i *IME) Preedit() string {
-	if len(i.buf) == 0 {
+	f := i.forms(false)
+	if len(f) == 0 {
 		return ""
 	}
-	return i.shown()
+	i.clampSel(f)
+	return f[i.sel]
 }
 
-// Candidates lists the three forms the staged buffer can commit —
-// hiragana, katakana, raw romaji — in cycle order, with the index of the
-// one Preedit shows. (nil, 0) with nothing staged.
+// Candidates lists the forms the staged buffer can commit — hiragana,
+// any dictionary surfaces, katakana, raw romaji — in cycle order, with
+// the index of the one Preedit shows. (nil, 0) with nothing staged.
 func (i *IME) Candidates() ([]string, int) {
-	if len(i.buf) == 0 {
+	f := i.forms(false)
+	if len(f) == 0 {
 		return nil, 0
 	}
-	h := convertKana(i.buf, false)
-	return []string{h, toKatakana(h), string(i.buf)}, i.sel
+	i.clampSel(f)
+	return f, i.sel
 }
 
 // Cancel drops the staged romaji without typing it.
@@ -135,7 +186,8 @@ func (i *IME) Flush() []rune {
 //   - a letter extends the romaji and drops back to the hiragana form;
 //     ' does the same only right after an n, where it is the ん escape
 //     ("n'a" -> んあ, not な);
-//   - Space cycles the shown form hiragana -> katakana -> raw romaji;
+//   - Space cycles the shown form hiragana -> dictionary surfaces ->
+//     katakana -> raw romaji;
 //   - Return commits the shown form and is consumed — the surface's own
 //     Return action does not fire on a key that ended a composition;
 //   - Escape drops the buffer;
@@ -169,7 +221,7 @@ func (i *IME) Feed(in Input) Step {
 		i.Cancel()
 		return Step{}
 	case in.Sym == ' ' || in.Usage == usageSpace:
-		i.sel = (i.sel + 1) % 3
+		i.sel = (i.sel + 1) % len(i.forms(false))
 		return Step{}
 	case in.Sym == '\'' && i.buf[len(i.buf)-1] == 'n':
 		i.buf = append(i.buf, '\'')
@@ -186,29 +238,13 @@ func (i *IME) Feed(in Input) Step {
 	return Step{Commit: i.Flush(), Pass: true}
 }
 
-// shown is the pre-edit text: the buffer converted to hiragana with any
-// pending syllable left in romaji, katakana when cycled to it, or the
-// romaji itself.
-func (i *IME) shown() string {
-	switch i.sel {
-	case 1:
-		return toKatakana(convertKana(i.buf, false))
-	case 2:
-		return string(i.buf)
-	}
-	return convertKana(i.buf, false)
-}
-
-// final is the committed form: the shown form with a trailing pending n
-// resolved to ん (raw romaji shows the romaji regardless).
+// final is the committed form: the selected candidate with a trailing
+// pending n resolved to ん for the kana forms (raw romaji and dictionary
+// surfaces commit as themselves).
 func (i *IME) final() string {
-	switch i.sel {
-	case 1:
-		return toKatakana(convertKana(i.buf, true))
-	case 2:
-		return string(i.buf)
-	}
-	return convertKana(i.buf, true)
+	f := i.forms(true)
+	i.clampSel(f)
+	return f[i.sel]
 }
 
 // isRomaji reports whether r is a letter the romaji buffer accepts —

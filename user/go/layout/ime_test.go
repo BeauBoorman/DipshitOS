@@ -1,6 +1,11 @@
 package layout
 
-import "testing"
+import (
+	"os"
+	"testing"
+
+	"virelai/ime"
+)
 
 // type keys one romaji string into the composer, the way the kernel
 // delivers it: usage for the key plus the symbol it carries. Letters are
@@ -243,4 +248,114 @@ func TestIMECommittedTextIsTheShownForm(t *testing.T) {
 			t.Fatalf("sel %d: flush %q != shown %q", sel, got, shown)
 		}
 	}
+}
+
+// testDict loads the committed packed dictionary — the same bytes the
+// guest reads at /host/KANADICT.BIN — so the composer tests run against
+// the real artifact. ime.Open itself goes through the guest file
+// channel (a -ENOSYS on the host), so tests parse the bytes directly.
+func testDict(t *testing.T) *ime.Dict {
+	t.Helper()
+	b, err := os.ReadFile("../../../image/kanadict/KANADICT.BIN")
+	if err != nil {
+		t.Fatalf("read committed dict: %v", err)
+	}
+	d, err := ime.Parse(b)
+	if err != nil {
+		t.Fatalf("parse committed dict: %v", err)
+	}
+	return d
+}
+
+func TestIMEDictOffersKanji(t *testing.T) {
+	var i IME
+	i.Dict = testDict(t)
+	typeRomaji(&i, "nihongo")
+	forms, sel := i.Candidates()
+	wantForms := []string{"にほんご", "日本語", "ニホンゴ", "nihongo"}
+	if sel != 0 || len(forms) != len(wantForms) {
+		t.Fatalf("candidates = %v sel=%d, want %v sel=0", forms, sel, wantForms)
+	}
+	for k, w := range wantForms {
+		if forms[k] != w {
+			t.Fatalf("candidate %d = %q, want %q (list %v)", k, forms[k], w, forms)
+		}
+	}
+	// Space is the conversion key: one press selects the dictionary's
+	// top surface, and Return commits it.
+	i.Feed(Input{Usage: usageSpace, Sym: ' '})
+	if i.Preedit() != "日本語" {
+		t.Fatalf("preedit = %q, want 日本語", i.Preedit())
+	}
+	want(t, i.Feed(Input{Usage: 0x28}), false, "日本語")
+	if i.Preedit() != "" {
+		t.Fatal("a committed buffer must clear")
+	}
+}
+
+func TestIMEDictSurfacesCycleInRankOrder(t *testing.T) {
+	var i IME
+	i.Dict = testDict(t)
+	typeRomaji(&i, "yasashii")
+	// 易しい then 優しい is the source's frequency order; katakana and
+	// romaji ride the tail and the cycle wraps to hiragana.
+	space := Input{Usage: usageSpace, Sym: ' '}
+	for _, want := range []string{"やさしい", "易しい", "優しい", "ヤサシイ", "yasashii", "やさしい"} {
+		if i.Preedit() != want {
+			t.Fatalf("preedit = %q, want %q", i.Preedit(), want)
+		}
+		i.Feed(space)
+	}
+}
+
+func TestIMEDictMissKeepsTheThreeForms(t *testing.T) {
+	var i IME
+	i.Dict = testDict(t)
+	typeRomaji(&i, "hugahuga")
+	// The honest bound: a reading the subset lacks offers kana-only
+	// candidates — never a wrong kanji.
+	forms, _ := i.Candidates()
+	if len(forms) != 3 {
+		t.Fatalf("absent reading gave %v, want the three kana/romaji forms", forms)
+	}
+	i.Feed(Input{Usage: usageSpace, Sym: ' '})
+	if i.Preedit() != "フガフガ" {
+		t.Fatalf("one space on a miss = %q, want フガフガ", i.Preedit())
+	}
+	want(t, i.Feed(Input{Usage: 0x28}), false, "フガフガ")
+}
+
+func TestIMEDictBackspaceClampsTheSelection(t *testing.T) {
+	var i IME
+	i.Dict = testDict(t)
+	typeRomaji(&i, "nihongo")
+	space := Input{Usage: usageSpace, Sym: ' '}
+	for k := 0; k < 3; k++ {
+		i.Feed(space) // -> raw romaji, the last of four forms
+	}
+	if i.Preedit() != "nihongo" {
+		t.Fatalf("preedit = %q, want nihongo", i.Preedit())
+	}
+	// Deleting a letter shortens the reading out of the dictionary: the
+	// list shrinks to three and the selection falls back to hiragana.
+	want(t, i.Feed(Input{Usage: keyBksp}), false, "")
+	if i.Preedit() != "にほんg" {
+		t.Fatalf("clamped preedit = %q, want にほんg", i.Preedit())
+	}
+}
+
+func TestIMEDictPendingNStillConverts(t *testing.T) {
+	var i IME
+	i.Dict = testDict(t)
+	typeRomaji(&i, "nihon")
+	// The pending n shows romaji in the pre-edit, but the lookup keys on
+	// the resolved reading — にほん already offers 日本.
+	if i.Preedit() != "にほn" {
+		t.Fatalf("preedit = %q, want にほn", i.Preedit())
+	}
+	i.Feed(Input{Usage: usageSpace, Sym: ' '})
+	if i.Preedit() != "日本" {
+		t.Fatalf("conversion of a pending-n buffer = %q, want 日本", i.Preedit())
+	}
+	want(t, i.Feed(Input{Usage: 0x28}), false, "日本")
 }
