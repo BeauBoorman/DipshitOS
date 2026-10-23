@@ -1,19 +1,29 @@
-# go-mail.spec -- M187c #3184: GOMAIL.ELF — the smallest honest mail
-# client: IMAP4rev1 LIST/SELECT/FETCH (boxes, bounded headers, one
-# readable body) + SMTP submit, over tls.Dial with the pinned fixture
-# chain, plaintext only behind the consent bit, and named refusals for
-# everything else. Host Python fixture = the go-irc pattern: a scripted
-# server on 127.0.0.1 behind --net-tcp-respond ...:relay; no live net.
+# go-mail.spec -- M187c #3184 + M193a #3253: GOMAIL.ELF — the smallest
+# honest mail client: IMAP4rev1 LIST/SELECT/FETCH (boxes, bounded
+# headers, one readable body) + SMTP submit, over tls.Dial with the
+# pinned fixture chain, plaintext only behind the consent bit, named
+# refusals for everything else — and now a bounded local cache under
+# /host/MAIL/ (folders + envelopes + last-N bodies, LRU) that `use`
+# writes and `search`/offline legs read. Host Python fixture = the
+# go-irc pattern: a scripted server on 127.0.0.1 behind
+# --net-tcp-respond ...:relay; no live net.
 #
 # Run 01 is the card leg: the GOMAIL.TXT account file resolves host/
 # creds/sni, --tls dials 993, and `fetch INBOX 1 2 3` walks the whole
 # journey in one session — LIST, SELECT (3 EXISTS), the bounded
 # ENVELOPE list, a text/plain body read verbatim, a text/html body
 # rendered stripped, and a multipart whose application/pdf attachment
-# lists by name and refuses to open. Run 02 submits one plaintext
-# message over SMTP+TLS (AUTH PLAIN, dot-stuffed DATA). Run 03 asks for
-# plaintext without consent — 'gomail: refuse plaintext' before any
-# dial. Run 04 is the consent answer: --plain dials 143 and fetches.
+# lists by name and refuses to open — while the cache write-through
+# lands on the share. Run 02 submits one plaintext message over
+# SMTP+TLS (AUTH PLAIN, dot-stuffed DATA). Run 03 asks for plaintext
+# without consent — 'gomail: refuse plaintext' before any dial. Run 04
+# is the consent answer: --plain dials 143 and fetches. Runs 05/06 are
+# the folder legs: `use Sent` LISTs, SELECTs and remembers; `use Lists`
+# refuses a name the real LIST never carried even though the seeded
+# cache remembers it. Runs 07/08 are the search legs: seeded-cache
+# header and body hits with no dial at all. Run 09 is the cache-miss
+# leg: a dead transport names itself offline, paints remembered rows,
+# and refuses seq 9 by name; run 10 serves a remembered body offline.
 #
 # exec-order: assert-proven — runs end on markers only the app prints
 # from fixture traffic ('gomail: refuse attachment report.pdf',
@@ -27,7 +37,7 @@
 # binary is what every run execs under the GOMAIL.ELF name. Fixture
 # transcripts land in $RUN_DIR/maild-<port>.log for the python asserts.
 
-vgate_name go-mail "M187c #3184: GOMAIL.ELF — IMAP4 fetch/list/read + SMTP submit over tls.Dial (pinned fixture chain), plaintext consent refusal + grant, attachment/html truth-in-bounds"
+vgate_name go-mail "M187c #3184 + M193a #3253: GOMAIL.ELF — IMAP4 fetch/list/read + SMTP submit over tls.Dial (pinned fixture chain), plaintext consent refusal + grant, attachment/html truth-in-bounds, + use-able folders, bounded /host/MAIL cache, offline search + cache-miss legs"
 vgate_share seed
 vgate_runner_flags -Xswiftc -DSPIKE
 
@@ -54,6 +64,38 @@ vgate_file script-04.txt <<'EOF'
 net ip 10.0.0.1
 net arp 10.0.0.2
 exec GOMAIL.ELF --plain fetch INBOX 1
+EOF
+
+vgate_file script-05.txt <<'EOF'
+net ip 10.0.0.1
+net arp 10.0.0.2
+exec GOMAIL.ELF --tls use Sent
+EOF
+
+vgate_file script-06.txt <<'EOF'
+net ip 10.0.0.1
+net arp 10.0.0.2
+exec GOMAIL.ELF --tls use Lists
+EOF
+
+# Runs 07/08 carry no net lines at all: search is a cache read and must
+# never dial.
+vgate_file script-07.txt <<'EOF'
+exec GOMAIL.ELF search weekly
+EOF
+
+vgate_file script-08.txt <<'EOF'
+exec GOMAIL.ELF search orchid
+EOF
+
+# Runs 09/10 ask for TLS with no net configured: the dial fails and the
+# verb answers from the cache — hit and miss both named.
+vgate_file script-09.txt <<'EOF'
+exec GOMAIL.ELF --tls fetch INBOX 9
+EOF
+
+vgate_file script-10.txt <<'EOF'
+exec GOMAIL.ELF --tls read INBOX 1
 EOF
 
 vgate_setup_python <<'PY'
@@ -84,6 +126,24 @@ with open(os.path.join(share, "GOMAIL.TXT"), "w") as f:
             "from=gate@fixture.local\n"
             "sni=leaf.example.com\n")
 print("go-mail: wrote GOMAIL.TXT account file")
+
+# M193a seed: remembered mail under /host/MAIL/ — the cache files the
+# app's own codec reads. 'Lists' exists ONLY here: the wire LIST never
+# carries it, so run 06's `use Lists` proves `use` trusts the real LIST
+# over the cache, while runs 07/08 prove search reads the seeded corpus
+# and run 09 proves a miss names itself instead of fabricating.
+maildir = os.path.join(share, "MAIL")
+os.makedirs(maildir, exist_ok=True)
+with open(os.path.join(maildir, "BOXES"), "w") as f:
+    f.write("INBOX\nSent\nLists\n")
+with open(os.path.join(maildir, "HDRS"), "w") as f:
+    f.write("Lists\t7\tdana@fixture.local\tweekly digest\t"
+            "Wed, 21 Oct 2026 11:00:00 +0000\n")
+seed_body = b"the orchid thread grows\r\nsecond seeded line"
+with open(os.path.join(maildir, "BODIES"), "wb") as f:
+    f.write(b"@Lists\t9\t1\ttext/plain\t" + str(len(seed_body)).encode()
+            + b"\n" + seed_body + b"\n")
+print("go-mail: seeded /host/MAIL cache (BOXES, Lists hdr 7, body 9)")
 
 fixture = os.path.join(run, "maild.py")
 with open(fixture, "w") as f:
@@ -360,9 +420,18 @@ vgate_assert 01 serial-contains 'gomail: body 3 text/plain'
 vgate_assert 01 serial-contains 'gomail: attach 3 report.pdf application/pdf'
 vgate_assert 01 serial-contains 'gomail: refuse attachment report.pdf'
 vgate_assert 01 serial-contains 'gomail: closed'
+vgate_assert 01 serial-contains 'gomail: cache /host/MAIL/BOXES'
+vgate_assert 01 serial-contains 'gomail: cache /host/MAIL/HDRS'
+vgate_assert 01 serial-contains 'gomail: cache /host/MAIL/BODIES'
 vgate_assert 01 serial-absent 'gomail: error'
 vgate_assert 01 serial-absent 'gomail: refuse plaintext'
+vgate_assert 01 serial-absent 'gomail: cache-fail'
 vgate_assert 01 serial-absent '[EXC] parking:'
+# The cache really landed: the share holds the folders, the envelopes,
+# and the bodies the wire just proved.
+vgate_assert 01 share-contains MAIL/BOXES 'INBOX'
+vgate_assert 01 share-contains MAIL/HDRS 'gate hello'
+vgate_assert 01 share-contains MAIL/BODIES 'line one of the gate body'
 # The wire half: the fixture transcript carries the exact tagged
 # commands — a program that never ran cannot produce them.
 vgate_assert 01 python <<'PY'
@@ -456,3 +525,127 @@ missing = [n for n in need if n not in log]
 if missing:
     sys.exit("imap-plain fixture transcript missing: %r\n%s" % (missing, log))
 PY
+
+# --- Run 05: 'use Sent' — folder browsing over the real LIST ------------
+#
+# M193a: LIST paints the folders, `use` SELECTs the named one and writes
+# the remembered selection + folder list into /host/MAIL/.
+vgate_run 05 -- \
+    --screen '$RUN_DIR/screen-05' \
+    --via-virtio \
+    --net '$RUN_DIR/cap05.bin' --net-arp-respond 10.0.0.2 \
+    --net-tcp-respond 10.0.0.2:993:relay --net-tcp-respond-relay 127.0.0.1:26993 \
+    --script '$RUN_DIR/script-05.txt' --script-expect 'gomail: use Sent exists=3' --timeout 240
+
+vgate_assert 05 serial-contains 'gomail: dial 10.0.0.2 993 tls'
+vgate_assert 05 serial-contains 'gomail: imap ready'
+vgate_assert 05 serial-contains 'gomail: box INBOX'
+vgate_assert 05 serial-contains 'gomail: box Sent'
+vgate_assert 05 serial-contains 'gomail: use Sent exists=3'
+vgate_assert 05 serial-contains 'gomail: cache /host/MAIL/BOXES'
+vgate_assert 05 serial-contains 'gomail: cache /host/MAIL/USE'
+vgate_assert 05 serial-contains 'gomail: closed'
+vgate_assert 05 serial-absent 'gomail: error'
+vgate_assert 05 serial-absent 'gomail: refuse'
+vgate_assert 05 serial-absent '[EXC] parking:'
+vgate_assert 05 share-contains MAIL/USE 'Sent'
+vgate_assert 05 share-contains MAIL/BOXES 'Sent'
+vgate_assert 05 python <<'PY'
+import os, sys
+log = open(os.path.join(os.environ["RUN_DIR"], "maild-26993.log")).read()
+need = ["LIST", "SELECT \"Sent\""]
+missing = [n for n in need if n not in log]
+if missing:
+    sys.exit("use fixture transcript missing: %r\n%s" % (missing, log))
+PY
+
+# --- Run 06: 'use Lists' — no fake folders ------------------------------
+#
+# The seeded BOXES remembers 'Lists' but the wire LIST does not: `use`
+# validates over the REAL LIST, so the name refuses by name and no
+# SELECT is ever sent.
+vgate_run 06 -- \
+    --screen '$RUN_DIR/screen-06' \
+    --via-virtio \
+    --net '$RUN_DIR/cap06.bin' --net-arp-respond 10.0.0.2 \
+    --net-tcp-respond 10.0.0.2:993:relay --net-tcp-respond-relay 127.0.0.1:26993 \
+    --script '$RUN_DIR/script-06.txt' --script-expect 'gomail: refuse use Lists' --timeout 240
+
+vgate_assert 06 serial-contains 'gomail: box INBOX'
+vgate_assert 06 serial-contains 'gomail: box Sent'
+vgate_assert 06 serial-contains 'gomail: refuse use Lists'
+vgate_assert 06 serial-contains 'gomail: closed'
+vgate_assert 06 serial-absent 'gomail: use Lists'
+vgate_assert 06 serial-absent 'gomail: error'
+vgate_assert 06 serial-absent '[EXC] parking:'
+vgate_assert 06 python <<'PY'
+import os, sys
+log = open(os.path.join(os.environ["RUN_DIR"], "maild-26993.log")).read()
+if 'SELECT "Lists"' in log:
+    sys.exit("use SELECTed a folder the LIST never carried\n%s" % log)
+PY
+
+# --- Run 07: 'search weekly' — seeded-cache header hit, no dial ----------
+vgate_run 07 -- \
+    --screen '$RUN_DIR/screen-07' \
+    --via-virtio \
+    --script '$RUN_DIR/script-07.txt' --script-expect 'gomail: search hits=1' --timeout 180
+
+vgate_assert 07 serial-contains 'gomail: search weekly'
+vgate_assert 07 serial-contains 'gomail: hit Lists 7 dana@fixture.local: weekly digest'
+vgate_assert 07 serial-contains 'gomail: search hits=1'
+vgate_assert 07 serial-contains 'gomail: closed'
+vgate_assert 07 serial-absent 'gomail: dial'
+vgate_assert 07 serial-absent 'gomail: error'
+vgate_assert 07 serial-absent '[EXC] parking:'
+
+# --- Run 08: 'search orchid' — seeded-cache body hit, no dial ------------
+vgate_run 08 -- \
+    --screen '$RUN_DIR/screen-08' \
+    --via-virtio \
+    --script '$RUN_DIR/script-08.txt' --script-expect 'gomail: search hits=1' --timeout 180
+
+vgate_assert 08 serial-contains 'gomail: hit Lists 9 (body)'
+vgate_assert 08 serial-contains 'gomail: search hits=1'
+vgate_assert 08 serial-contains 'gomail: closed'
+vgate_assert 08 serial-absent 'gomail: dial'
+vgate_assert 08 serial-absent 'gomail: error'
+vgate_assert 08 serial-absent '[EXC] parking:'
+
+# --- Run 09: cache-miss fetch — offline names itself, never fabricates ---
+#
+# --tls asks for the wire with no net configured: the dial fails, the
+# offline leg paints the remembered folders + INBOX envelopes, then
+# 'gomail: cache-miss INBOX 9' names the miss — no 'gomail: body 9' is
+# ever invented.
+vgate_run 09 -- \
+    --screen '$RUN_DIR/screen-09' \
+    --via-virtio \
+    --script '$RUN_DIR/script-09.txt' --script-expect 'gomail: cache-miss INBOX 9' --timeout 180
+
+vgate_assert 09 serial-contains 'gomail: offline fetch INBOX'
+vgate_assert 09 serial-contains 'gomail: box INBOX'
+vgate_assert 09 serial-contains 'gomail: box Sent'
+vgate_assert 09 serial-contains 'gomail: hdr 1 Alice: gate hello'
+vgate_assert 09 serial-contains 'gomail: cache-miss INBOX 9'
+vgate_assert 09 serial-contains 'gomail: closed'
+vgate_assert 09 serial-absent 'gomail: dial'
+vgate_assert 09 serial-absent 'gomail: body 9'
+vgate_assert 09 serial-absent 'gomail: hdr 9'
+vgate_assert 09 serial-absent 'gomail: error'
+vgate_assert 09 serial-absent '[EXC] parking:'
+
+# --- Run 10: offline read — a remembered body paints offline --------------
+vgate_run 10 -- \
+    --screen '$RUN_DIR/screen-10' \
+    --via-virtio \
+    --script '$RUN_DIR/script-10.txt' --script-expect 'gomail: closed' --timeout 180
+
+vgate_assert 10 serial-contains 'gomail: offline read INBOX 1'
+vgate_assert 10 serial-contains 'gomail: body 1 text/plain'
+vgate_assert 10 serial-contains 'gomail: text line one of the gate body'
+vgate_assert 10 serial-contains 'gomail: closed'
+vgate_assert 10 serial-absent 'gomail: dial'
+vgate_assert 10 serial-absent 'gomail: cache-miss'
+vgate_assert 10 serial-absent 'gomail: error'
+vgate_assert 10 serial-absent '[EXC] parking:'

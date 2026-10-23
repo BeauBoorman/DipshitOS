@@ -12,13 +12,24 @@
 //	                [--tls] [--plain] [--max N] <verb> [args]
 //	verbs:
 //	  fetch <mbox> [seq ...]   boxes + headers + read each seq (default 1)
+//	  fetch [seq ...]          same, on the `use`d box (INBOX until then)
 //	  boxes                    LIST "" "*"
-//	  headers <mbox>           SELECT + bounded ENVELOPE list
-//	  read <mbox> <seq>        BODYSTRUCTURE + readable part / attachments
+//	  use <box>                LIST + SELECT + remember the box
+//	  headers [mbox]           SELECT + bounded ENVELOPE list
+//	  read [mbox] <seq>        BODYSTRUCTURE + readable part / attachments
+//	  search <q>               substring over the local cache (no dial)
 //	  send                     --to A [...] --subject S --body T|--body-file P
 //	  open <name>              named refusal: attachments do not open
-//	  <out-of-scope verb>      named refusal (search idle notify copy move
+//	  <out-of-scope verb>      named refusal (idle notify copy move
 //	                          delete append store subscribe oauth render)
+//
+// M193a (#3253): the wire work also writes a bounded cache under the
+// data root's MAIL/ subtree — folder names, envelope rows, the last-N
+// bodies per mailbox (cache.go names the bounds; LRU evicts). `search`
+// reads that corpus and never dials; when a verb's own dial fails the
+// verb answers from the cache instead, printing 'gomail: offline' ahead
+// of the rows memory can prove and 'gomail: cache-miss' for what it
+// cannot — never fabricated mail.
 //
 // The account lives in a key=value file (default /host/GOMAIL.TXT, the
 // account.go codec); argv overrides it. Transport: --tls selects
@@ -32,9 +43,14 @@
 //	gomail: account <path>           gomail: dial <host> <port> tls|plain
 //	gomail: imap ready               gomail: login <user>
 //	gomail: box <name>               gomail: select <mbox> exists=<n>
+//	gomail: use <box> exists=<n>     gomail: use <box> cached
 //	gomail: hdr <seq> <from>: <subj> gomail: body <seq> <type> bytes=<n>
 //	gomail: html-stripped <seq>      gomail: text <line>
 //	gomail: attach <seq> <name> <type>  gomail: refuse attachment <name>
+//	gomail: cache <path>             gomail: cache-fail <path> <err>
+//	gomail: offline <verb> …         gomail: cache-miss <ref>
+//	gomail: hit <box> <seq> <from>: <subj> [(body)]
+//	gomail: search hits=<n>          gomail: refuse use <box>
 //	gomail: smtp ready               gomail: mail <from>
 //	gomail: rcpt <to>                gomail: sent bytes=<n>
 //	gomail: refuse plaintext|…       gomail: error <err>
@@ -80,8 +96,9 @@ type options struct {
 func usage() {
 	vi.ConsoleLine("usage: GOMAIL.ELF [--account P] [--host H] [--user U] [--pass P]")
 	vi.ConsoleLine("                  [--from A] [--sni NAME] [--tls] [--plain] [--max N]")
-	vi.ConsoleLine("                  fetch <mbox> [seq ...] | boxes | headers <mbox> |")
-	vi.ConsoleLine("                  read <mbox> <seq> | send --to A --subject S --body T")
+	vi.ConsoleLine("                  fetch <mbox> [seq ...] | boxes | use <box> |")
+	vi.ConsoleLine("                  headers [mbox] | read [mbox] <seq> | search <q> |")
+	vi.ConsoleLine("                  send --to A --subject S --body T")
 }
 
 // cliArgs drops argv[0] when it is the image name (the kernel's ELF gap
@@ -118,7 +135,7 @@ func parseUint(s string) (int64, bool) {
 // refusedVerbs names the out-of-scope surface — every one is a named
 // refusal, never silence.
 var refusedVerbs = map[string]bool{
-	"search": true, "idle": true, "notify": true, "copy": true,
+	"idle": true, "notify": true, "copy": true,
 	"move": true, "delete": true, "append": true, "store": true,
 	"subscribe": true, "oauth": true, "render": true, "html": true,
 }
@@ -331,7 +348,8 @@ func main() {
 	if cfg.MaxHeaders <= 0 {
 		cfg.MaxHeaders = headerMaxDefault
 	}
-	if cfg.Host == "" {
+	// 'search' never dials, so it never needs the account's host.
+	if cfg.Host == "" && o.verb != "search" {
 		say("gomail: account missing host")
 		say("gomail: closed")
 		vi.Exit(exitError)
@@ -340,14 +358,21 @@ func main() {
 	var err error
 	switch o.verb {
 	case "fetch":
-		mbox := "INBOX"
-		seqs := []int{1}
-		if len(o.args) > 0 {
-			mbox = o.args[0]
+		// fetch <mbox> [seq ...] — or fetch [seq ...] on the `use`d
+		// box: a leading non-numeric arg is the mailbox, a numeric or
+		// absent one means seqs on the remembered box.
+		mboxArg := ""
+		rest := o.args
+		if len(rest) > 0 {
+			if _, ok := parseUint(rest[0]); !ok {
+				mboxArg = rest[0]
+				rest = rest[1:]
+			}
 		}
-		if len(o.args) > 1 {
+		seqs := []int{1}
+		if len(rest) > 0 {
 			seqs = seqs[:0]
-			for _, a := range o.args[1:] {
+			for _, a := range rest {
 				n, ok := parseUint(a)
 				if !ok || n <= 0 {
 					usage()
@@ -356,26 +381,45 @@ func main() {
 				seqs = append(seqs, int(n))
 			}
 		}
-		err = runFetch(cfg, mbox, seqs, true)
+		err = runFetch(cfg, resolveBox(mboxArg), seqs, true)
 	case "boxes":
 		err = runFetch(cfg, "", nil, false)
+	case "use":
+		if len(o.args) != 1 {
+			usage()
+			vi.Exit(exitUsage)
+		}
+		err = runUse(cfg, o.args[0])
 	case "headers":
-		if len(o.args) < 1 {
-			usage()
-			vi.Exit(exitUsage)
+		mboxArg := ""
+		if len(o.args) > 0 {
+			mboxArg = o.args[0]
 		}
-		err = runHeaders(cfg, o.args[0])
+		err = runHeaders(cfg, resolveBox(mboxArg))
 	case "read":
-		if len(o.args) < 2 {
+		// read <mbox> <seq> — or read <seq> on the `use`d box.
+		var mboxArg, seqArg string
+		switch len(o.args) {
+		case 1:
+			seqArg = o.args[0]
+		case 2:
+			mboxArg, seqArg = o.args[0], o.args[1]
+		default:
 			usage()
 			vi.Exit(exitUsage)
 		}
-		n, ok := parseUint(o.args[1])
+		n, ok := parseUint(seqArg)
 		if !ok || n <= 0 {
 			usage()
 			vi.Exit(exitUsage)
 		}
-		err = runRead(cfg, o.args[0], int(n))
+		err = runRead(cfg, resolveBox(mboxArg), int(n))
+	case "search":
+		if len(o.args) < 1 {
+			usage()
+			vi.Exit(exitUsage)
+		}
+		err = runSearch(strings.Join(o.args, " "))
 	case "open":
 		if len(o.args) < 1 {
 			usage()
@@ -408,7 +452,10 @@ func dialIMAP(cfg Config) (*imapClient, error) {
 	}
 	conn, err := dialOne(cfg, cfg.imapPort())
 	if err != nil {
-		return nil, err
+		if _, named := err.(mailError); named {
+			return nil, err // consent refusal — never a cache leg
+		}
+		return nil, dialError{err} // transport dead — the cache may answer
 	}
 	say("gomail: dial " + cfg.Host + " " + vsys.Itoa64(int64(cfg.imapPort())) + " " + scheme)
 	c := newIMAP(conn)
@@ -425,23 +472,25 @@ func dialIMAP(cfg Config) (*imapClient, error) {
 	return c, nil
 }
 
-// listBoxes emits the mailbox rows.
-func listBoxes(c *imapClient) error {
+// listBoxes emits the mailbox rows and returns the names — the caller
+// publishes them to the folder cache.
+func listBoxes(c *imapClient) ([]string, error) {
 	boxes, err := c.list()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	for _, b := range boxes {
 		say("gomail: box " + b)
 	}
-	return nil
+	return boxes, nil
 }
 
-// listHeaders emits the bounded header rows for mbox; returns exists.
-func listHeaders(c *imapClient, mbox string, max int) (int, error) {
+// fetchHeaders emits the select marker and returns the bounded envelope
+// window plus EXISTS; the caller prints and caches the rows.
+func fetchHeaders(c *imapClient, mbox string, max int) ([]Header, int, error) {
 	exists, err := c.selectBox(mbox)
 	if err != nil {
-		return 0, err
+		return nil, 0, err
 	}
 	say("gomail: select " + mbox + " exists=" + vsys.Itoa64(int64(exists)))
 	hi := exists
@@ -449,24 +498,27 @@ func listHeaders(c *imapClient, mbox string, max int) (int, error) {
 		hi = max
 	}
 	if hi <= 0 {
-		return exists, nil
+		return nil, exists, nil
 	}
 	hdrs, err := c.envelopes(1, hi)
-	if err != nil {
-		return exists, err
-	}
+	return hdrs, exists, err
+}
+
+// printHdrs emits the envelope rows.
+func printHdrs(hdrs []Header) {
 	for _, h := range hdrs {
 		say("gomail: hdr " + vsys.Itoa64(int64(h.Seq)) + " " + h.From + ": " + h.Subject)
 	}
-	return exists, nil
 }
 
 // readOne renders one message: BODYSTRUCTURE, the readable part (or the
-// named refusal), and the attachment list + refuse-to-open rows.
-func readOne(c *imapClient, seq int) error {
+// named refusal), and the attachment list + refuse-to-open rows. On a
+// rendered body it returns the mime + bytes so the caller can remember
+// them; a refusal or error returns "", nil, err.
+func readOne(c *imapClient, seq int) (string, []byte, error) {
 	root, err := c.structure(seq)
 	if err != nil {
-		return err
+		return "", nil, err
 	}
 	body := pickBody(root)
 	if body == nil {
@@ -474,64 +526,65 @@ func readOne(c *imapClient, seq int) error {
 			say("gomail: attach " + vsys.Itoa64(int64(seq)) + " " + a.attachName() + " " + a.mimeType())
 			say("gomail: refuse attachment " + a.attachName())
 		}
-		return protoErr("refuse ", itoa(int64(seq))+" no readable text")
+		return "", nil, protoErr("refuse ", itoa(int64(seq))+" no readable text")
 	}
 	if body.encoding == "base64" || body.encoding == "quoted-printable" {
-		return protoErr("refuse ", itoa(int64(seq))+" encoded body "+body.encoding)
+		return "", nil, protoErr("refuse ", itoa(int64(seq))+" encoded body "+body.encoding)
 	}
 	data, err := c.section(seq, body.section())
 	if err != nil {
-		return err
+		return "", nil, err
 	}
 	if len(data) > bodyByteMax {
 		data = data[:bodyByteMax]
 	}
-	say("gomail: body " + vsys.Itoa64(int64(seq)) + " " + body.mimeType() + " bytes=" + vsys.Itoa64(int64(len(data))))
-	text := string(data)
-	if body.sub == "html" {
-		say("gomail: html-stripped " + vsys.Itoa64(int64(seq)))
-		text = stripHTML(text)
-	}
-	lines := strings.Split(text, "\n")
-	for i, l := range lines {
-		if i >= bodyLineMax {
-			say("gomail: text …")
-			break
-		}
-		say("gomail: text " + strings.TrimRight(l, "\r"))
-	}
+	printBodyRows(seq, body.mimeType(), body.sub == "html", data)
 	for _, a := range attachments(root) {
 		say("gomail: attach " + vsys.Itoa64(int64(seq)) + " " + a.attachName() + " " + a.mimeType())
 		say("gomail: refuse attachment " + a.attachName())
 	}
-	return nil
+	return body.mimeType(), data, nil
 }
 
-// runFetch is the composite leg: LIST + SELECT + headers + the reads.
-// full=false runs only the LIST half (the 'boxes' verb).
+// runFetch is the composite leg: LIST + SELECT + headers + the reads,
+// writing the corpus through to the cache as the wire proves it.
+// full=false runs only the LIST half (the 'boxes' verb). A dead
+// transport answers from the cache instead — the offline leg.
 func runFetch(cfg Config, mbox string, seqs []int, full bool) error {
 	c, err := dialIMAP(cfg)
 	if err != nil {
-		return err
+		return offlineOr(err, func() error {
+			if !full {
+				return offlineBoxes()
+			}
+			return offlineFetch(mbox, seqs)
+		})
 	}
 	defer c.logout()
-	if err := listBoxes(c); err != nil {
-		return err
-	}
-	if !full {
-		return nil
-	}
-	exists, err := listHeaders(c, mbox, cfg.MaxHeaders)
+	boxes, err := listBoxes(c)
 	if err != nil {
 		return err
 	}
+	cacheSaveBoxes(boxes)
+	if !full {
+		return nil
+	}
+	hdrs, exists, err := fetchHeaders(c, mbox, cfg.MaxHeaders)
+	if err != nil {
+		return err
+	}
+	printHdrs(hdrs)
+	cacheSaveUse(mbox)
+	cacheSaveHdrs(mbox, hdrs)
 	for _, seq := range seqs {
 		if seq > exists {
 			return protoErr("refuse ", itoa(int64(seq))+" past exists")
 		}
-		if err := readOne(c, seq); err != nil {
+		mime, data, err := readOne(c, seq)
+		if err != nil {
 			return err
 		}
+		cachePutBody(mbox, seq, mime, data)
 	}
 	return nil
 }
@@ -539,17 +592,23 @@ func runFetch(cfg Config, mbox string, seqs []int, full bool) error {
 func runHeaders(cfg Config, mbox string) error {
 	c, err := dialIMAP(cfg)
 	if err != nil {
-		return err
+		return offlineOr(err, func() error { return offlineHeaders(mbox) })
 	}
 	defer c.logout()
-	_, err = listHeaders(c, mbox, cfg.MaxHeaders)
-	return err
+	hdrs, _, err := fetchHeaders(c, mbox, cfg.MaxHeaders)
+	if err != nil {
+		return err
+	}
+	printHdrs(hdrs)
+	cacheSaveUse(mbox)
+	cacheSaveHdrs(mbox, hdrs)
+	return nil
 }
 
 func runRead(cfg Config, mbox string, seq int) error {
 	c, err := dialIMAP(cfg)
 	if err != nil {
-		return err
+		return offlineOr(err, func() error { return offlineRead(mbox, seq) })
 	}
 	defer c.logout()
 	exists, err := c.selectBox(mbox)
@@ -560,7 +619,36 @@ func runRead(cfg Config, mbox string, seq int) error {
 	if seq > exists {
 		return protoErr("refuse ", itoa(int64(seq))+" past exists")
 	}
-	return readOne(c, seq)
+	mime, data, err := readOne(c, seq)
+	if err != nil {
+		return err
+	}
+	cacheSaveUse(mbox)
+	cachePutBody(mbox, seq, mime, data)
+	return nil
+}
+
+// runSearch answers 'search <q>' over the cache only — it never dials:
+// what memory holds answers, what it does not simply does not hit.
+func runSearch(q string) error {
+	say("gomail: search " + q)
+	hits := cacheSearch(q)
+	for i, h := range hits {
+		if i >= cacheHitMax {
+			say("gomail: search …")
+			break
+		}
+		line := "gomail: hit " + h.box + " " + itoa(int64(h.seq))
+		if h.haveHdr {
+			line += " " + h.from + ": " + h.subject
+		}
+		if h.bodyOnly {
+			line += " (body)"
+		}
+		say(line)
+	}
+	say("gomail: search hits=" + itoa(int64(len(hits))))
+	return nil
 }
 
 // runSend submits one plaintext message over SMTP.
