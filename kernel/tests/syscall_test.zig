@@ -7908,3 +7908,181 @@ test "syscall: slots 94/95 — bounds, grant word, arm/cancel across kinds, over
     scheduler.deadline_service(0, 50_000_000);
     try std.testing.expect(!scheduler.is_blocked(2));
 }
+
+test "syscall: M182b (#3153) — file, notify and audio wire words refuse out-of-range narrowing" {
+    userspace.init();
+    init(test_writer);
+    _ = scheduler.init();
+    _ = scheduler.register_worker(0x2000);
+    _ = scheduler.register_user(0x3000, 0); // task 2 = process 0
+    scheduler.start();
+    file_table.init();
+    var frame = fresh_frame();
+    try std.testing.expect(scheduler.yield_current()); // shell -> user (2)
+
+    var path_buf: [16]u8 = undefined;
+    @memcpy(path_buf[0..5], "/host");
+    set_user_regions(.{ .base = @intFromPtr(&path_buf), .len = path_buf.len }, .{ .base = 0, .len = 0 });
+
+    // review L3: a wire word that does not fit its field is refused with
+    // the errno its ADR 0007 row names — never silently narrowed into a
+    // different, valid request.
+    try std.testing.expectEqual(error_result(.einval), dispatch(sys_file_open, .{ @intFromPtr(&path_buf), 5, (@as(u64, 1) << 32) | file_table.MODE_READ, 0, 0, 0 }, &frame));
+    try std.testing.expectEqual(error_result(.enospc), dispatch(sys_file_truncate, .{ 0, @as(u64, 1) << 32, 0, 0, 0, 0 }, &frame));
+    try std.testing.expectEqual(error_result(.einval), dispatch(sys_file_free, .{ @as(u64, 1) << 32, 0, 0, 0, 0, 0 }, &frame));
+    try std.testing.expectEqual(error_result(.einval), dispatch(sys_file_mode, .{ @intFromPtr(&path_buf), 5, @as(u64, 1) << 16, 0, 0, 0 }, &frame));
+
+    // notify level 0x102 used to narrow to 2; a clean level still takes
+    // the empty-text no-op path.
+    try std.testing.expectEqual(error_result(.einval), dispatch(sys_notify, .{ 0, 0, 0x102, 0, 0, 0 }, &frame));
+    try std.testing.expectEqual(@as(u64, 0), dispatch(sys_notify, .{ 0, 0, 2, 0, 0, 0 }, &frame));
+
+    // sys_audio_rec: device absence still answers ENXIO before the tuple
+    // is judged (the slot-92 order), and an armed device refuses a tuple
+    // word that does not fit u8.
+    virtio_snd.snd_ready = false;
+    virtio_snd.ctrl_armed = false;
+    virtio_snd.rx_armed = false;
+    try std.testing.expectEqual(error_result(.enxio), dispatch(syscall.sys_audio_rec, .{ 0x1_13, 7, 1, 0, 8, 0 }, &frame));
+    virtio_snd.snd_ready = true;
+    virtio_snd.ctrl_armed = true;
+    virtio_snd.rx_armed = true;
+    defer {
+        virtio_snd.snd_ready = false;
+        virtio_snd.ctrl_armed = false;
+        virtio_snd.rx_armed = false;
+    }
+    try std.testing.expectEqual(error_result(.einval), dispatch(syscall.sys_audio_rec, .{ 0x1_13, 7, 1, 0, 8, 0 }, &frame));
+    try std.testing.expectEqual(error_result(.einval), dispatch(syscall.sys_audio_rec, .{ 19, 0x1_07, 1, 0, 8, 0 }, &frame));
+    try std.testing.expectEqual(error_result(.einval), dispatch(syscall.sys_audio_rec, .{ 19, 7, 0x1_01, 0, 8, 0 }, &frame));
+}
+
+test "syscall: M182b (#3153) — dir v2 refuses dirty reserved registers" {
+    userspace.init();
+    init(test_writer);
+    _ = scheduler.init();
+    _ = scheduler.register_worker(0x2000);
+    _ = scheduler.register_user(0x3000, 0);
+    scheduler.start();
+    file_table.init();
+    var frame = fresh_frame();
+    try std.testing.expect(scheduler.yield_current());
+    const dir = file_table.directory;
+    var files: [1]syscall.virtio_file.TestFile = .{.{ .name = "entry-00", .data = "payload" }};
+    syscall.virtio_file.set_test_share(&files);
+    defer syscall.virtio_file.set_test_share(null);
+    var storage: extern struct {
+        path: [512]u8,
+        page: dir.Page,
+    } = undefined;
+    @memcpy(storage.path[0..5], "/host");
+    const path_addr = @intFromPtr(&storage.path);
+    const page_addr = @intFromPtr(&storage.page);
+    set_user_regions(.{ .base = 0, .len = 0 }, .{ .base = @intFromPtr(&storage), .len = @sizeOf(@TypeOf(storage)) });
+
+    // review L17: registers an op does not read are reserved-zero.
+    // open_op reads x0/x1 — a dirty x2, x4 or x5 is EINVAL.
+    try std.testing.expectEqual(error_result(.einval), dispatch(sys_dir_list, .{ path_addr, 5, 1, dir.open_op, 0, 0 }, &frame));
+    try std.testing.expectEqual(error_result(.einval), dispatch(sys_dir_list, .{ path_addr, 5, 0, dir.open_op, 1, 0 }, &frame));
+    try std.testing.expectEqual(error_result(.einval), dispatch(sys_dir_list, .{ path_addr, 5, 0, dir.open_op, 0, 1 }, &frame));
+    const token = dispatch(sys_dir_list, .{ path_addr, 5, 0, dir.open_op, 0, 0 }, &frame);
+    try std.testing.expect(@as(i64, @bitCast(token)) > 0);
+    // page_op reads x0/x1/x2/x4 — a dirty x5 is EINVAL and consumes no
+    // page (the clean page below still returns the first entry).
+    try std.testing.expectEqual(error_result(.einval), dispatch(sys_dir_list, .{ token, 0, page_addr, dir.page_op, 16, 1 }, &frame));
+    try std.testing.expectEqual(@as(u64, 1), dispatch(sys_dir_list, .{ token, 0, page_addr, dir.page_op, 16, 0 }, &frame));
+    // close_op reads x0 — a dirty x1/x2/x4/x5 is EINVAL; the token stays
+    // open for the clean close.
+    try std.testing.expectEqual(error_result(.einval), dispatch(sys_dir_list, .{ token, 1, 0, dir.close_op, 0, 0 }, &frame));
+    try std.testing.expectEqual(error_result(.einval), dispatch(sys_dir_list, .{ token, 0, 1, dir.close_op, 0, 0 }, &frame));
+    try std.testing.expectEqual(error_result(.einval), dispatch(sys_dir_list, .{ token, 0, 0, dir.close_op, 1, 0 }, &frame));
+    try std.testing.expectEqual(error_result(.einval), dispatch(sys_dir_list, .{ token, 0, 0, dir.close_op, 0, 1 }, &frame));
+    try std.testing.expectEqual(@as(u64, 0), dispatch(sys_dir_list, .{ token, 0, 0, dir.close_op, 0, 0 }, &frame));
+}
+
+test "syscall: M182b (#3153) — win/wmctl wire words refuse out-of-range narrowing" {
+    userspace.init();
+    init(test_writer);
+    wm_server.init();
+    _ = scheduler.init();
+    _ = scheduler.register_worker(0x2000);
+    _ = scheduler.register_user(0x3000, 0); // task 2 = process 0
+    scheduler.start();
+    var frame = fresh_frame();
+    try std.testing.expect(scheduler.yield_current()); // shell -> user (2)
+
+    driving_award.arm();
+    try std.testing.expect(wm_server.register(0));
+    defer _ = wm_server.unregister(0);
+    const opened = driving_award.user_open(64, 64, 400, 300, 0);
+    try std.testing.expectEqual(@as(u8, 2), opened.opened);
+
+    // sys_win_move_to_workspace (slot 52): a workspace word that does
+    // not fit u8 is refused — 0x100 must not narrow to workspace 0, and
+    // a clean workspace still applies.
+    try std.testing.expectEqual(error_result(.einval), dispatch(52, .{ 2, 0x100, 0, 0, 0, 0 }, &frame));
+    try std.testing.expectEqual(@as(u64, 0), dispatch(52, .{ 2, 1, 0, 0, 0, 0 }, &frame));
+
+    // WMCTL DIALOG action 3: a target word that does not fit u8 is
+    // refused — 0x102 must not narrow to the open window's id.
+    try std.testing.expectEqual(error_result(.einval), dispatch(sys_wmctl, .{ wm_server.wmctl_dialog, 3, 0x100 | 2, 0, 0, 0 }, &frame));
+    try std.testing.expect(!driving_award.unsaved_dialog_is_open());
+
+    // WMCTL CONTENT_KEY: a usage/flags word that does not fit u8/u16 is
+    // refused — never a different injected press.
+    try std.testing.expectEqual(error_result(.einval), dispatch(sys_wmctl, .{ wm_server.wmctl_content_key, 0x104, 0, 0, 0, 0 }, &frame));
+    try std.testing.expectEqual(error_result(.einval), dispatch(sys_wmctl, .{ wm_server.wmctl_content_key, 4, 0x1_0000, 0, 0, 0 }, &frame));
+}
+
+var m182b_console = console.MockConsole(1024){};
+
+test "syscall: M182b (#3153) — wrapping user-pointer sums are EFAULT" {
+    userspace.init();
+    init(test_writer);
+    _ = scheduler.init();
+    _ = scheduler.register_worker(0x2000);
+    _ = scheduler.register_user(0x3000, 0); // task 2 = process 0
+    scheduler.start();
+    var frame = fresh_frame();
+    try std.testing.expect(scheduler.yield_current()); // shell -> user (2)
+
+    var buf: [4096]u8 = undefined;
+    set_user_regions(
+        .{ .base = @intFromPtr(&buf), .len = buf.len },
+        .{ .base = @intFromPtr(&buf), .len = buf.len },
+    );
+
+    // review L18: an EL1-side pointer sum that cannot be formed faults
+    // before uaccess — never lands on the caller's own pages.
+    const was_gpu_ready = virtio_gpu.gpu_ready;
+    virtio_gpu.gpu_ready = true;
+    defer virtio_gpu.gpu_ready = was_gpu_ready;
+    try std.testing.expectEqual(error_result(.efault), dispatch(syscall.sys_scanout_read, .{ 16, 16, 8, 8, std.math.maxInt(u64) - 8, 256 }, &frame));
+    try std.testing.expectEqual(@as(u64, 256), dispatch(syscall.sys_scanout_read, .{ 16, 16, 8, 8, @intFromPtr(&buf), 256 }, &frame));
+
+    // sys_audio_play: an unformable `ptr + off` span is EFAULT before
+    // the device starts; a valid pointer still answers the honest
+    // no-start ENXIO.
+    virtio_snd.mixer = null;
+    virtio_snd.snd_ready = true;
+    try std.testing.expectEqual(error_result(.efault), dispatch(sys_audio_play, .{ std.math.maxInt(u64) - 4, 8, 0, 0, 0, 0 }, &frame));
+    try std.testing.expectEqual(error_result(.enxio), dispatch(sys_audio_play, .{ @intFromPtr(&buf), 8, 0, 0, 0, 0 }, &frame));
+
+    // sys_audio_rec: the same span rule on the drain side.
+    virtio_snd.ctrl_armed = true;
+    virtio_snd.rx_armed = true;
+    defer {
+        virtio_snd.snd_ready = false;
+        virtio_snd.ctrl_armed = false;
+        virtio_snd.rx_armed = false;
+    }
+    try std.testing.expectEqual(error_result(.efault), dispatch(syscall.sys_audio_rec, .{ virtio_snd.cap_format, virtio_snd.cap_rate, virtio_snd.cap_channels, std.math.maxInt(u64) - 4, 8, 0 }, &frame));
+
+    // sys_vsock_ctl: the refusal text's copy-out is EFAULT for a wrapped
+    // code_ptr — the same contract the ok path's terminator write holds.
+    // The session's refusal line rides the tee console; arm it over a
+    // file-scope mock so the writes land somewhere stable.
+    syscall.road_pops.arm(m182b_console.console(), null);
+    @memcpy(buf[0..7], "suspend");
+    try std.testing.expectEqual(error_result(.efault), dispatch(syscall.sys_vsock_ctl, .{ @intFromPtr(&buf), 7, 0, 0, std.math.maxInt(u64) - 4, 8 }, &frame));
+}

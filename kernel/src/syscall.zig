@@ -1184,6 +1184,10 @@ fn handle_scanout_read(args: Args, _: *exceptions.VectorFrame) u64 {
     const need = row_bytes * h;
     if (need > scanout_read_max or args[5] != need) return error_result(.einval);
     const stride = @as(usize, virtio_gpu.fb_width) * virtio_gpu.fb_bpp;
+    // M182b (#3153, review L18): `args[4] + row * row_bytes` must never
+    // wrap into the caller's own pages — a span that cannot be formed is
+    // EFAULT before any row is stored.
+    _ = std.math.add(u64, args[4], need) catch return error_result(.efault);
     var row: u64 = 0;
     while (row < h) : (row += 1) {
         const off = @as(usize, @intCast((y + row) * @as(u64, stride) + x * bpp));
@@ -1675,6 +1679,9 @@ fn handle_notify(args: Args, _: *exceptions.VectorFrame) u64 {
     _ = pid;
     const text_addr = args[0];
     const text_len = args[1];
+    // M182b (#3153, review L3): a level word that does not fit u8 is
+    // refused, never silently narrowed into a valid level.
+    if (args[2] > std.math.maxInt(u8)) return error_result(.einval);
     const level: u8 = @truncate(args[2]);
     if (level > 2) return error_result(.einval);
     if (text_len > driving_award.notify_text_max) return error_result(.einval);
@@ -1941,6 +1948,9 @@ fn handle_win_move_to_workspace(args: Args, _: *exceptions.VectorFrame) u64 {
     if (args[0] > std.math.maxInt(u8)) return error_result(.einval);
     const id: u8 = @truncate(args[0]);
     if (!win_owned_by_caller(id)) return error_result(.einval);
+    // M182b (#3153, review L3): a workspace word that does not fit u8 is
+    // refused, never silently narrowed into a valid workspace.
+    if (args[1] > std.math.maxInt(u8)) return error_result(.einval);
     const ws: u8 = @truncate(args[1]);
     if (ws >= driving_award.workspace_max) return error_result(.einval);
     if (!driving_award.user_move_to_workspace(id, ws)) return error_result(.einval);
@@ -2097,6 +2107,9 @@ fn handle_wait_event(args: Args, _: *exceptions.VectorFrame) u64 {
 fn handle_file_open(args: Args, _: *exceptions.VectorFrame) u64 {
     const path_ptr = args[0];
     const path_len = args[1];
+    // M182b (#3153, review L3): a flags word that does not fit u32 is
+    // refused, never silently narrowed into a different valid flag set.
+    if (args[2] > std.math.maxInt(u32)) return error_result(.einval);
     const flags: u32 = @truncate(args[2]);
     if (path_len == 0 or path_len > file_table.max_path_len) return error_result(.einval);
     const pid = process.find_by_task(scheduler.current_id()) orelse return error_result(.einval);
@@ -2335,6 +2348,10 @@ fn handle_dir_v2(args: Args) u64 {
     const pid = process.find_by_task(scheduler.current_id()) orelse return error_result(.einval);
     const res: i64 = switch (args[3]) {
         dir.open_op => blk: {
+            // M182b (#3153, review L17): the registers this op does not
+            // read are reserved-zero — a dirty one is refused, not
+            // silently ignored.
+            if (args[2] != 0 or args[4] != 0 or args[5] != 0) return error_result(.einval);
             if (args[1] > file_table.max_path_len) return error_result(.enametoolong);
             var path: [file_table.max_path_len]u8 = undefined;
             if (args[1] > 0 and uaccess.copy_in(&path, args[0], @intCast(args[1])) != .ok)
@@ -2342,6 +2359,7 @@ fn handle_dir_v2(args: Args) u64 {
             break :blk file_table.dir_open(pid, path[0..args[1]]);
         },
         dir.page_op => blk: {
+            if (args[5] != 0) return error_result(.einval);
             var page: dir.Page = undefined;
             const count = file_table.dir_page(pid, args[0], args[1], args[4], &page);
             if (count < 0) break :blk count;
@@ -2350,7 +2368,10 @@ fn handle_dir_v2(args: Args) u64 {
             if (uaccess.copy_out(args[2], bytes[0..len], len) != .ok) return error_result(.efault);
             break :blk count;
         },
-        dir.close_op => file_table.dir_close(pid, args[0]),
+        dir.close_op => blk: {
+            if (args[1] != 0 or args[2] != 0 or args[4] != 0 or args[5] != 0) return error_result(.einval);
+            break :blk file_table.dir_close(pid, args[0]);
+        },
         else => -1,
     };
     return @bitCast(res);
@@ -2391,6 +2412,10 @@ fn handle_file_rename(args: Args, _: *exceptions.VectorFrame) u64 {
 /// Milestone 13 (claim 5801): slot 36 — sys_file_truncate(handle, size)
 fn handle_file_truncate(args: Args, _: *exceptions.VectorFrame) u64 {
     const handle = args[0];
+    // M182b (#3153, review L3): a size word that does not fit u32 is the
+    // slot-36 over-large refusal (ENOSPC), never a silently narrower
+    // truncate target.
+    if (args[1] > std.math.maxInt(u32)) return error_result(.enospc);
     const size: u32 = @truncate(args[1]);
     if (handle >= file_table.max_handles_per_process) return error_result(.ebadf);
     const pid = process.find_by_task(scheduler.current_id()) orelse return error_result(.einval);
@@ -2401,6 +2426,9 @@ fn handle_file_truncate(args: Args, _: *exceptions.VectorFrame) u64 {
 
 /// Milestone 13 (claim 5801): slot 37 — sys_file_free(volume)
 fn handle_file_free(args: Args, _: *exceptions.VectorFrame) u64 {
+    // M182b (#3153, review L3): a volume word that does not fit u32 is
+    // refused, never silently narrowed into a valid volume.
+    if (args[0] > std.math.maxInt(u32)) return error_result(.einval);
     const volume: u32 = @truncate(args[0]);
     const pid = process.find_by_task(scheduler.current_id()) orelse return error_result(.einval);
     const res = file_table.free_space(pid, volume);
@@ -2428,6 +2456,9 @@ fn handle_file_sync(args: Args, _: *exceptions.VectorFrame) u64 {
 fn handle_file_mode(args: Args, _: *exceptions.VectorFrame) u64 {
     const path_ptr = args[0];
     const path_len = args[1];
+    // M182b (#3153, review L3): a mode word that does not fit u16 is
+    // refused, never silently narrowed into a different valid mode.
+    if (args[2] > std.math.maxInt(u16)) return error_result(.einval);
     const mode: u16 = @truncate(args[2]);
     if (path_len == 0 or path_len > file_table.max_path_len) return error_result(.einval);
     const pid = process.find_by_task(scheduler.current_id()) orelse return error_result(.einval);
@@ -3441,6 +3472,10 @@ fn handle_audio_play(args: Args, _: *exceptions.VectorFrame) u64 {
     if (raw_len > virtio_snd.audio_max_len) return error_result(.enametoolong);
     if (!virtio_snd.snd_ready) return error_result(.enxio);
     const len: usize = @intCast(raw_len);
+    // M182b (#3153, review L18): `ptr + off` must never wrap into the
+    // caller's own pages — a span that cannot be formed is EFAULT before
+    // the device starts.
+    _ = std.math.add(u64, ptr, len) catch return error_result(.efault);
     const st = virtio_snd.snd_audio_start();
     if (st != virtio_snd.S_OK) return error_result(.enxio);
     var off: usize = 0;
@@ -3620,6 +3655,16 @@ fn handle_audio_rec(args: Args, _: *exceptions.VectorFrame) u64 {
     if (len > virtio_snd.cap_ring_bytes) return error_result(.enametoolong);
     const saved = virtio_snd.audio_lock.lock();
     defer virtio_snd.audio_lock.unlock(saved);
+    // M182b (#3153): the slot-92 order holds — device absence answers
+    // ENXIO before the wire-word refusals below, exactly as
+    // `snd_capture`'s own checks precede its tuple check.
+    if (!virtio_snd.snd_ready or !virtio_snd.ctrl_armed or !virtio_snd.rx_armed) return error_result(.enxio);
+    // review L3: a tuple word that does not fit its u8 field is refused,
+    // never silently narrowed into a valid tuple.
+    if (args[0] > std.math.maxInt(u8) or args[1] > std.math.maxInt(u8) or args[2] > std.math.maxInt(u8)) return error_result(.einval);
+    // review L18: `ptr + off` must never wrap into the caller's own
+    // pages — a span that cannot be formed is EFAULT before the drain.
+    _ = std.math.add(u64, ptr, len) catch return error_result(.efault);
     const st = virtio_snd.snd_capture(format, rate, channels, @intCast(len / virtio_snd.cap_frame_bytes));
     if (st != virtio_snd.S_OK) return error_result(audio_rec_errno(virtio_snd.cap_refusal));
     var off: usize = 0;
@@ -3682,7 +3727,11 @@ fn handle_vsock_ctl(args: Args, _: *exceptions.VectorFrame) u64 {
             const take = @min(raw.len, cap - 1);
             if (uaccess.copy_out(code_ptr, raw[0..take], take) != .ok) return error_result(.efault);
             const nul: [1]u8 = .{0};
-            _ = uaccess.copy_out(code_ptr + take, &nul, 1);
+            // M182b (#3153, review L18): form the terminator address
+            // without wrap — a wrapped target is EFAULT, never a byte
+            // landing on the caller's own pages.
+            const nul_at = std.math.add(u64, code_ptr, take) catch return error_result(.efault);
+            _ = uaccess.copy_out(nul_at, &nul, 1);
         }
         return 0;
     }
@@ -5044,6 +5093,10 @@ fn handle_wmctl(args: Args, _: *exceptions.VectorFrame) u64 {
             // 15; a press is one down+up pair, no held state.
             if (!wm_server.registered()) return error_result(.enosys);
             if (wm_server.registered_pid() != pid) return error_result(.eacces);
+            // M182b (#3153, review L3): a usage/flags word that does not
+            // fit its field is refused, never silently narrowed into a
+            // different valid press.
+            if (args[1] > std.math.maxInt(u8) or args[2] > std.math.maxInt(u16)) return error_result(.einval);
             input.inject_content_key(@truncate(args[1]), @truncate(args[2]));
             return 0;
         },
@@ -5369,6 +5422,10 @@ fn handle_wmctl(args: Args, _: *exceptions.VectorFrame) u64 {
                 1 => driving_award.about_dialog_open_dialog(),
                 2 => driving_award.about_dialog_toggle(),
                 3 => {
+                    // M182b (#3153, review L3): a target word that does
+                    // not fit u8 is refused, never silently narrowed into
+                    // a different valid window.
+                    if (args[2] > std.math.maxInt(u8)) return error_result(.einval);
                     const target: u8 = @truncate(args[2]);
                     if (driving_award.find_user_window(target) == null) return error_result(.einval);
                     driving_award.unsaved_dialog_show(target);
