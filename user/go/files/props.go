@@ -39,6 +39,10 @@ var statFacts = vi.StatFacts
 // refusal arms are pinnable too.
 var volFree = vi.VolumeFree
 
+// statOwner is the stat wire's owner word — the package var so host
+// tests pin the row without a kernel (M188b #3187).
+var statOwner = fileOwner
+
 // props is the open card's whole state. name/path/kind identify the row;
 // size is the wire size; mimeID is the sniff word on files ("" on rows
 // with no bytes to sniff); mtOK/mtSec and ctOK/ctSec carry the M134a
@@ -67,6 +71,9 @@ type props struct {
 	freeOK   bool
 	free     uint64
 	freeNo   string
+	owner    uint32
+	ownerOK  bool
+	ownerNo  string
 	vol      string
 	volKind  string
 	volSt    string
@@ -233,6 +240,22 @@ func (m *model) openProps() {
 			}
 		}
 	}
+	// M188b (#3187): the owner row — the stat wire's owner word. A /disk
+	// file carries the inode's owner_uid (0 = unowned, world-accessible);
+	// a /host file carries the share's host uid. A tar member, a volume
+	// row, and a path the wire does not root name their reason instead.
+	switch {
+	case m.tar != nil:
+		p.ownerNo = "not in the archive header"
+	case p.kind == "volume":
+		p.ownerNo = "a volume row has no owner"
+	default:
+		if uid, ok := statOwner(path); ok {
+			p.owner, p.ownerOK = uid, true
+		} else {
+			p.ownerNo = "not on the stat wire"
+		}
+	}
 	m.props = p
 	m.mode = modeProps
 	mtWord, ctWord, allocWord, freeWord := "none", "-", "-", "-"
@@ -329,6 +352,10 @@ func (m model) propsRows() []string {
 			vol += " · " + p.volAcc
 		}
 	}
+	owner := "not available — " + p.ownerNo
+	if p.ownerOK {
+		owner = ownerName(p.owner)
+	}
 	return []string{
 		"  name      " + p.name,
 		"  path      " + p.path,
@@ -339,9 +366,26 @@ func (m model) propsRows() []string {
 		"  created   " + created,
 		"  mime      " + mimeWord,
 		"  volume    " + vol,
+		"  owner     " + owner,
 		"  on disk   " + disk,
 		"  vol free  " + free,
 	}
+}
+
+// ownerName renders the owner word by name (M188b): 0 is the unowned,
+// world-accessible inode; the two guest principals name themselves; any
+// other uid — a host uid on the share, or a principal this build does
+// not know — renders its number, honestly.
+func ownerName(uid uint32) string {
+	switch uid {
+	case 0:
+		return "unowned"
+	case 1000:
+		return "user"
+	case 2000:
+		return "agent"
+	}
+	return "uid " + vi.Itoa64(int64(uid))
 }
 
 // isoUTC renders an epoch second as strict UTC ISO-8601 — the card's

@@ -157,6 +157,10 @@ pub const Error = error{
     NameTooLong,
     /// not_empty — a remove target is a directory with live dirents.
     NotEmpty,
+    /// not_owner — M188b (#3187, ADR 0061 D13): the inode's owner_uid is
+    /// nonzero and neither matches the caller's uid nor is the caller
+    /// uid_system — the e_perm-class refusal, always named, never silent.
+    NotOwner,
     /// bad_block_auth — a sealed (v2) block's AEAD tag did not verify
     /// (ADR 0061): a torn or tampered ciphertext refuses by name, never
     /// serves unauthenticated bytes.
@@ -197,6 +201,7 @@ pub fn refusalName(err: Error) []const u8 {
         error.FileTooLarge => "file_too_large",
         error.NameTooLong => "name_too_long",
         error.NotEmpty => "not_empty",
+        error.NotOwner => "not_owner",
         error.BadBlockAuth => "bad_block_auth",
     };
 }
@@ -1133,7 +1138,21 @@ pub const in_mtime: usize = 8;
 pub const in_ctime: usize = 16;
 pub const in_extents: usize = 24;
 pub const in_next_ext: usize = 88;
+/// ADR 0061 D13 (M188b #3187): the inode's owner principal, u32 in the
+/// reserved span. Minted 0 at format and at create; 0 means "unowned" —
+/// every uid may read, write and unlink it.
+pub const in_owner: usize = 92;
 pub const in_cksum: usize = 124;
+
+/// M188b (#3187): the opt-in ownership rule ADR 0061 D13 reserved the
+/// bytes for. `owner` 0 is unowned — world-accessible so every existing
+/// file keeps working; caller uid 0 is uid_system, which always proceeds;
+/// otherwise the caller's uid must equal the inode's owner_uid. This is
+/// the whole policy: no mode bits, no groups, no ACLs (the card's stated
+/// bound — "the smallest honest step past D13, not a permission system").
+pub fn ownerAllows(owner: u32, caller_uid: u32) bool {
+    return owner == 0 or caller_uid == 0 or caller_uid == owner;
+}
 
 pub const xb_magic: usize = 0;
 pub const xb_next: usize = 4;
@@ -1154,6 +1173,8 @@ pub const Inode = struct {
     ctime: u64,
     extents: [inline_extents]Extent,
     next_extent_block: u32,
+    /// M188b (#3187, ADR 0061 D13): the inode's owner_uid; 0 = unowned.
+    owner: u32 = 0,
 
     pub fn isDir(self: Inode) bool {
         return self.kind == kind_dir;
@@ -1186,6 +1207,7 @@ fn parseInode(rec: *const [inode_len]u8) Error!Inode {
         .ctime = rd64(rec, in_ctime),
         .extents = undefined,
         .next_extent_block = rd32(rec, in_next_ext),
+        .owner = rd32(rec, in_owner),
     };
     for (0..inline_extents) |i| {
         ino.extents[i] = .{
@@ -1233,10 +1255,21 @@ pub fn fileBlock(src: SectorSource, vol: Volume, ino: Inode, fblock: u32, scratc
 
 /// Read `out` bytes of file `ino` starting at `offset`. Returns bytes read
 /// (0 at EOF); a mid-read structural failure stops at the last good byte
-/// like fat32_ro, and a failure on the first block is the error.
+/// like fat32_ro, and a failure on the first block is the error. The
+/// un-owned entry point: callers that name no principal act as uid_system.
 pub fn read(src: SectorSource, vol: Volume, ino: u32, offset: u64, out: []u8, scratch: *[block_len]u8) Error!usize {
+    return readAs(src, vol, ino, 0, offset, out, scratch);
+}
+
+/// M188b (#3187): the owner-checked read. An owned inode (owner_uid ≠ 0)
+/// serves only its owner and uid_system; any other uid gets the named
+/// not_owner refusal — never a short read, never silent bytes. Directory
+/// traversal and metadata (lookup/listDir/stat) stay unowned surfaces:
+/// the owner is public metadata, needed by the file-facts view itself.
+pub fn readAs(src: SectorSource, vol: Volume, ino: u32, caller_uid: u32, offset: u64, out: []u8, scratch: *[block_len]u8) Error!usize {
     const rec = try readInode(src, vol, ino, scratch);
     if (rec.kind != kind_file) return error.IsDir;
+    if (!ownerAllows(rec.owner, caller_uid)) return error.NotOwner;
     return readExtentBytes(src, vol, rec, offset, out, scratch);
 }
 
@@ -1435,12 +1468,15 @@ pub const Stat = struct {
     /// (they are blocks the file allocated). The op-15 "allocated bytes"
     /// fact is this count times block_len.
     alloc_blocks: u64,
+    /// M188b (#3187): the inode's owner_uid — public metadata (the
+    /// file-facts view shows it; enforcement lives on the byte paths).
+    owner: u32,
 };
 
 pub fn stat(src: SectorSource, vol: Volume, ino: u32, scratch: *[block_len]u8) Error!Stat {
     const rec = try readInode(src, vol, ino, scratch);
     const alloc = try extentCoverage(src, vol, rec, scratch);
-    return .{ .ino = ino, .kind = rec.kind, .size = rec.size, .mtime = rec.mtime, .ctime = rec.ctime, .alloc_blocks = alloc };
+    return .{ .ino = ino, .kind = rec.kind, .size = rec.size, .mtime = rec.mtime, .ctime = rec.ctime, .alloc_blocks = alloc, .owner = rec.owner };
 }
 
 /// M160b (#2990): the blocks one inode's extent list claims — inline

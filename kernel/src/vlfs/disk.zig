@@ -28,6 +28,8 @@ const metadata = @import("../fs_metadata.zig");
 const virtio_blk = @import("../virtio_blk.zig");
 const timer = @import("../timer.zig");
 const seal = @import("../seal.zig");
+const process = @import("../process.zig");
+const scheduler = @import("../scheduler.zig");
 
 const Mount = struct {
     src: vlfs.SectorSource,
@@ -77,6 +79,19 @@ fn now() u64 {
     return timer.wall_epoch() orelse 0;
 }
 
+/// M188b (#3187): the acting uid for a /disk op — the process principal of
+/// the task the op runs on (the same find_by_task resolution the syscall
+/// layer makes, so an EL0 caller's uid_agent/uid_user is what the inode's
+/// owner_uid is checked against). A call that resolves no process — the
+/// monitor's `vf` verbs, boot-time ops, host tests — acts as uid_system:
+/// the kernel authority, which the opt-in rule always admits.
+pub fn actingUid() u32 {
+    if (process.find_by_task(scheduler.current_id())) |pid| {
+        if (process.principal(pid)) |p| return p.uid;
+    }
+    return process.uid_system;
+}
+
 /// Attach and mount a VLFS volume through the mount-time check (M134c
 /// #2761): a corrupt image is refused by name before any write reaches it.
 /// Returns true on success; on refusal the named reason is in
@@ -112,6 +127,22 @@ pub fn detach() void {
 
 pub fn mounted() bool {
     return active != null;
+}
+
+/// M188b (#3187): the mounted volume's seal posture for the mount-table
+/// row — `unsealed` for a live v2 mount, `locked` when the last attach
+/// refused a sealed volume (the boot continues share-only, ADR 0061 D10),
+/// `none` for v1 or no disk. GOFILES's volume face names it honestly.
+pub const SealState = enum(u8) { none, locked, unsealed };
+pub fn sealState() SealState {
+    if (active) |m| {
+        if (m.vol.seal != null) return .unsealed;
+        return .none;
+    }
+    if (last_refusal) |r| {
+        if (std.mem.eql(u8, r, "sealed")) return .locked;
+    }
+    return .none;
 }
 
 /// The mounted volume, or not_mounted.
@@ -150,7 +181,7 @@ pub fn lookup(path: []const u8) vlfs.Error!vlfs.Dirent {
 
 pub fn read(ino: u32, offset: u64, out: []u8) vlfs.Error!usize {
     const m = try mountOr();
-    return vlfs.read(m.src, m.vol, ino, offset, out, &block_scratch);
+    return vlfs.readAs(m.src, m.vol, ino, actingUid(), offset, out, &block_scratch);
 }
 
 /// Name-sorted dirents of directory `dir_ino`, the smallest `out.len` by
@@ -169,29 +200,32 @@ pub fn statInode(ino: u32) vlfs.Error!vlfs.Stat {
 // Every one is one journaled transaction (ADR D4) — committed and
 // checkpointed before it returns. Named refusals propagate unchanged.
 
-/// Create `path` (kind_file or kind_dir); returns the new inode.
+/// Create `path` (kind_file or kind_dir); returns the new inode. The
+/// inode's owner_uid is claimed by the acting principal (M188b): an EL0
+/// create mints the caller's uid; kernel-actor creates (the monitor's `vf`
+/// verbs) mint 0 — unowned, world-accessible, the mkfs default.
 pub fn create(path: []const u8, kind: u8) vlfs.Error!u32 {
     const m = try mountPtr();
-    return vlfs_write.createPath(m.src, &m.vol, path, kind, now(), &block_scratch, &compose_scratch);
+    return vlfs_write.createPathAs(m.src, &m.vol, path, kind, actingUid(), now(), &block_scratch, &compose_scratch);
 }
 
 /// Write `bytes` at `offset` inside inode `ino` (one transaction).
 pub fn write(ino: u32, offset: u64, bytes: []const u8) vlfs.Error!usize {
     const m = try mountPtr();
-    return vlfs_write.writeFile(m.src, &m.vol, ino, offset, bytes, now(), &block_scratch, &compose_scratch);
+    return vlfs_write.writeFileAs(m.src, &m.vol, ino, actingUid(), offset, bytes, now(), &block_scratch, &compose_scratch);
 }
 
 /// Resize inode `ino` (journaled shrink or zero-filled grow).
 pub fn truncate(ino: u32, new_size: u32) vlfs.Error!void {
     const m = try mountPtr();
-    return vlfs_write.truncateFile(m.src, &m.vol, ino, new_size, now(), &block_scratch, &compose_scratch);
+    return vlfs_write.truncateFileAs(m.src, &m.vol, ino, actingUid(), new_size, now(), &block_scratch, &compose_scratch);
 }
 
 /// Remove `path`; returns the freed inode so callers can stale handles and
 /// pins that referenced it.
 pub fn remove(path: []const u8) vlfs.Error!u32 {
     const m = try mountPtr();
-    const ino = try vlfs_write.removePath(m.src, &m.vol, path, now(), &block_scratch, &compose_scratch);
+    const ino = try vlfs_write.removePathAs(m.src, &m.vol, path, actingUid(), now(), &block_scratch, &compose_scratch);
     invalidateIno(ino);
     return ino;
 }
@@ -215,20 +249,21 @@ pub fn sync() vlfs.Error!void {
 /// shape, one journaled transaction per stage.
 pub fn writeWhole(path: []const u8, bytes: []const u8) vlfs.Error!void {
     const m = try mountPtr();
+    const uid = actingUid();
     const ino = blk: {
         const found = vlfs.lookup(m.src, m.vol, path, &block_scratch) catch |err| switch (err) {
-            error.NotFound => break :blk try vlfs_write.createPath(m.src, &m.vol, path, vlfs.kind_file, now(), &block_scratch, &compose_scratch),
+            error.NotFound => break :blk try vlfs_write.createPathAs(m.src, &m.vol, path, vlfs.kind_file, uid, now(), &block_scratch, &compose_scratch),
             else => return err,
         };
         if (found.kind == vlfs.kind_dir) return error.IsDir;
         break :blk found.inode;
     };
     if (bytes.len == 0) {
-        try vlfs_write.truncateFile(m.src, &m.vol, ino, 0, now(), &block_scratch, &compose_scratch);
+        try vlfs_write.truncateFileAs(m.src, &m.vol, ino, uid, 0, now(), &block_scratch, &compose_scratch);
     } else {
         const st = try vlfs.stat(m.src, m.vol, ino, &block_scratch);
-        if (st.size != 0) try vlfs_write.truncateFile(m.src, &m.vol, ino, 0, now(), &block_scratch, &compose_scratch);
-        _ = try vlfs_write.writeFile(m.src, &m.vol, ino, 0, bytes, now(), &block_scratch, &compose_scratch);
+        if (st.size != 0) try vlfs_write.truncateFileAs(m.src, &m.vol, ino, uid, 0, now(), &block_scratch, &compose_scratch);
+        _ = try vlfs_write.writeFileAs(m.src, &m.vol, ino, uid, 0, bytes, now(), &block_scratch, &compose_scratch);
     }
     try vlfs_write.sync(m.src);
 }
@@ -237,16 +272,17 @@ pub fn writeWhole(path: []const u8, bytes: []const u8) vlfs.Error!void {
 /// the monitor's `vf write /disk/...` verb loops over.
 pub fn writeAppend(path: []const u8, bytes: []const u8) vlfs.Error!void {
     const m = try mountPtr();
+    const uid = actingUid();
     const ino = blk: {
         const found = vlfs.lookup(m.src, m.vol, path, &block_scratch) catch |err| switch (err) {
-            error.NotFound => break :blk try vlfs_write.createPath(m.src, &m.vol, path, vlfs.kind_file, now(), &block_scratch, &compose_scratch),
+            error.NotFound => break :blk try vlfs_write.createPathAs(m.src, &m.vol, path, vlfs.kind_file, uid, now(), &block_scratch, &compose_scratch),
             else => return err,
         };
         if (found.kind == vlfs.kind_dir) return error.IsDir;
         break :blk found.inode;
     };
     const st = try vlfs.stat(m.src, m.vol, ino, &block_scratch);
-    _ = try vlfs_write.writeFile(m.src, &m.vol, ino, st.size, bytes, now(), &block_scratch, &compose_scratch);
+    _ = try vlfs_write.writeFileAs(m.src, &m.vol, ino, uid, st.size, bytes, now(), &block_scratch, &compose_scratch);
 }
 
 /// A deleted inode's contained handles and pins are stale immediately —
@@ -332,7 +368,7 @@ pub fn vlfsToMetaError(err: vlfs.Error) metadata.Error {
         error.IsDir => error.NotFile,
         error.Exists, error.NotEmpty => error.Exists,
         error.NameTooLong => error.InvalidPath,
-        error.ReadOnly => error.AccessDenied,
+        error.ReadOnly, error.NotOwner => error.AccessDenied,
         else => error.Io,
     };
 }
@@ -357,7 +393,9 @@ fn metaOf(m: Mount, ino: u32) metadata.Error!metadata.Metadata {
         // Every .disk object is world-readable/writable in v1 (D6) — the
         // mode is a statement, not a policy check.
         .host_mode = if (s.kind == vlfs.kind_dir) 0o040777 else 0o100666,
-        .host_uid = 0,
+        // M188b (#3187): the inode's owner_uid rides the wire honestly —
+        // 0 is unowned (world), never a substitute for access policy.
+        .host_uid = s.owner,
         .host_gid = 0,
     };
 }
@@ -428,7 +466,7 @@ fn opsRead(_: *anyopaque, handle: u64, out: []u8) metadata.Error!usize {
     if (!f.used) return error.StaleIdentity;
     const m = mountOr() catch |err| return vlfsToMetaError(err);
     if (f.epoch != m.epoch) return error.StaleIdentity;
-    const n = vlfs.read(m.src, m.vol, f.ino, f.cursor, out, &block_scratch) catch |err|
+    const n = vlfs.readAs(m.src, m.vol, f.ino, actingUid(), f.cursor, out, &block_scratch) catch |err|
         return vlfsToMetaError(err);
     f.cursor += n;
     return n;
@@ -441,7 +479,7 @@ fn opsWrite(_: *anyopaque, handle: u64, bytes: []const u8) metadata.Error!usize 
     if (!f.writable) return error.AccessDenied;
     const m = mountPtr() catch |err| return vlfsToMetaError(err);
     if (f.epoch != m.epoch) return error.StaleIdentity;
-    const n = vlfs_write.writeFile(m.src, &m.vol, f.ino, f.cursor, bytes, now(), &block_scratch, &compose_scratch) catch |err|
+    const n = vlfs_write.writeFileAs(m.src, &m.vol, f.ino, actingUid(), f.cursor, bytes, now(), &block_scratch, &compose_scratch) catch |err|
         return vlfsToMetaError(err);
     f.cursor += n;
     return n;
@@ -449,7 +487,7 @@ fn opsWrite(_: *anyopaque, handle: u64, bytes: []const u8) metadata.Error!usize 
 
 fn opsCreate(_: *anyopaque, parent: metadata.Object, name: []const u8) metadata.Error!metadata.Created {
     const m = mountPtr() catch |err| return vlfsToMetaError(err);
-    const ino = vlfs_write.create(m.src, &m.vol, @intCast(parent.token), name, vlfs.kind_file, now(), &block_scratch, &compose_scratch) catch |err|
+    const ino = vlfs_write.createAs(m.src, &m.vol, @intCast(parent.token), name, vlfs.kind_file, actingUid(), now(), &block_scratch, &compose_scratch) catch |err|
         return vlfsToMetaError(err);
     for (&contained_files, 0..) |*f, i| {
         if (!f.used) {
@@ -462,7 +500,7 @@ fn opsCreate(_: *anyopaque, parent: metadata.Object, name: []const u8) metadata.
 
 fn opsMkdir(_: *anyopaque, parent: metadata.Object, name: []const u8) metadata.Error!metadata.Object {
     const m = mountPtr() catch |err| return vlfsToMetaError(err);
-    const ino = vlfs_write.create(m.src, &m.vol, @intCast(parent.token), name, vlfs.kind_dir, now(), &block_scratch, &compose_scratch) catch |err|
+    const ino = vlfs_write.createAs(m.src, &m.vol, @intCast(parent.token), name, vlfs.kind_dir, actingUid(), now(), &block_scratch, &compose_scratch) catch |err|
         return vlfsToMetaError(err);
     return .{ .token = ino, .metadata = try metaOf(m.*, ino) };
 }
@@ -488,7 +526,7 @@ fn opsRemove(_: *anyopaque, parent: metadata.Object, name: []const u8, kind: met
     const want: u8 = if (kind == .directory) vlfs.kind_dir else vlfs.kind_file;
     if (found_kind != want) return if (kind == .directory) error.NotDirectory else error.NotFile;
     // Kind-checked (pin inode, name) removal — the pin never re-resolves.
-    const ino = vlfs_write.removeAt(m.src, &m.vol, @intCast(parent.token), name, now(), &block_scratch, &compose_scratch) catch |err|
+    const ino = vlfs_write.removeAtAs(m.src, &m.vol, @intCast(parent.token), name, actingUid(), now(), &block_scratch, &compose_scratch) catch |err|
         return vlfsToMetaError(err);
     invalidateIno(ino);
 }
@@ -565,7 +603,7 @@ pub fn containedRead(handle: u32, out: []u8) vlfs.Error!usize {
     if (!f.used) return error.BadInode;
     const m = try mountOr();
     if (f.epoch != m.epoch) return error.BadInode;
-    const n = try vlfs.read(m.src, m.vol, f.ino, f.cursor, out, &block_scratch);
+    const n = try vlfs.readAs(m.src, m.vol, f.ino, actingUid(), f.cursor, out, &block_scratch);
     f.cursor += n;
     return n;
 }
@@ -578,7 +616,7 @@ pub fn containedWrite(handle: u32, bytes: []const u8) vlfs.Error!usize {
     if (!f.used or !f.writable) return error.BadInode;
     const m = try mountPtr();
     if (f.epoch != m.epoch) return error.BadInode;
-    const n = try vlfs_write.writeFile(m.src, &m.vol, f.ino, f.cursor, bytes, now(), &block_scratch, &compose_scratch);
+    const n = try vlfs_write.writeFileAs(m.src, &m.vol, f.ino, actingUid(), f.cursor, bytes, now(), &block_scratch, &compose_scratch);
     f.cursor += n;
     return n;
 }

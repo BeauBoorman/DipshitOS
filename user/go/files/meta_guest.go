@@ -33,6 +33,7 @@ const (
 	metaMtimeNsecOff = 56
 	metaCtimeSecOff  = 64
 	metaCtimeNsecOff = 72
+	metaOwnerOff     = 84 // wire.host_uid — /disk carries owner_uid (M188b)
 	metaRoot         = "/host"
 )
 
@@ -63,4 +64,32 @@ func fileTimes(path string) (mt, ct int64, mtOK, ctOK bool) {
 	// M134a's "absent reads zero" rule applies to each stamp on its own.
 	return msec*1e9 + mnsec, csec*1e9 + cnsec,
 		msec != 0 || mnsec != 0, csec != 0 || cnsec != 0
+}
+
+// fileOwner is the stat wire's owner word (M188b #3187): on /host it is
+// the share's host uid, on /disk the inode's owner_uid — 0 names the
+// unowned, world-accessible case, never a substitute for policy. A path
+// outside both roots, or a refused stat, reports ok=false and the card
+// prints its named reason rather than inventing an owner.
+func fileOwner(path string) (uint32, bool) {
+	root, rel := "", ""
+	switch {
+	case path == "/host" || path == "/disk":
+		root = path
+	case strings.HasPrefix(path, "/host/"):
+		root, rel = "/host", path[len("/host/"):]
+	case strings.HasPrefix(path, "/disk/"):
+		root, rel = "/disk", path[len("/disk/"):]
+	default:
+		return 0, false
+	}
+	var wire [metaWireBytes]byte
+	rc := rawsvc6(slotFsMetadata, metaStatOp,
+		uintptr(unsafe.Pointer(unsafe.StringData(root))), uintptr(len(root)),
+		uintptr(unsafe.Pointer(unsafe.StringData(rel))), uintptr(len(rel)),
+		uintptr(unsafe.Pointer(&wire[0])))
+	if rc < 0 {
+		return 0, false
+	}
+	return binary.LittleEndian.Uint32(wire[metaOwnerOff:]), true
 }

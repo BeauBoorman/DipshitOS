@@ -185,6 +185,19 @@ func main() {
 			pickArg = a
 		}
 	}
+	// M188b (#3187): `vol` is the bounded volume face — a serial face on
+	// the kernel mount table, not a window. Each row names its state,
+	// kind, access and seal posture, and the face names the existing
+	// create/unlock channel for a sealed disk: the host's
+	// `mkfs.vlfs --seal` writes the image, the boot passphrase prompt
+	// unlocks it. The guest owns no format or runtime-mount verb — the
+	// face names the honest seam instead of inventing one.
+	for _, a := range argsOf()[1:] {
+		if a == "vol" {
+			runVol()
+			return
+		}
+	}
 	// M125c (#2588): the state hooks. SaveState reads the live model (the
 	// closure captures the variable, so an ask always serializes the
 	// current session) and prints its own marker — a save is an action,
@@ -752,4 +765,29 @@ func shutdown(ta *tabapp.TabApp, fd uint32, status int) {
 	vi.ConsoleLine(markerClose)
 	vi.ConsoleLine(markerOK)
 	ta.CloseAndExit(status)
+}
+
+// runVol is the `vol` verb's body: the mount table over serial, one
+// `gofiles: vol` line per row — name, state, kind, access, and `sealed`
+// when the row's flag bit names a sealed v2 VLFS. A sealed row's lock
+// posture rides its state word (mounted = unsealed, not_mounted = locked
+// or absent). The closing line names the existing channel the face
+// surfaces: create is the host's mkfs.vlfs --seal, unlock is the boot
+// passphrase prompt — ADR 0061's current seam, named, never faked.
+func runVol() {
+	mounts, rc := vi.Mounts()
+	if rc < 0 {
+		vi.ConsoleLine("gofiles: vol refused rc=" + vi.Itoa64(rc))
+		vi.Exit(2)
+	}
+	for _, mt := range mounts {
+		line := "gofiles: vol " + mt.Name + " " + mt.StateName() +
+			" " + mt.KindName() + " " + mt.AccessName()
+		if mt.Sealed {
+			line += " sealed"
+		}
+		vi.ConsoleLine(line)
+	}
+	vi.ConsoleLine("gofiles: vol create=mkfs.vlfs--seal unlock=boot-passphrase-prompt")
+	vi.Exit(0)
 }

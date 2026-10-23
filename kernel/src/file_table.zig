@@ -1557,7 +1557,9 @@ fn disk_errno(err: vlfs.Error) i64 {
         // does not exist on a mounted volume.
         error.NotMounted => -9,
         error.NotFound, error.Io => -6,
-        error.ReadOnly => -7,
+        // M188b (#3187): the e_perm class — read_only_partition and the
+        // owner_uid refusal are both "permission, not absence" answers.
+        error.ReadOnly, error.NotOwner => -7,
         error.NameTooLong => -8,
         error.Exists => -9,
         // The space/refusal family: full device, full inode table, full

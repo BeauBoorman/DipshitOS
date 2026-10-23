@@ -103,6 +103,7 @@ func TestPropsFileCardMarkerAndRows(t *testing.T) {
 		"   created   2020-09-13T12:26:40Z",
 		"   mime      text",
 		"   volume    host · share · mounted · rw",
+		"   owner     not available — not on the stat wire",
 		"   on disk   4096 bytes (4.0 KiB)",
 		"   vol free  8388608 bytes (8.0 MiB)",
 	}

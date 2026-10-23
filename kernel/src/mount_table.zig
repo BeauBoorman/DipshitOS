@@ -39,6 +39,9 @@ pub const State = enum(u8) { not_mounted = 0, mounted = 1 };
 
 /// `DirEntry.reserved[2]` bits: the mounted volume refuses writes.
 pub const flag_read_only: u8 = 1;
+/// M188b (#3187): the volume is a sealed (v2) VLFS — mounted-unsealed or
+/// refused-locked; the row's state already says which (ADR 0061 D10).
+pub const flag_sealed: u8 = 2;
 
 /// One mount-table row. `usb_index` is the 1-based MBR partition index for
 /// `.fat32` rows and 0 elsewhere.
@@ -110,7 +113,11 @@ fn usbFatMounted(index: u8) bool {
 
 /// `DirEntry.reserved[2]` flags for the row.
 pub fn flags(row: Row) u8 {
-    return if (row.read_only) flag_read_only else 0;
+    var f: u8 = if (row.read_only) flag_read_only else 0;
+    // M188b (#3187): a sealed v2 volume is flagged whether it mounted
+    // (unsealed) or refused at the prompt (locked) — the face names both.
+    if (row.kind == .vlfs and vlfs_disk.sealState() != .none) f |= flag_sealed;
+    return f;
 }
 
 /// A directory-rooted row can be descended into when mounted; the `.block`

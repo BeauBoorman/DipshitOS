@@ -30,6 +30,11 @@ const (
 // refuses writes.
 const MountFlagReadOnly uint8 = 1
 
+// MountFlagSealed is the DirEntry.Reserved[2] bit (M188b #3187) naming a
+// sealed v2 VLFS — mounted-unsealed or refused-locked; the row's state
+// says which.
+const MountFlagSealed uint8 = 2
+
 // Mount is one kernel mount-table row decoded from the "/" listing.
 type Mount struct {
 	Name     string
@@ -37,6 +42,7 @@ type Mount struct {
 	State    uint8
 	Kind     uint8
 	ReadOnly bool
+	Sealed   bool // M188b: a sealed v2 VLFS (ADR 0061), mounted or locked
 }
 
 // ErrNotMounted is the named refusal for a path resolved onto an absent
@@ -105,6 +111,7 @@ func MountFromEntry(e DirEntry) Mount {
 		State:    e.Reserved[0],
 		Kind:     e.Reserved[1],
 		ReadOnly: e.Reserved[2]&MountFlagReadOnly != 0,
+		Sealed:   e.Reserved[2]&MountFlagSealed != 0,
 	}
 }
 

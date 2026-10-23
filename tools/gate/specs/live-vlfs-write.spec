@@ -19,6 +19,14 @@
 # it does NOT prove: crash-ordered replay (M100e's kill gate owns that).
 
 vgate_name live-vlfs-write "M100d (#2309) class-B: journaled write->flush->readback->remount on VZ"
+# M188b (#3187): the armed share exists for leg D's `exec GOSH.ELF`
+# principals — exec loads the program off the host file channel, which a
+# share-less boot does not have. Legs A–C's device shape is unchanged
+# (the empty armed share mounts /host but nothing on it runs).
+vgate_share arm
+# The custom-virtio share channel needs the SPIKE runner build — the same
+# declaration every share-arming spec makes (go-fileman, go-agentd).
+vgate_runner_flags -Xswiftc -DSPIKE
 
 vgate_setup_python <<'PY'
 import os
@@ -52,6 +60,25 @@ for line in Path("kernel/src/vlfs/testdata/corrupt-inode-checksum.regions").read
 assert img is not None and len(img) == 16 * 1024 * 1024
 Path(os.environ["RUN_DIR"], "corrupt.img").write_bytes(bytes(img))
 print("corrupt.img rebuilt from the inode-checksum fixture")
+
+# M188b (#3187): leg D's principals are real processes — `exec -u<uid>`
+# spawns GOSH.ELF off the armed share (same copy shape as go-fileman's
+# GOFILES.ELF); a missing build is named here, not at a refused launch.
+import shutil, sys
+share = os.environ.get("VG_SHARE") or os.path.join(os.environ["RUN_DIR"], "share")
+os.makedirs(share, exist_ok=True)
+gosh = os.path.join(".build", "go", "GOSH.ELF")
+if not os.path.exists(gosh):
+    sys.exit("GOSH.ELF missing (expected " + gosh + ") - build it first: "
+             "bash tools/go/build-gosh.sh")
+shutil.copy(gosh, os.path.join(share, "GOSH.ELF"))
+# GOFILES.ELF's `vol` face prints the mount rows on serial — the leg's
+# bounded volume-face check.
+files = os.path.join(".build", "go", "GOFILES.ELF")
+if not os.path.exists(files):
+    sys.exit("GOFILES.ELF missing (expected " + files + ") - build it first: "
+             "bash tools/go/build-files.sh")
+shutil.copy(files, os.path.join(share, "GOFILES.ELF"))
 PY
 
 vgate_file script-A.txt <<'EOF'
@@ -179,3 +206,34 @@ vgate_assert C serial-absent 'vlfs: mounted /disk'
 vgate_assert C serial-contains 'vf ls: disk:/: not_mounted'
 vgate_assert C serial-contains 'vf cat: disk:GATE.TXT: not_mounted'
 vgate_assert C serial-absent '[EXC] parking:'
+
+# M188b (#3187): the cross-uid ownership leg — an agent-created file is
+# owner-claimed at create (uid 2000), uid_user's read refuses e_perm
+# (EACCES through the app, never silent), the owner proceeds, and an
+# unowned (uid-0-minted) file stays world-accessible.
+# exec-order: assert-proven -- each exec's turn is stage-gated on the
+# previous program's own marker; the run ends on the owner-read marker
+# only the program prints.
+vgate_file script-D.txt <<'EOS'
+write /disk/WORLD.TXT world-bytes
+exec -u2000 GOSH.ELF -c "echo agent-bytes > /disk/AGENT.TXT && echo owner-write-done"
+EOS
+vgate_file script-D2.txt <<'EOS'
+exec -u1000 GOSH.ELF -c "cat /disk/AGENT.TXT; echo x > /disk/AGENT.TXT; cat /disk/WORLD.TXT; echo user-attempts-done"
+EOS
+vgate_file script-D3.txt <<'EOS'
+exec -u2000 GOSH.ELF -c "cat /disk/AGENT.TXT; echo owner-read-done"
+exec -u0 GOFILES.ELF vol
+EOS
+vgate_run D -- --data-disk '$RUN_DIR/vlfs.img' --script '$RUN_DIR/script-D.txt' --script2 '$RUN_DIR/script-D2.txt' --script2-after 'owner-write-done' --script3 '$RUN_DIR/script-D3.txt' --script3-after 'user-attempts-done' --script-expect 'gofiles: vol create=' --timeout 90
+vgate_assert D output-contains 'data-disk: ENABLED'
+vgate_assert D serial-contains 'vlfs: mounted /disk'
+vgate_assert D serial-contains 'owner-write-done'
+vgate_assert D serial-contains 'gosh: cannot open /disk/AGENT.TXT: EACCES'
+vgate_assert D serial-contains 'world-bytes'
+vgate_assert D serial-contains 'agent-bytes'
+vgate_assert D serial-contains 'user-attempts-done'
+vgate_assert D serial-contains 'owner-read-done'
+vgate_assert D serial-contains 'gofiles: vol disk mounted vlfs rw'
+vgate_assert D serial-contains 'gofiles: vol create=mkfs.vlfs--seal unlock=boot-passphrase-prompt'
+vgate_assert D serial-absent '[EXC] parking:'

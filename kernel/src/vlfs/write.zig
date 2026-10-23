@@ -328,6 +328,7 @@ fn writeInodeRec(out: *[vlfs.inode_len]u8, rec: vlfs.Inode) void {
         wr32(out, vlfs.in_extents + i * 8 + 4, e.count);
     }
     wr32(out, vlfs.in_next_ext, rec.next_extent_block);
+    wr32(out, vlfs.in_owner, rec.owner); // ADR 0061 D13 (M188b #3187)
     wr32(out, vlfs.in_cksum, vlfs.fnv32(out[0..vlfs.in_cksum]));
 }
 
@@ -686,7 +687,17 @@ fn dirInsert(t: *Txn, src: vlfs.SectorSource, vol: *vlfs.Volume, dir: *vlfs.Inod
 /// Create a file or directory named `name` inside directory `parent_ino`.
 /// Returns the new inode number. One transaction: ibitmap bit, itable
 /// record, parent dirent (+ parent dir growth and bbitmap bits as needed).
+/// The un-owned entry point: mints an unowned (owner_uid 0) inode.
 pub fn create(src: vlfs.SectorSource, vol: *vlfs.Volume, parent_ino: u32, name: []const u8, kind: u8, now: u64, walk: *Block, compose: *Block) Error!u32 {
+    return createAs(src, vol, parent_ino, name, kind, 0, now, walk, compose);
+}
+
+/// M188b (#3187): the set-ownership seam ADR 0061 D13 reserved — the
+/// owner_uid is claimed AT create, never changed after (there is no
+/// chown: bounded on purpose). `owner` is the creator's uid, supplied by
+/// the caller that resolved the acting principal; 0 mints an unowned,
+/// world-accessible inode — the mkfs and kernel-actor default.
+pub fn createAs(src: vlfs.SectorSource, vol: *vlfs.Volume, parent_ino: u32, name: []const u8, kind: u8, owner: u32, now: u64, walk: *Block, compose: *Block) Error!u32 {
     if (!src.writable()) return error.ReadOnly;
     if (!validName(name)) return error.NameTooLong;
     var parent = try vlfs.readInode(src, vol.*, parent_ino, walk);
@@ -706,6 +717,7 @@ pub fn create(src: vlfs.SectorSource, vol: *vlfs.Volume, parent_ino: u32, name: 
         .ctime = now,
         .extents = @splat(.{ .first = 0, .count = 0 }),
         .next_extent_block = 0,
+        .owner = owner,
     };
     if (kind == vlfs.kind_dir) {
         // A directory is minted with one allocated, zeroed dirent block
@@ -727,9 +739,17 @@ pub fn create(src: vlfs.SectorSource, vol: *vlfs.Volume, parent_ino: u32, name: 
 /// a write that would need more than the 64-block payload span refuses
 /// `txn_too_large`, and past 4 GiB − 1 is `file_too_large`.
 pub fn writeFile(src: vlfs.SectorSource, vol: *vlfs.Volume, ino: u32, offset: u64, data: []const u8, now: u64, walk: *Block, compose: *Block) Error!usize {
+    return writeFileAs(src, vol, ino, 0, offset, data, now, walk, compose);
+}
+
+/// M188b (#3187): the owner-checked write — a nonzero owner_uid admits
+/// only the owner or uid_system, else the named not_owner refusal lands
+/// BEFORE the first payload is staged (the refused txn never exists).
+pub fn writeFileAs(src: vlfs.SectorSource, vol: *vlfs.Volume, ino: u32, caller_uid: u32, offset: u64, data: []const u8, now: u64, walk: *Block, compose: *Block) Error!usize {
     if (!src.writable()) return error.ReadOnly;
     var rec = try vlfs.readInode(src, vol.*, ino, walk);
     if (rec.kind != vlfs.kind_file) return error.IsDir;
+    if (!vlfs.ownerAllows(rec.owner, caller_uid)) return error.NotOwner;
     if (data.len == 0) return 0;
     const end = offset + data.len;
     if (end > std.math.maxInt(u32)) return error.FileTooLarge;
@@ -763,9 +783,16 @@ pub fn writeFile(src: vlfs.SectorSource, vol: *vlfs.Volume, ino: u32, offset: u6
 /// shrink can leave live bytes past the size field). A grow spanning more
 /// than the payload cap refuses `txn_too_large`.
 pub fn truncateFile(src: vlfs.SectorSource, vol: *vlfs.Volume, ino: u32, new_size: u32, now: u64, walk: *Block, compose: *Block) Error!void {
+    return truncateFileAs(src, vol, ino, 0, new_size, now, walk, compose);
+}
+
+/// M188b (#3187): the owner-checked truncate — same not_owner refusal
+/// placement as writeFileAs (a resize is a write).
+pub fn truncateFileAs(src: vlfs.SectorSource, vol: *vlfs.Volume, ino: u32, caller_uid: u32, new_size: u32, now: u64, walk: *Block, compose: *Block) Error!void {
     if (!src.writable()) return error.ReadOnly;
     var rec = try vlfs.readInode(src, vol.*, ino, walk);
     if (rec.kind != vlfs.kind_file) return error.IsDir;
+    if (!vlfs.ownerAllows(rec.owner, caller_uid)) return error.NotOwner;
     if (new_size == rec.size) return;
     var t = Txn.begin(src, vol, walk, compose);
     const need_blocks: u64 = (@as(u64, new_size) + vlfs.block_len - 1) / vlfs.block_len;
@@ -799,6 +826,14 @@ pub fn truncateFile(src: vlfs.SectorSource, vol: *vlfs.Volume, ino: u32, new_siz
 /// transaction. Returns the freed inode number (callers invalidate
 /// handles/pins that referenced it).
 pub fn removeAt(src: vlfs.SectorSource, vol: *vlfs.Volume, dir_ino: u32, name: []const u8, now: u64, walk: *Block, compose: *Block) Error!u32 {
+    return removeAtAs(src, vol, dir_ino, name, 0, now, walk, compose);
+}
+
+/// M188b (#3187): the owner-checked unlink — the victim inode's owner_uid
+/// gates the removal, not the parent directory's. A nonzero owner admits
+/// only the owner or uid_system; the named not_owner refusal lands before
+/// the first payload (the refused txn never exists).
+pub fn removeAtAs(src: vlfs.SectorSource, vol: *vlfs.Volume, dir_ino: u32, name: []const u8, caller_uid: u32, now: u64, walk: *Block, compose: *Block) Error!u32 {
     if (!src.writable()) return error.ReadOnly;
     var parent = try vlfs.readInode(src, vol.*, dir_ino, walk);
     if (parent.kind != vlfs.kind_dir) return error.NotDir;
@@ -806,6 +841,7 @@ pub fn removeAt(src: vlfs.SectorSource, vol: *vlfs.Volume, dir_ino: u32, name: [
     const abs = scan.hit orelse return error.NotFound;
     var rec = try vlfs.readInode(src, vol.*, scan.hit_inode, walk);
     if (rec.kind != scan.hit_kind) return error.BadDirent;
+    if (!vlfs.ownerAllows(rec.owner, caller_uid)) return error.NotOwner;
     if (rec.kind == vlfs.kind_dir) {
         const inner = try dirScan(null, src, vol, rec, "", walk);
         if (inner.live != 0) return error.NotEmpty;
@@ -903,18 +939,30 @@ fn splitPath(path: []const u8) ?struct { parent: []const u8, leaf: []const u8 } 
 /// Create a file at `path` (all but the last component must resolve to
 /// directories). Returns the new inode.
 pub fn createPath(src: vlfs.SectorSource, vol: *vlfs.Volume, path: []const u8, kind: u8, now: u64, walk: *Block, compose: *Block) Error!u32 {
+    return createPathAs(src, vol, path, kind, 0, now, walk, compose);
+}
+
+/// M188b (#3187): create at `path` minting the inode's owner_uid — the
+/// claim is the create itself, the only set-ownership verb (see createAs).
+pub fn createPathAs(src: vlfs.SectorSource, vol: *vlfs.Volume, path: []const u8, kind: u8, owner: u32, now: u64, walk: *Block, compose: *Block) Error!u32 {
     const parts = splitPath(path) orelse return error.Exists; // root exists
     const parent = try vlfs.lookup(src, vol.*, parts.parent, walk);
     if (parent.kind != vlfs.kind_dir) return error.NotDir;
-    return create(src, vol, parent.inode, parts.leaf, kind, now, walk, compose);
+    return createAs(src, vol, parent.inode, parts.leaf, kind, owner, now, walk, compose);
 }
 
 /// Remove `path` (file or empty directory).
 pub fn removePath(src: vlfs.SectorSource, vol: *vlfs.Volume, path: []const u8, now: u64, walk: *Block, compose: *Block) Error!u32 {
+    return removePathAs(src, vol, path, 0, now, walk, compose);
+}
+
+/// M188b (#3187): remove `path` as `caller_uid` — the victim's owner_uid
+/// gates the unlink inside removeAtAs.
+pub fn removePathAs(src: vlfs.SectorSource, vol: *vlfs.Volume, path: []const u8, caller_uid: u32, now: u64, walk: *Block, compose: *Block) Error!u32 {
     const parts = splitPath(path) orelse return error.IsDir; // the root is not a name
     const parent = try vlfs.lookup(src, vol.*, parts.parent, walk);
     if (parent.kind != vlfs.kind_dir) return error.NotDir;
-    return removeAt(src, vol, parent.inode, parts.leaf, now, walk, compose);
+    return removeAtAs(src, vol, parent.inode, parts.leaf, caller_uid, now, walk, compose);
 }
 
 /// Rename `old` to `new`. Both may name different directories; moving a
@@ -1464,4 +1512,59 @@ test "vlfs write: identical operation sequences produce identical images" {
     // Byte-identical images — journal tail included — is the determinism
     // receipt the issue asks for.
     try std.testing.expectEqualSlices(u8, &img_a, &img_b);
+}
+
+// --- M188b (#3187): owner_uid enforcement ------------------------------------
+
+test "vlfs write: owner_uid — cross-uid refusals, owner proceeds, uid 0 stays world" {
+    try buildImage(empty_regions, &img_a);
+    var disk = RecDisk{ .img = &img_a, .record = false };
+    const src = disk.source();
+    var vol = try vlfs.mount(src, &t_walk);
+
+    const uid_agent: u32 = 2000;
+    const uid_user: u32 = 1000;
+
+    // The create claims the owner (the only set-ownership verb): an inode
+    // minted for uid_agent carries owner_uid 2000 in its record and stat.
+    const agent_file = try createAs(src, &vol, vlfs.root_inode, "AGENT.TXT", vlfs.kind_file, uid_agent, test_now, &t_walk, &t_compose);
+    const rec = try vlfs.readInode(src, vol, agent_file, &t_walk);
+    try std.testing.expectEqual(uid_agent, rec.owner);
+    const st = try vlfs.stat(src, vol, agent_file, &t_walk);
+    try std.testing.expectEqual(uid_agent, st.owner);
+    _ = try writeFileAs(src, &vol, agent_file, uid_agent, 0, "agent-only", test_now, &t_walk, &t_compose);
+
+    // Cross-uid read/write/truncate/unlink all refuse not_owner.
+    var buf: [32]u8 = undefined;
+    try std.testing.expectError(error.NotOwner, vlfs.readAs(src, vol, agent_file, uid_user, 0, &buf, &t_walk));
+    try std.testing.expectError(error.NotOwner, writeFileAs(src, &vol, agent_file, uid_user, 0, "x", test_now, &t_walk, &t_compose));
+    try std.testing.expectError(error.NotOwner, truncateFileAs(src, &vol, agent_file, uid_user, 2, test_now, &t_walk, &t_compose));
+    try std.testing.expectError(error.NotOwner, removeAtAs(src, &vol, vlfs.root_inode, "AGENT.TXT", uid_user, test_now, &t_walk, &t_compose));
+
+    // The owner proceeds on every path; uid_system (0) proceeds too.
+    try std.testing.expectEqual(@as(usize, 10), try vlfs.readAs(src, vol, agent_file, uid_agent, 0, &buf, &t_walk));
+    try std.testing.expectEqualSlices(u8, "agent-only", buf[0..10]);
+    try std.testing.expectEqual(@as(usize, 10), try vlfs.readAs(src, vol, agent_file, 0, 0, &buf, &t_walk));
+    _ = try writeFileAs(src, &vol, agent_file, 0, 0, "sys", test_now, &t_walk, &t_compose);
+    try truncateFileAs(src, &vol, agent_file, 0, 3, test_now, &t_walk, &t_compose);
+
+    // An unowned file (owner_uid 0 — the mkfs/system default) is
+    // world-accessible to every uid on every path.
+    const world = try createAs(src, &vol, vlfs.root_inode, "WORLD.TXT", vlfs.kind_file, 0, test_now, &t_walk, &t_compose);
+    _ = try writeFileAs(src, &vol, world, uid_user, 0, "everyone", test_now, &t_walk, &t_compose);
+    _ = try writeFileAs(src, &vol, world, uid_agent, 8, "+agent", test_now, &t_walk, &t_compose);
+    var wbuf: [64]u8 = undefined;
+    const n = try vlfs.readAs(src, vol, world, uid_user, 0, &wbuf, &t_walk);
+    try std.testing.expectEqualSlices(u8, "everyone+agent", wbuf[0..n]);
+
+    // A third, unrelated uid is refused the same named way; a uid_user
+    // file refuses uid_agent symmetrically.
+    const user_file = try createAs(src, &vol, vlfs.root_inode, "USER.TXT", vlfs.kind_file, uid_user, test_now, &t_walk, &t_compose);
+    _ = try writeFileAs(src, &vol, user_file, uid_user, 0, "mine", test_now, &t_walk, &t_compose);
+    try std.testing.expectError(error.NotOwner, vlfs.readAs(src, vol, user_file, uid_agent, 0, &buf, &t_walk));
+    try std.testing.expectError(error.NotOwner, vlfs.readAs(src, vol, user_file, 4242, 0, &buf, &t_walk));
+
+    // Owner unlink proceeds; the name is gone.
+    _ = try removeAtAs(src, &vol, vlfs.root_inode, "AGENT.TXT", uid_agent, test_now, &t_walk, &t_compose);
+    try std.testing.expectError(error.NotFound, vlfs.lookup(src, vol, "AGENT.TXT", &t_walk));
 }
