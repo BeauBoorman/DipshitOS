@@ -21,6 +21,9 @@ public final class HostSettingsView: NSView {
     private let cpusField = NSTextField()
     private let memoryField = NSTextField()
     private let baseImageField = NSTextField()
+    /// M183c (#3173): the host-preference minutes field — one of the
+    /// `.live` host rows below the Config grid.
+    private let idleMinutesField = NSTextField()
     /// key → (control, marker label) so tests and reload() index the
     /// rows without walking the grid.
     private var toggles: [String: NSButton] = [:]
@@ -50,7 +53,7 @@ public final class HostSettingsView: NSView {
         addSubview(grid)
 
         var gridRows: [[NSView]] = []
-        for row in HostSettingsModel.rows {
+        for row in HostSettingsModel.rows + HostSettingsModel.hostRows {
             let label = NSTextField(labelWithString: row.title)
             label.alignment = .right
             let marker = NSTextField(labelWithString: Self.effectMarkerText(row.effect))
@@ -74,6 +77,11 @@ public final class HostSettingsView: NSView {
                 baseImageField.target = self
                 baseImageField.action = #selector(fieldCommitted(_:))
                 control = baseImageField
+            case "idlePauseMinutes":
+                idleMinutesField.placeholderString = "min"
+                idleMinutesField.target = self
+                idleMinutesField.action = #selector(fieldCommitted(_:))
+                control = idleMinutesField
             default:
                 let toggle = NSButton(checkboxWithTitle: "", target: self,
                                     action: #selector(toggleCommitted(_:)))
@@ -93,7 +101,7 @@ public final class HostSettingsView: NSView {
 
         noteLabel.font = .systemFont(ofSize: 10)
         noteLabel.textColor = .secondaryLabelColor
-        noteLabel.stringValue = "Changes are written to the profile bundle and take effect on the next boot."
+        noteLabel.stringValue = "Changes are written to the profile bundle and take effect on the next boot. Rows marked live are host preferences — they apply immediately and are never written to the bundle."
         noteLabel.translatesAutoresizingMaskIntoConstraints = false
         addSubview(noteLabel)
 
@@ -189,11 +197,15 @@ public final class HostSettingsView: NSView {
         for (key, button) in toggles {
             setDevice(key, button.state == .on)
         }
+        // M183c: the host-preference rows write through on commit —
+        // `live` means the store takes the value now, not at save.
+        model.idlePauseMinutesText = idleMinutesField.stringValue
         reload()
     }
 
     private func setDevice(_ key: String, _ on: Bool) {
         switch key {
+        case "idlePause": model.idlePauseEnabled = on
         case "display": model.devices.display = on
         case "input": model.devices.input = on
         case "sound": model.devices.sound = on
@@ -218,10 +230,12 @@ public final class HostSettingsView: NSView {
         cpusField.stringValue = model.cpusText
         memoryField.stringValue = model.memoryText
         baseImageField.stringValue = model.baseImageText
+        idleMinutesField.stringValue = model.idlePauseMinutesText
         for (key, button) in toggles {
             button.state = deviceValue(key) ? .on : .off
         }
         var problems = model.errors
+        if let idleError = model.idlePauseMinutesError { problems.append(idleError) }
         if let loadError = model.loadError { problems.append(loadError) }
         if let lastSaveError = model.lastSaveError { problems.append(lastSaveError) }
         errorLabel.stringValue = problems.joined(separator: "\n")
@@ -230,6 +244,7 @@ public final class HostSettingsView: NSView {
     }
 
     private func deviceValue(_ key: String) -> Bool {
+        if key == "idlePause" { return model.idlePauseEnabled }
         let d = model.devices
         switch key {
         case "display": return d.display

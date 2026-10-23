@@ -512,4 +512,207 @@ final class HostMachineTests: XCTestCase {
         XCTAssertTrue(HostMachineModel.closeSavedMessage.contains("--resume"))
         XCTAssertTrue(HostMachineModel.closeSavedMessage.contains("Code=12"))
     }
+
+    // MARK: - M183c (#3173): the idle-pause policy.
+
+    /// A policy-armed model: running VM, stub pause/resume drivers, the
+    /// prefs seams and a pinned clock — every edge a test needs is a
+    /// call away, and no real window/timer ever runs.
+    private final class IdleRig {
+        let model = HostMachineModel()
+        var pauses = 0
+        var resumes = 0
+        var verdict: String? = nil   // driver's refusal code, nil = accept
+        var now = Date(timeIntervalSince1970: 1_000_000)
+        var enabled = true
+        var seconds: TimeInterval = 300
+        var running = true
+        var audio = false
+        var capture = false
+        var lines: [String] = []
+
+        init() {
+            model.emit = { [weak self] in self?.lines.append($0) }
+            model.now = { [weak self] in self?.now ?? .distantPast }
+            model.idlePauseEnabled = { [weak self] in self?.enabled ?? true }
+            model.idlePauseSeconds = { [weak self] in self?.seconds ?? 300 }
+            model.vmRunning = { [weak self] in self?.running ?? true }
+            model.audioActive = { [weak self] in self?.audio ?? false }
+            model.captureActive = { [weak self] in self?.capture ?? false }
+            model.pauseDriver = { [weak self] in self?.pauses += 1; return self?.verdict ?? nil }
+            model.resumeDriver = { [weak self] in self?.resumes += 1; return self?.verdict ?? nil }
+        }
+    }
+
+    /// Occluded ≥ interval → the pause driver runs and the machine reads
+    /// paused; a visible edge resumes it. The marker lines name both.
+    func testIdlePauseOccludedPausesAndFocusResumes() {
+        let rig = IdleRig()
+        let model = rig.model
+        let window = NSObject()
+        XCTAssertFalse(model.allWindowsOccluded)
+        model.noteWindowOcclusion(window, occluded: true)
+        XCTAssertTrue(model.allWindowsOccluded)
+        // Inside the grace stretch — waiting, not held.
+        rig.now = rig.now.addingTimeInterval(rig.seconds - 1)
+        XCTAssertFalse(model.idlePauseEvaluate())
+        XCTAssertEqual(rig.pauses, 0)
+        // The interval elapsed → the real driver runs.
+        rig.now = rig.now.addingTimeInterval(2)
+        XCTAssertTrue(model.idlePauseEvaluate())
+        XCTAssertEqual(rig.pauses, 1)
+        XCTAssertTrue(model.idlePaused)
+        XCTAssertEqual(rig.lines.last?.hasPrefix("host-machine: idle-pause paused occluded="), true)
+        // Further ticks do not re-pause.
+        XCTAssertFalse(model.idlePauseEvaluate())
+        XCTAssertEqual(rig.pauses, 1)
+        // The focus edge (a window going visible) resumes it.
+        model.noteWindowOcclusion(window, occluded: false)
+        XCTAssertEqual(rig.resumes, 1)
+        XCTAssertFalse(model.idlePaused)
+        XCTAssertEqual(rig.lines.last, "host-machine: idle-pause resumed")
+    }
+
+    /// The vets named in the card: a sounding guest and a live capture
+    /// each hold the pause; the held reason is emitted once per cause.
+    func testIdlePauseNeverWhileAudioOrCaptureLive() {
+        let rig = IdleRig()
+        let model = rig.model
+        model.noteWindowOcclusion(NSObject(), occluded: true)
+        rig.now = rig.now.addingTimeInterval(rig.seconds + 1)
+        rig.audio = true
+        XCTAssertFalse(model.idlePauseEvaluate())
+        XCTAssertEqual(rig.pauses, 0)
+        XCTAssertEqual(rig.lines.last, "host-machine: idle-pause held reason=audio")
+        // Same reason does not repeat on the next tick.
+        XCTAssertFalse(model.idlePauseEvaluate())
+        XCTAssertEqual(rig.lines.filter { $0.contains("reason=audio") }.count, 1)
+        rig.audio = false
+        rig.capture = true
+        XCTAssertFalse(model.idlePauseEvaluate())
+        XCTAssertEqual(rig.pauses, 0)
+        XCTAssertEqual(rig.lines.last, "host-machine: idle-pause held reason=capture")
+        rig.capture = false
+        XCTAssertTrue(model.idlePauseEvaluate())
+        XCTAssertTrue(model.idlePaused)
+    }
+
+    /// Toggle off → never fires; and toggling the policy off while a
+    /// pause is held releases it (off is never a trap).
+    func testIdlePauseToggleOffNeverPauses() {
+        let rig = IdleRig()
+        rig.enabled = false
+        let model = rig.model
+        model.noteWindowOcclusion(NSObject(), occluded: true)
+        rig.now = rig.now.addingTimeInterval(rig.seconds + 1)
+        XCTAssertFalse(model.idlePauseEvaluate())
+        XCTAssertEqual(rig.pauses, 0)
+        XCTAssertEqual(rig.lines.last, "host-machine: idle-pause held reason=off")
+        XCTAssertEqual(model.idleDetail, "idle=off after=300s held=off")
+    }
+
+    /// No windows at all is not "all occluded" — a windowless scripted
+    /// run can never idle-pause, and a stopped machine never freezes.
+    func testIdlePauseNeedsAWindowAndARunningVM() {
+        let rig = IdleRig()
+        let model = rig.model
+        XCTAssertFalse(model.allWindowsOccluded)
+        XCTAssertFalse(model.idlePauseEvaluate())
+        XCTAssertTrue(rig.lines.isEmpty) // nothing to hold — no windows
+        rig.running = false
+        model.noteWindowOcclusion(NSObject(), occluded: true)
+        rig.now = rig.now.addingTimeInterval(rig.seconds + 1)
+        XCTAssertFalse(model.idlePauseEvaluate())
+        XCTAssertEqual(rig.pauses, 0)
+        XCTAssertEqual(rig.lines.last, "host-machine: idle-pause held reason=stopped")
+    }
+
+    /// A refused pause names the code once; a refused resume keeps the
+    /// hold so the next activity edge retries.
+    func testIdlePauseRefusalsAreNamed() {
+        let rig = IdleRig()
+        let model = rig.model
+        rig.verdict = "busy"
+        model.noteWindowOcclusion(NSObject(), occluded: true)
+        rig.now = rig.now.addingTimeInterval(rig.seconds + 1)
+        XCTAssertFalse(model.idlePauseEvaluate())
+        XCTAssertFalse(model.idlePaused)
+        XCTAssertEqual(rig.lines.last, "host-machine: idle-pause refused code=busy")
+        // Now the pause lands but the resume is refused — the hold stays.
+        rig.verdict = nil
+        XCTAssertTrue(model.idlePauseEvaluate())
+        rig.verdict = "resume_failed"
+        model.noteActivity()
+        XCTAssertTrue(model.idlePaused)
+        XCTAssertEqual(rig.lines.last, "host-machine: idle-pause resume refused code=resume_failed")
+        rig.verdict = nil
+        model.noteActivity()
+        XCTAssertFalse(model.idlePaused)
+    }
+
+    /// Suspend lifts a policy-held pause first — the save path's own
+    /// pause step expects a running machine.
+    func testSuspendReleasesAnIdlePause() throws {
+        let rig = IdleRig()
+        let model = rig.model
+        let profile = try mintProfile(in: tempDir())
+        model.profileURL = profile.url
+        model.saveCapable = { true }
+        var suspended = 0
+        model.suspendDriver = { suspended += 1; return nil }
+        model.noteWindowOcclusion(NSObject(), occluded: true)
+        rig.now = rig.now.addingTimeInterval(rig.seconds + 1)
+        XCTAssertTrue(model.idlePauseEvaluate())
+        XCTAssertTrue(model.idlePaused)
+        XCTAssertEqual(model.suspend(), .performed)
+        XCTAssertEqual(rig.resumes, 1)
+        XCTAssertEqual(suspended, 1)
+        XCTAssertFalse(model.idlePaused)
+    }
+
+    /// The bus verbs: `idle-pause` toggles the settings model's host
+    /// preference (receipt names it), `idle-occlude` rides the real
+    /// policy path with its staged `@seconds` operand, and `idle-focus`
+    /// is enabled exactly while a pause is held.
+    func testIdlePauseVerbsOnTheBus() {
+        let sink = Sink()
+        let bus = makeBus(sink)
+        let model = bus.machine
+        // The toggle reads the settings model's persisted pref — stub the
+        // store so tests never touch real defaults.
+        var prefs: [String: Any] = [:]
+        bus.settings.prefStore = (get: { prefs[$0] }, set: { prefs[$0] = $1 })
+        XCTAssertEqual(bus.dispatch(.idlePause), .performed)
+        XCTAssertEqual(sink.lines.last,
+                       "host-ui: cmd=idle-pause state=performed idle=off after=300s")
+        XCTAssertFalse(bus.settings.idlePauseEnabled)
+        XCTAssertEqual(bus.dispatch(.idlePause), .performed)
+        XCTAssertTrue(bus.settings.idlePauseEnabled)
+        XCTAssertEqual(sink.lines.last,
+                       "host-ui: cmd=idle-pause state=performed idle=armed after=300s")
+        // idle-focus with nothing held receipts disabled — the menu's
+        // "Paused (idle) — Resume Now" leaf greys the same way.
+        XCTAssertEqual(bus.dispatch(.idleFocus), .disabled)
+        // The scripted edge: @600 stages elapsed past the default 300 s
+        // interval, so the occlude dispatch itself pauses.
+        var pauses = 0
+        var resumes = 0
+        model.vmRunning = { true }
+        model.pauseDriver = { pauses += 1; return nil }
+        model.resumeDriver = { resumes += 1; return nil }
+        model.idleOccludeElapsed = 600
+        XCTAssertEqual(bus.dispatch(.idleOcclude), .performed)
+        XCTAssertEqual(pauses, 1)
+        XCTAssertTrue(model.idlePaused)
+        XCTAssertEqual(sink.lines.last,
+                       "host-ui: cmd=idle-occlude state=performed idle=paused after=300s")
+        XCTAssertTrue(sink.lines.contains(
+            "host-machine: idle-pause paused occluded=600s"))
+        XCTAssertEqual(bus.dispatch(.idleFocus), .performed)
+        XCTAssertEqual(resumes, 1)
+        XCTAssertFalse(model.idlePaused)
+        XCTAssertTrue(sink.lines.contains("host-machine: idle-pause resumed"))
+        XCTAssertEqual(sink.lines.last,
+                       "host-ui: cmd=idle-focus state=performed idle=armed after=300s")
+    }
 }

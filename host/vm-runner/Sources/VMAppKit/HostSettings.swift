@@ -107,6 +107,76 @@ public final class HostSettingsModel {
 
     public init() {}
 
+    // MARK: M183c (#3173) — host preferences (process-local, live)
+
+    /// The host-preference rows — the panel's second section, rendered
+    /// below the Config rows with the `.live` marker: these write the
+    /// host store at commit time and never ride `save()` into the
+    /// profile (the guest settings table is full — M183a — and a host
+    /// pref is not a guest-visible config anyway).
+    public static let hostRows: [SettingRow] = [
+        SettingRow(key: "idlePause", title: "Pause VM when hidden", effect: .live),
+        SettingRow(key: "idlePauseMinutes", title: "Hidden pause after (min)", effect: .live),
+    ]
+
+    /// The store's get/set — UserDefaults in production, an in-memory
+    /// stub in tests (the model never touches real defaults under
+    /// `swift test`).
+    public var prefStore: (get: (String) -> Any?, set: (String, Any?) -> Void) = (
+        get: { UserDefaults.standard.object(forKey: $0) },
+        set: { UserDefaults.standard.set($1, forKey: $0) }
+    )
+
+    public static let idlePauseEnabledKey = "idlePause.enabled"
+    public static let idlePauseMinutesKey = "idlePause.minutes"
+    /// The card's "say 5" default.
+    public static let defaultIdlePauseMinutes = 5
+    /// The accepted minutes range — a clamp the panel field shares.
+    public static let idlePauseMinutesRange = 1...120
+
+    /// The idle-pause policy toggle — persisted host-side, read live by
+    /// the machine model's `idlePauseEnabled` seam. Default ON.
+    public var idlePauseEnabled: Bool {
+        get { (prefStore.get(Self.idlePauseEnabledKey) as? Bool) ?? true }
+        set { prefStore.set(Self.idlePauseEnabledKey, newValue); changed() }
+    }
+
+    /// The occluded stretch before the pause fires, in minutes.
+    public var idlePauseMinutes: Int {
+        get {
+            (prefStore.get(Self.idlePauseMinutesKey) as? Int)
+                ?? Self.defaultIdlePauseMinutes
+        }
+        set { prefStore.set(Self.idlePauseMinutesKey, newValue); changed() }
+    }
+
+    /// The minutes field's draft — a text field like cpusText, so an
+    /// unparseable entry is representable and refusable instead of
+    /// clamped by a formatter. A valid commit writes through to the
+    /// store immediately (the row is `.live`).
+    public var idlePauseMinutesText: String = String(HostSettingsModel.defaultIdlePauseMinutes) {
+        didSet {
+            let t = idlePauseMinutesText.trimmingCharacters(in: .whitespaces)
+            if let m = Int(t), Self.idlePauseMinutesRange.contains(m) {
+                idlePauseMinutes = m
+                idlePauseMinutesError = nil
+            } else {
+                idlePauseMinutesError =
+                    "hidden pause minutes must be \(Self.idlePauseMinutesRange.lowerBound)–\(Self.idlePauseMinutesRange.upperBound)"
+            }
+            changed()
+        }
+    }
+    /// Why the minutes draft is refused, if it is — the panel's error
+    /// line carries it.
+    public private(set) var idlePauseMinutesError: String?
+
+    /// Sync the minutes draft to the stored value — the panel's revert/
+    /// reload edge for the host rows.
+    public func reloadHostPrefs() {
+        idlePauseMinutesText = String(idlePauseMinutes)
+    }
+
     // MARK: Arming — argv resolution and posture.
 
     /// The bundle path from argv: `--profile <path>`, else `--resume

@@ -774,6 +774,26 @@ else:
     sys.exit("no host-ui: close vm=2 verdict line in the out file")
 PY
 
+# Run 13 is M183c's (#3173): the idle-pause policy. A gate cannot produce
+# a real NSWindow occlusion change (index thesis 1), so `idle-occlude`
+# and `idle-focus` are the scripted twins of the occlusion and focus
+# edges — the close@vm= precedent — driving the identical policy path the
+# window delegates ride. `idle-occlude@600` stages a stretch already past
+# the default 300 s interval, so the dispatch itself runs the real
+# vm.pause on the live VM; `idle-focus` on the same marker runs the real
+# vm.resume (a paused guest can print no marker — the focus trigger must
+# ride a pre-pause marker, in dispatch order after the occlude).
+vgate_run 13 -- --script '$RUN_DIR/script.txt' \
+    --host-cmd-after 'virelai> :idle-occlude@600' \
+    --host-cmd-after 'virelai> :idle-focus' \
+    --script-expect 'host-ui-idle' --timeout 120
+
+vgate_assert 13 output-contains 'host-machine: idle-pause armed interval=300s'
+vgate_assert 13 output-contains 'host-ui: cmd=idle-occlude vm=1 state=performed idle=paused'
+vgate_assert 13 output-contains 'host-machine: idle-pause paused occluded=600s'
+vgate_assert 13 output-contains 'host-ui: cmd=idle-focus vm=1 state=performed'
+vgate_assert 13 output-contains 'host-machine: idle-pause resumed'
+
 # Run 12 is M157e's (#2938): the whole M157 arc in one journey, under
 # the spec's inherited K=3. On vm 1's first prompt two triggers fire in
 # order — `new-window@tr2` boots the sibling, and `send-serial` writes

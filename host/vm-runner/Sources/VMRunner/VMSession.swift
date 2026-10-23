@@ -1,4 +1,5 @@
 import AppKit
+import CoreAudio
 import Foundation
 import VSCtl
 import VMAppKit
@@ -134,7 +135,7 @@ final class VMSession {
         case .starting: return "starting"
         case .running: return "running"
         case .pausing: return "pausing"
-        case .paused: return "paused"
+        case .paused: return commandBus.machine.idlePaused ? "paused (idle)" : "paused"
         case .resuming: return "resuming"
         case .saving: return "saving"
         case .restoring: return "restoring"
@@ -155,6 +156,20 @@ final class SessionWindowDelegate: NSObject, NSWindowDelegate {
         // stop — closeAction=suspend runs the save path first.
         if let s = session { VMSessionRegistry.shared.requestClose(s, reason: "window-close") }
         return false // the stopping state stays visible until VZ completes
+    }
+
+    /// M183c (#3173): the occlusion edge, per sibling window — the
+    /// secondary's machine model sees the identical report the primary's
+    /// HostApplication delegate sends.
+    func windowDidChangeOcclusionState(_ notification: Notification) {
+        guard let s = session, let w = s.window else { return }
+        s.commandBus.machine.noteWindowOcclusion(
+            w, occluded: !w.occlusionState.contains(.visible))
+    }
+
+    /// M183c: refocus is the resume edge.
+    func windowDidBecomeKey(_ notification: Notification) {
+        session?.commandBus.machine.noteActivity()
     }
 }
 
@@ -245,7 +260,66 @@ final class VMSessionRegistry {
         installNewWindowVerb(on: commandBus, session: s)
         installCloseVerb(on: commandBus, session: s)
         commandBus.emit("host-ui: window vm=\(s.id) title=\(Self.windowTitle(profile: profile, sessionID: s.id))")
+        Self.wireIdlePause(on: commandBus, runner: runner)
         return s
+    }
+
+    /// M183c (#3173): the idle-pause driver pair + the audio vet — the
+    /// same wiring for the adopted primary (scripted AND session runs,
+    /// so `--host-cmd-after` dispatches the identical seam) and every
+    /// new-window secondary via installSessionBus. The drivers hop onto
+    /// the VM's own queue and wait — SuspendCtl.begin's serialization
+    /// run from the caller's queue. Pause is the cheap transition: no
+    /// state save, and save-incapable device sets still qualify.
+    static func wireIdlePause(on bus: HostCommandBus, runner: Runner) {
+        bus.machine.pauseDriver = { [weak runner] in
+            guard let runner else { return "no_state" }
+            let done = DispatchSemaphore(value: 0)
+            var code: String? = "pause_failed"
+            runner.queue.async {
+                let vm = runner.vm
+                // Already paused (a snapshot's reply window, anything
+                // else) is NOT this policy's pause — refuse rather than
+                // claim it.
+                guard vm.state == .running else { code = "busy"; done.signal(); return }
+                vm.pause { result in
+                    code = nil
+                    if case .failure(let error) = result {
+                        FileHandle.standardError.write(Data("ERROR: idle-pause refused: \(error as NSError)\n".utf8))
+                        code = "pause_failed"
+                    }
+                    done.signal()
+                }
+            }
+            done.wait()
+            return code
+        }
+        bus.machine.resumeDriver = { [weak runner] in
+            guard let runner else { return "no_state" }
+            let done = DispatchSemaphore(value: 0)
+            var code: String? = "resume_failed"
+            runner.queue.async {
+                let vm = runner.vm
+                // Already running is the goal state — accept.
+                guard vm.state == .paused else {
+                    code = vm.state == .running ? nil : "resume_failed"
+                    done.signal()
+                    return
+                }
+                vm.resume { result in
+                    code = nil
+                    if case .failure(let error) = result {
+                        FileHandle.standardError.write(Data("ERROR: idle-pause resume refused: \(error as NSError)\n".utf8))
+                        code = "resume_failed"
+                    }
+                    done.signal()
+                }
+            }
+            done.wait()
+            return code
+        }
+        bus.machine.audioActive = { processAudioPlaying() }
+        bus.machine.armIdlePause()
     }
 
     /// Sessions that own a bus other than their own (only the primary).
@@ -408,6 +482,10 @@ final class VMSessionRegistry {
     /// VZErrorDomain Code=12 (M119e's named bound).
     func requestClose(_ s: VMSession, reason: String) {
         guard !s.stopped, !s.stopping else { return }
+        // M183c (#3173): a policy-held pause lifts before the close
+        // policy runs — the suspend leg's pause step and the stop
+        // teardown both expect a running machine.
+        bus(for: s).machine.releaseIdlePause()
         if let app = s.hostApp {
             // The session-mode primary: the policy + named message live
             // in HostApplication (its suspend driver is the Machine
@@ -673,6 +751,7 @@ final class VMSessionRegistry {
             ctl.resumeAfterReply()
             return verdict.accepted ? nil : verdict.code
         }
+        Self.wireIdlePause(on: bus, runner: runner)
         bus.register(.stop, HostCommandBus.Registration(
             isEnabled: { [weak s] in s.map { !$0.stopped } ?? false }
         ) { [weak self, weak s] in
@@ -946,6 +1025,7 @@ final class VMSessionRegistry {
     /// card.
     func requestStop(_ s: VMSession, reason: String) {
         guard !s.stopped, !s.stopping else { return }
+        bus(for: s).machine.releaseIdlePause() // M183c: resume before teardown
         s.stopping = true
         print("vm=\(s.id): stopping reason=\(reason)")
         guard let runner = s.runner else {
@@ -1054,6 +1134,33 @@ extension VMSession {
     }
 }
 
+// MARK: - M183c (#3173) — the idle-pause audio vet
+
+/// The "audio is playing" check the policy requires: CoreAudio reports
+/// this process running output IO (the virtio-snd host sink renders
+/// in-process, so a sounding guest marks the process; a configured-but-
+/// quiet sound device does not). Any probe error reads as quiet — the
+/// vet must never block the pause on a failed query.
+func processAudioPlaying() -> Bool {
+    var pid = getpid()
+    var addr = AudioObjectPropertyAddress(
+        mSelector: kAudioHardwarePropertyTranslatePIDToProcessObject,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain)
+    var object = AudioObjectID(0)
+    var size = UInt32(MemoryLayout<AudioObjectID>.size)
+    guard AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject), &addr,
+            UInt32(MemoryLayout<pid_t>.size), &pid,
+            &size, &object) == noErr, object != 0 else { return false }
+    addr.mSelector = kAudioProcessPropertyIsRunningOutput
+    var running: UInt32 = 0
+    size = UInt32(MemoryLayout<UInt32>.size)
+    guard AudioObjectGetPropertyData(object, &addr, 0, nil, &size, &running) == noErr
+    else { return false }
+    return running != 0
+}
+
 // MARK: - The shared trigger fire — one implementation for every session
 
 /// The M114a mirror, per session: scan `text` (this session's serial) for
@@ -1075,6 +1182,12 @@ func fireHostCmdTriggers(_ triggers: inout [HostCommandTrigger],
         // new-window's `@` operand before the dispatch runs.
         if t.command == .close, let arg = t.argument {
             bus.closeTargetVM = VMSessionRegistry.parseVMTarget(arg)
+        }
+        // M183c (#3173): `idle-occlude@<seconds>` stages how long the
+        // scripted occlusion stretch has already run — the dispatch's
+        // model consumes it.
+        if t.command == .idleOcclude, let arg = t.argument {
+            bus.machine.idleOccludeElapsed = TimeInterval(arg) ?? 0
         }
         bus.dispatch(t.command)
     }

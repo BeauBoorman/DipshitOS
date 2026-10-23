@@ -269,6 +269,7 @@ public final class HostMachineModel {
     /// is `failed` with the wire code in `error=`.
     @discardableResult
     public func suspend() -> HostCommandBus.Outcome {
+        releaseIdlePause() // M183c: SuspendCtl pauses first — a policy-held pause must lift or the save's pause step refuses.
         guard let driver = suspendDriver else { return fail("no_driver") }
         if let code = driver() { return fail("refuse=\(code)") }
         lastError = nil
@@ -283,6 +284,7 @@ public final class HostMachineModel {
     /// driver's post-save resume is part of the injected pair.
     @discardableResult
     public func snapshot() -> HostCommandBus.Outcome {
+        releaseIdlePause() // M183c: the save path pauses first — lift a policy pause before it.
         guard let share = resolvedShareDir(), let driver = snapshotDriver else {
             return fail("no_driver")
         }
@@ -414,6 +416,200 @@ public final class HostMachineModel {
     }
 
     private func changed() { onChange?() }
+
+    // MARK: M183c (#3173) — the idle-pause policy
+    //
+    // A VM window the user cannot see stops burning a vCPU: when every
+    // window this machine owns has been occluded for the configured
+    // interval the policy runs `vm.pause()` — the cheap transition, no
+    // state save, never a suspend (suspend-on-close keeps its own path).
+    // Refocus or any user input event resumes. Host-side only — the
+    // guest never knows.
+
+    /// The VZ pause/resume drivers — the runner injects a semaphore hop
+    /// onto the VM's queue (the SuspendCtl.begin precedent); nil return
+    /// is accept, else a wire-style refusal word. No driver pair → the
+    /// policy is unarmed and evaluate holds `no_driver`.
+    public var pauseDriver: (() -> String?)?
+    public var resumeDriver: (() -> String?)?
+    /// The activity vets a pause must never interrupt: guest audio
+    /// playing (the runner wires the CoreAudio process check) and a
+    /// live capture/recording (the bus wires the recorder's isRecording).
+    /// The defaults say quiet so a bare bus exercises the pause path.
+    public var audioActive: () -> Bool = { false }
+    public var captureActive: () -> Bool = { false }
+    /// The host-preference reads — persisted by the settings model's
+    /// host store (UserDefaults), injected here so a test owns them.
+    /// Defaults: policy on, 5 minutes.
+    public var idlePauseEnabled: () -> Bool = { true }
+    public var idlePauseSeconds: () -> TimeInterval = { 300 }
+    /// The clock — a test pins it to drive the interval edge.
+    public var now: () -> Date = { Date() }
+
+    /// True while THIS policy holds the pause — the "paused (idle)"
+    /// indicator's truth, and what keeps noteActivity from resuming a
+    /// machine something else paused.
+    public private(set) var idlePaused = false
+    /// When the all-occluded stretch began — nil while any known window
+    /// is visible or none have ever reported.
+    public private(set) var idleOccludedSince: Date?
+    /// Why the last elapsed-interval evaluation did not pause, once per
+    /// reason — the `held` marker line's tail.
+    public private(set) var idleHoldReason: String?
+    /// The `idle-occlude@<seconds>` trigger's staged operand — how long
+    /// the scripted stretch has already run (the fireHostCmdTriggers
+    /// slot, the closeTargetVM precedent). Consumed by the dispatch.
+    public var idleOccludeElapsed: TimeInterval = 0
+
+    /// Each known window's current occlusion bit. The policy requires
+    /// at least one window AND all of them occluded — a windowless run
+    /// (every scripted headless leg) can never idle-pause.
+    private var windowOccluded: [ObjectIdentifier: Bool] = [:]
+    /// The scripted edge's token — `idle-occlude` dispatches a window
+    /// that lives only in this map, so the gate drives the identical
+    /// policy path a real NSWindow reports through.
+    private let scriptedWindow = NSObject()
+    /// The 1 Hz evaluation tick — armed by the runner's wiring, never
+    /// in tests (they call idlePauseEvaluate directly).
+    private var idleTimer: Timer?
+
+    deinit { idleTimer?.invalidate() }
+
+    /// Every known window occluded right now — and at least one window
+    /// must exist, so a headless run is never "all occluded".
+    public var allWindowsOccluded: Bool {
+        !windowOccluded.isEmpty && windowOccluded.values.allSatisfy { $0 }
+    }
+
+    /// A session window's occlusion edge — its delegate reports the
+    /// occlusionState change (and once at arm). Becoming visible is the
+    /// focus edge: it resumes a policy-held pause.
+    public func noteWindowOcclusion(_ window: AnyObject, occluded: Bool) {
+        let id = ObjectIdentifier(window)
+        windowOccluded[id] = occluded
+        if occluded {
+            if idleOccludedSince == nil { idleOccludedSince = now() }
+        } else {
+            noteActivity()
+        }
+    }
+
+    /// The resume edge — refocus, a window un-occluding, or any user
+    /// input event. Restarts the occlusion clock so a still-occluded
+    /// stretch cannot immediately re-pause, and resumes a machine THIS
+    /// policy paused. A refused resume keeps the hold (the next
+    /// activity retries) and names the code.
+    public func noteActivity() {
+        if idleOccludedSince != nil { idleOccludedSince = now() }
+        guard idlePaused else { return }
+        if let code = resumeDriver?() {
+            emit("host-machine: idle-pause resume refused code=\(code)")
+            return
+        }
+        idlePaused = false
+        idleHoldReason = nil
+        emit("host-machine: idle-pause resumed")
+        changed()
+    }
+
+    /// Lift a policy-held pause — the suspend/snapshot/close/stop paths
+    /// call this so a frozen machine never wedges a save's pause step or
+    /// a teardown. A no-op unless the policy holds the pause.
+    public func releaseIdlePause() {
+        guard idlePaused else { return }
+        idlePaused = false
+        if let code = resumeDriver?() {
+            emit("host-machine: idle-pause resume refused code=\(code)")
+            idlePaused = true // still frozen — say so
+            return
+        }
+        emit("host-machine: idle-pause resumed")
+        changed()
+    }
+
+    /// The policy evaluation — the tick's body, also run synchronously
+    /// inside the scripted occlusion edge. Pauses only when every known
+    /// window has been occluded at least the configured interval, the
+    /// preference is on, the VM is running, both drivers are armed, and
+    /// neither activity vet objects. `held` reasons emit once each.
+    @discardableResult
+    public func idlePauseEvaluate() -> Bool {
+        guard !idlePaused else { return false }
+        guard allWindowsOccluded, let since = idleOccludedSince else {
+            idleHoldReason = nil
+            return false
+        }
+        // Inside the grace stretch — waiting, not held.
+        guard now().timeIntervalSince(since) >= idlePauseSeconds() else { return false }
+        guard idlePauseEnabled() else { return hold("off") }
+        guard vmRunning() else { return hold("stopped") }
+        guard let pause = pauseDriver, resumeDriver != nil else { return hold("no_driver") }
+        guard !audioActive() else { return hold("audio") }
+        guard !captureActive() else { return hold("capture") }
+        if let code = pause() {
+            if idleHoldReason != "refused" {
+                idleHoldReason = "refused"
+                emit("host-machine: idle-pause refused code=\(code)")
+            }
+            return false
+        }
+        idlePaused = true
+        idleHoldReason = nil
+        emit("host-machine: idle-pause paused occluded=\(Int(now().timeIntervalSince(since)))s")
+        changed()
+        return true
+    }
+
+    private func hold(_ reason: String) -> Bool {
+        if idleHoldReason != reason {
+            idleHoldReason = reason
+            emit("host-machine: idle-pause held reason=\(reason)")
+        }
+        return false
+    }
+
+    /// The `idle-occlude` verb's edge — the scripted twin of "every
+    /// window occluded for <idleOccludeElapsed> seconds" (a gate cannot
+    /// produce a real NSWindow occlusion change; the close@vm=
+    /// precedent). The sentinel window shares the real map, so a
+    /// genuinely-visible window still vetoes the pause.
+    public func scriptedOcclusion() {
+        let elapsed = idleOccludeElapsed
+        idleOccludeElapsed = 0
+        let id = ObjectIdentifier(scriptedWindow)
+        windowOccluded[id] = true
+        if let since = idleOccludedSince {
+            idleOccludedSince = min(since, now().addingTimeInterval(-elapsed))
+        } else {
+            idleOccludedSince = now().addingTimeInterval(-elapsed)
+        }
+        idlePauseEvaluate()
+    }
+
+    /// The `idle-focus` verb's edge — the scripted twin of the focus /
+    /// user-input resume.
+    public func scriptedFocus() { noteActivity() }
+
+    /// Arm the policy — the runner calls this after injecting the
+    /// drivers so the armed line names the live interval. The 1 Hz
+    /// tick covers "still occluded when the interval elapsed"; the
+    /// occlusion/focus events drive the edges. Idempotent.
+    public func armIdlePause() {
+        guard idleTimer == nil else { return }
+        emit("host-machine: idle-pause armed interval=\(Int(idlePauseSeconds()))s")
+        idleTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            self?.idlePauseEvaluate()
+        }
+    }
+
+    /// The idle-pause receipt tail — the post-action truth a gate reads
+    /// (`paused`/`armed`/`off`, plus the live hold reason).
+    public var idleDetail: String {
+        var s = "idle=\(idlePaused ? "paused" : (idlePauseEnabled() ? "armed" : "off"))"
+        s += " after=\(Int(idlePauseSeconds()))s"
+        if let r = idleHoldReason { s += " held=\(r)" }
+        return s
+    }
 
     // MARK: M157a (#2934) — the close policy's named messages + refusal word.
 

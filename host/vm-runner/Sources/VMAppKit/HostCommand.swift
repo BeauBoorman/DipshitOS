@@ -44,6 +44,17 @@ public enum HostCommand: String, CaseIterable, Sendable {
     case applyUpdate = "apply-update"
     case rollbackUpdate = "rollback-update"
     case revealShare = "reveal-share"
+    // M183c (#3173): the idle-pause policy's three verbs. `idle-pause`
+    // toggles the persisted host preference (the Machine menu's
+    // checkmark); `idle-occlude`/`idle-focus` are the scripted twins of
+    // the window occlusion and focus edges — a gate cannot produce a
+    // real NSWindow occlusion change (index thesis 1), so these verbs
+    // drive the identical policy path (the `close@vm=` precedent).
+    // `idle-occlude@<seconds>` stages how long the stretch has already
+    // run through the machine model's idleOccludeElapsed slot.
+    case idlePause = "idle-pause"
+    case idleOcclude = "idle-occlude"
+    case idleFocus = "idle-focus"
     // M128b (#2606): the profile manager's four verbs — the model
     // (HostProfilesModel) self-registers in init like the recorder/
     // agent/settings companions, so a profile-less run receipts
@@ -297,6 +308,15 @@ public final class HostCommandBus: NSObject, NSMenuDelegate {
         self.machine.emit = self.emit
         self.captures.emit = self.emit
         super.init()
+        // M183c (#3173): the idle-pause policy's reads — the toggle and
+        // interval are the settings model's persisted host preferences;
+        // the capture vet is the bus's own recorder (a bare bus already
+        // covers "a recording is live" without runner wiring).
+        self.machine.idlePauseEnabled = { [s = self.settings] in s.idlePauseEnabled }
+        self.machine.idlePauseSeconds = { [s = self.settings] in
+            TimeInterval(s.idlePauseMinutes * 60)
+        }
+        self.machine.captureActive = { [r = self.recorder] in r.isRecording }
         let recorder = self.recorder
         let captures = self.captures
         // M120e (#2562): the recorder shares the captures model's
@@ -381,6 +401,27 @@ public final class HostCommandBus: NSObject, NSMenuDelegate {
             isEnabled: { machine.canRevealShare },
             receiptDetail: { machine.revealShareDetail },
             action: { machine.revealShare() }))
+        // M183c (#3173): the idle-pause verbs. The toggle is a host
+        // preference — it needs no posture, and turning it off while a
+        // pause is held releases it (off is never a trap). The edge
+        // verbs are the scripted twins: occlude records the stretch and
+        // evaluates; focus is the resume edge — enabled exactly while a
+        // pause is held, so an idle edge receipts `disabled`.
+        register(.idlePause, Registration(
+            itemState: { settings.idlePauseEnabled },
+            receiptDetail: { machine.idleDetail },
+            action: {
+                settings.idlePauseEnabled.toggle()
+                if !settings.idlePauseEnabled { machine.releaseIdlePause() }
+                return .performed
+            }))
+        register(.idleOcclude, Registration(
+            receiptDetail: { machine.idleDetail },
+            action: { machine.scriptedOcclusion(); return .performed }))
+        register(.idleFocus, Registration(
+            isEnabled: { machine.idlePaused },
+            receiptDetail: { machine.idleDetail },
+            action: { machine.scriptedFocus(); return .performed }))
         // M122d (#2573): ⌘/ — always armed (the sheet is generated from
         // the static command table, so there is nothing a run can lack);
         // the receipt tail carries the open state + row count.

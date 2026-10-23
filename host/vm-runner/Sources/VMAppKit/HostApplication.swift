@@ -97,6 +97,9 @@ public final class HostApplication: NSObject, NSApplicationDelegate, NSWindowDel
     private let savedBadge = NSView()
     private let savedBadgeLabel = NSTextField(labelWithString: "")
     private var savedBadgeTimer: Timer?
+    /// M183c (#3173): the app-directed input monitor — the "any user
+    /// input event" resume edge.
+    private var activityMonitor: Any?
     /// M120c (#2560): the staged-update banner — a strip across the
     /// bottom of the guest pane, visible exactly while the armed share
     /// holds `<share>/UPDATE/` (the guest's GOUPD stage lands mid-run,
@@ -350,7 +353,26 @@ public final class HostApplication: NSObject, NSApplicationDelegate, NSWindowDel
         ])
         updateBanner.isHidden = true
         updateBannerApply = updateApply
-        commandBus.machine.onChange = { [weak self] in self?.syncUpdateBanner() }
+        commandBus.machine.onChange = { [weak self] in
+            self?.syncUpdateBanner()
+            self?.syncIdlePause()
+        }
+        // M183c (#3173): the idle-pause edges — this window reports its
+        // current occlusion bit once at arm and on every change, and a
+        // local monitor makes any key/mouse input the resume edge (the
+        // monitor sees app-directed events; a paused guest produces none,
+        // so the window/app focus paths below carry the rest).
+        commandBus.machine.noteWindowOcclusion(
+            window, occluded: !window.occlusionState.contains(.visible))
+        if presentWindow {
+            activityMonitor = NSEvent.addLocalMonitorForEvents(
+                matching: [.keyDown, .leftMouseDown, .rightMouseDown,
+                           .otherMouseDown, .scrollWheel]
+            ) { [weak self] event in
+                self?.commandBus.machine.noteActivity()
+                return event
+            }
+        }
         updateBannerTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
             self?.syncUpdateBanner()
         }
@@ -926,6 +948,9 @@ public final class HostApplication: NSObject, NSApplicationDelegate, NSWindowDel
     }
 
     private var statsStateWord: String {
+        // M183c (#3173): a policy-held pause outranks the lifecycle word
+        // — the stats line is the card's "paused (idle)" surface.
+        if commandBus.machine.idlePaused { return "paused (idle)" }
         switch lifecycle.state {
         case .starting: return "starting"
         case .running: return "running"
@@ -933,6 +958,18 @@ public final class HostApplication: NSObject, NSApplicationDelegate, NSWindowDel
         case .stopping: return "stopping"
         case .stopped: return "stopped"
         }
+    }
+
+    /// M183c (#3173): while the policy holds a pause the window subtitle
+    /// names it (never silent); cleared on resume, and never clobbers a
+    /// close-policy message (only a subtitle the policy itself set).
+    private func syncIdlePause() {
+        if commandBus.machine.idlePaused {
+            window.subtitle = "Paused (idle) — focus or any input resumes"
+        } else if window.subtitle.hasPrefix("Paused (idle)") {
+            window.subtitle = ""
+        }
+        syncStats()
     }
 
     /// The runner's own flag resolution — last occurrence wins, the
@@ -952,6 +989,10 @@ public final class HostApplication: NSObject, NSApplicationDelegate, NSWindowDel
     /// message names the Code=12 bound). The window's own close button
     /// and the `close vm=<k>` verb land here alike.
     public func requestClose(reason: String) {
+        // M183c (#3173): a policy-held pause lifts first — the suspend
+        // close path's own pause step and the stop teardown both expect
+        // a running machine.
+        commandBus.machine.releaseIdlePause()
         let vm = commandBus.sessionID.map { " vm=\($0)" } ?? ""
         switch sessionProfile?.config.closeAction ?? .stop {
         case .suspend:
@@ -985,6 +1026,7 @@ public final class HostApplication: NSObject, NSApplicationDelegate, NSWindowDel
         updateBannerTimer?.invalidate()
         savedBadgeTimer?.invalidate()
         statsTimer?.invalidate()
+        if let activityMonitor { NSEvent.removeMonitor(activityMonitor) }
     }
 
     private func reportFocus(_ reason: String) {
@@ -992,14 +1034,24 @@ public final class HostApplication: NSObject, NSApplicationDelegate, NSWindowDel
         fflush(stdout)
     }
 
+    /// M183c (#3173): the occlusion edge — every change reports the
+    /// window's current bit to the policy (occluded = no .visible; a
+    /// minimized or fully covered window counts).
+    public func windowDidChangeOcclusionState(_ notification: Notification) {
+        commandBus.machine.noteWindowOcclusion(
+            window, occluded: !window.occlusionState.contains(.visible))
+    }
+
     public func windowDidBecomeKey(_ notification: Notification) {
         focusGuest()
         reportFocus("key-window")
+        commandBus.machine.noteActivity()
     }
 
     public func applicationDidBecomeActive(_ notification: Notification) {
         focusGuest()
         reportFocus("active")
+        commandBus.machine.noteActivity()
     }
 
     public func windowShouldClose(_ sender: NSWindow) -> Bool {

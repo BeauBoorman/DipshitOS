@@ -63,6 +63,12 @@ public enum HostMenuBar {
             // M120c (#2560): the persistence lifecycle — each item greys
             // live on the machine model's posture.
             [Item("Suspend", .suspend), Item("Snapshot", .snapshot)],
+            // M183c (#3173): the idle-pause preference toggle (checkmark
+            // mirrors the host pref) and the "paused (idle)" line — the
+            // card's menu-bar surface: while the policy holds a pause the
+            // leaf reads enabled and its tap is the resume edge.
+            [Item("Pause VM When Hidden", .idlePause),
+             Item("Paused (idle) — Resume Now", .idleFocus)],
             [Item("Apply OS Update", .applyUpdate), Item("Roll Back OS Update", .rollbackUpdate)],
             [Item("Reveal Share in Finder", .revealShare)],
             // M128b (#2606): the profile manager. "Switch To" is a
