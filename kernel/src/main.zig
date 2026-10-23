@@ -137,6 +137,11 @@ const gpu3d_device = @import("gpu3d_device.zig"); // M102b1 (issue #2162): exper
 const virtio_file = @import("virtio_file.zig"); // M34 HF1+HF2 (issues #735/#736): host file channel client (queue 5)
 const virtio_fs = @import("virtio_fs.zig"); // M83g: standard VirtioFS/FUSE backend for /host
 const virtio_vsock = @import("virtio_vsock.zig"); // M115a (issue #2460): VZVirtioSocketDevice save/restore probe (DID 0x1053)
+// M183b (issue #3172): the virtio-balloon transport (the runner's
+// VZVirtioTraditionalMemoryBalloonDeviceConfiguration under `--balloon`) —
+// host-driven guest-memory reclaim. Pre-exit discovery, post-MMU re-arm,
+// inflate/deflate reconciled from the scheduler's idle pass.
+const virtio_balloon = @import("virtio_balloon.zig");
 // M34 HF5 (issue #739): one-time /data → /host migration at boot.
 
 const HandoffV2 = handoff.HandoffV2;
@@ -445,6 +450,17 @@ fn kernel_main(base: u64, size: u64, st: *const SystemTable, handoff_rec: *Hando
     // so `vsock_probed` is false on every existing gate and the boot
     // output stays byte-identical.
     const vsock_probed = virtio_vsock.probe();
+    // M183b (issue #3172): the traditional virtio-balloon device (the
+    // runner's `--balloon` attachment — modern DID 0x1045 expected per
+    // the 0x1040 + device-id scheme, transitional 0x1005 accepted;
+    // whatever is observed is recorded in docs/hardware-contract.md).
+    // Discovery + capability resolution run PRE-EXIT like every other
+    // device (config-space reads must stay pre-exit, claim 0013); its
+    // BAR windows are handed to the identity map below and the
+    // transport is RE-ARMED post-MMU (the claim-6420 lesson). The
+    // default runner attaches no balloon device, so `balloon_ready` is
+    // false on every existing gate — the default VM is unchanged.
+    const balloon_ready = virtio_balloon.virtio_balloon_init();
 
     var exited = false;
     var attempt: usize = 0;
@@ -558,6 +574,12 @@ fn kernel_main(base: u64, size: u64, st: *const SystemTable, handoff_rec: *Hando
         extra_windows[extra_count] = .{ .base = virtio_snd.snd_bar0, .len = 0x10000 };
         extra_count += 1;
     }
+    // M183b (issue #3172): the balloon transport BARs — same Device-
+    // window treatment so post-MMU common-config reads + queue notify +
+    // device-config polls reach the device. Only present under the
+    // runner's `--balloon` flag (default VM: no balloon device, no
+    // window).
+    if (balloon_ready) extra_count += virtio_balloon.add_device_windows(extra_windows[extra_count..]);
     const user_text = userspace.text_region(base);
     const user_stack = userspace.stack_region(base);
     const user_regions = [_]mmu.UserRegion{
@@ -1183,6 +1205,37 @@ fn kernel_main(base: u64, size: u64, st: *const SystemTable, handoff_rec: *Hando
             uart_puts(")\n");
         }
     }
+    // M183b (issue #3172): re-arm the virtio-balloon transport post-MMU
+    // (the claim-6420/2665 lesson — VZ resets SOME virtio devices at
+    // ExitBootServices; the balloon answer is observed, not assumed: the
+    // pre-rearm status is printed so the host sees it either way). The
+    // re-arm itself is unconditional and idempotent. Inflate/deflate are
+    // driven only by the host's `num_pages` target from here on — the
+    // idle-pass pump below reconciles toward it. The default runner
+    // attaches no balloon device, so on every existing gate this whole
+    // block is skipped and the boot output stays byte-identical.
+    if (balloon_ready) {
+        uart_puts("balloon: pre-rearm st=");
+        uart_hex8(virtio_balloon.bal_status());
+        uart_puts("\n");
+        if (virtio_balloon.balloon_rearm()) {
+            uart_puts("balloon: armed did=");
+            uart_hex(virtio_balloon.bal_did);
+            uart_puts(" num=");
+            uart_hex(virtio_balloon.devcfg_num_pages());
+            uart_puts(" actual=");
+            uart_hex(virtio_balloon.devcfg_actual());
+            uart_puts("\n");
+        } else {
+            uart_puts("balloon: rearm failed stage=");
+            uart_hex8(virtio_balloon.bal_fail_stage);
+            uart_puts(" feats=");
+            uart_hex(virtio_balloon.bal_feat_hi);
+            uart_puts("/");
+            uart_hex(virtio_balloon.bal_feat_lo);
+            uart_puts("\n");
+        }
+    }
     // Claim 3693 (milestone-four follow-on): ASLR for the BOOT-time static
     // EL0 payload too. The pre-install user root (built inside
     // build_identity_map) maps the stack at the fixed userspace.stack_va;
@@ -1278,6 +1331,12 @@ fn kernel_main(base: u64, size: u64, st: *const SystemTable, handoff_rec: *Hando
     // shell, worker, and EL0 task run one quantum each — every timer PPI
     // (claim 9187) is a context switch.
     _ = scheduler.init();
+    // M183b (issue #3172): the idle-pass pump is armed UNCONDITIONALLY —
+    // the balloon reconciler rides the same home as the custom-virtio
+    // input drain (claim 1747's "not the shell idle loop" lesson), on
+    // every device set rather than only a --custom-virtio boot. The
+    // spike's own registration below points at the same combined pump.
+    scheduler.on_idle_pass = idle_pump;
     _ = scheduler.register_worker(@intFromPtr(&worker_entry));
     _ = scheduler.register_user(@intFromPtr(&userspace.entry), base);
     smp.init();
@@ -1937,6 +1996,18 @@ fn cv_idle_input_pump() void {
     if (virtio_custom.snap_pending) virtio_custom.service_snapshot();
 }
 
+/// M183b (issue #3172): the ONE idle-pass pump — registered
+/// unconditionally so the balloon reconciler runs on every device set,
+/// not just on a --custom-virtio boot (the claim-1747 home the cv drain
+/// already rides). Both halves are bounded and non-blocking:
+/// balloon_poll caps its queue submissions per pass and no-ops while
+/// `bal_ready` is false; the cv half's own `cv_ready`/`snap_pending`
+/// guards keep the flags-off boot a no-op.
+fn idle_pump() void {
+    virtio_balloon.balloon_poll();
+    cv_idle_input_pump();
+}
+
 fn cv_input_dispatch(rep: []const u8) void {
     input.decode_keyboard_report(rep);
 }
@@ -2256,8 +2327,10 @@ fn custom_virtio_spike() void {
     virtio_custom.on_pointer_report = &cv_pointer_dispatch;
     // Claim 1747: the drain rides the scheduler's idle pass, not the
     // console reader — one owner for the ring, and input liveness no
-    // longer depends on the shell idle loop running.
-    scheduler.on_idle_pass = cv_idle_input_pump;
+    // longer depends on the shell idle loop running. M183b: it is the
+    // combined pump (balloon reconcile + cv drain), the same hook the
+    // unconditional registration armed.
+    scheduler.on_idle_pass = idle_pump;
     if (virtio_custom.has_input_queue) {
         if (!virtio_custom.arm_input_pool()) {
             uart_puts("cvspike: q3 arm failed\n");

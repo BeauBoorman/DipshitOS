@@ -2171,6 +2171,7 @@ pub fn build(b: *std.Build) void {
         // M100c (issue #2308, ADR 0050): the VLFS read half — golden-fixture
         // mount/lookup/read/readdir parity with tools/go/vlfs.
         "kernel/src/vlfs/vlfs.zig",
+        "kernel/src/virtio_balloon.zig",
         "kernel/src/virtio_console.zig",
         "kernel/src/virtio_custom.zig",
         "kernel/src/virtio_entropy.zig",

@@ -190,6 +190,19 @@
 //          host speakers. OFF by default: without the flag
 //          config.soundDevices stays [] — every existing gate is
 //          byte-identical.)
+//         [--balloon] (M183b #3172: attach ONE
+//          VZVirtioTraditionalMemoryBalloonDeviceConfiguration — the
+//          traditional virtio-balloon device (public VZ API since
+//          macOS 11). The guest's virtio_balloon driver inflates/deflates
+//          toward the device's num_pages target on its polled idle pass.
+//          OFF by default: without the flag config.memoryBalloonDevices
+//          stays [] — every existing gate is byte-identical.)
+//         [--balloon-target-after <marker>:<MiB>] (M183b: write <MiB> MiB
+//          to the device's targetVirtualMachineMemorySize once <marker>
+//          appears in the serial stream — a value below memorySize asks
+//          the guest to inflate, restoring memorySize asks it to deflate.
+//          Repeatable, fires once each; the marker scan runs on the
+//          scripted poll like --host-cmd-after. Implies --balloon.)
 //         [--script2 <file> --script2-after <text>] (claim 4613: a second
 //          scripted phase, forwarded once after its own serial marker)
 //         [--script3 <file> --script3-after <text>] (claim 7786: a third
@@ -544,6 +557,26 @@ var inputMode = false
 // device, negotiates, and arms the control queue; the PCM playback path
 // (the audible beep) is card A2.
 var soundMode = false
+// M183b (issue #3172): `--balloon` attaches the traditional memory
+// balloon device (VZVirtioTraditionalMemoryBalloonDeviceConfiguration —
+// public VZ API since macOS 11, one per VM). OFF by default — without
+// the flag config.memoryBalloonDevices stays [] exactly as before, so
+// every existing gate stays byte-identical.
+var balloonEnabled = false
+// M183b: one armed `--balloon-target-after <marker>:<MiB>` instance —
+// when <marker> appears in the serial stream the runner writes <MiB>
+// MiB to the device's targetVirtualMachineMemorySize (the public VZ
+// property: shrinking it below memorySize asks the guest to inflate,
+// restoring it asks the guest to deflate). Repeatable; each fires once.
+// The serial marker is CHOREOGRAPHY (the host-side trigger the spec leg
+// asserts against); the memory transfer itself travels the balloon
+// device's inflate/deflate queues. Implies --balloon.
+struct BalloonTargetTrigger {
+    let marker: String
+    let targetMiB: UInt64
+    var fired = false
+}
+var balloonTargetTriggers: [BalloonTargetTrigger] = []
 // M97g (#2084): --no-entropy detaches the virtio-entropy device so a gate
 // can prove the guest's slot-72 fail-closed behavior while unseeded.
 var noEntropy = false
@@ -1457,6 +1490,25 @@ while idx < arguments.count {
     } else if arg == "--sound" {
         soundMode = true
         idx += 1
+    } else if arg == "--balloon" {
+        // M183b (#3172): attach the traditional memory balloon device.
+        balloonEnabled = true
+        idx += 1
+    } else if arg == "--balloon-target-after", idx + 1 < arguments.count {
+        // M183b: <marker>:<MiB> — the target is the suffix after the
+        // LAST colon (serial markers may carry colons of their own —
+        // the --host-write-after precedent). An unparsable spec is a
+        // parse-time error, not a trigger that silently never fires.
+        let spec = arguments[idx + 1]
+        guard let colon = spec.lastIndex(of: ":"),
+              let mib = UInt64(spec[spec.index(after: colon)...]),
+              !spec[..<colon].isEmpty else {
+            fail("--balloon-target-after expects <marker>:<MiB> (e.g. 'm183b-pre:448').")
+        }
+        balloonTargetTriggers.append(BalloonTargetTrigger(
+            marker: String(spec[..<colon]), targetMiB: mib))
+        balloonEnabled = true
+        idx += 2
     } else if arg == "--no-entropy" {
         // M97g (#2084): detach the virtio-entropy device so a gate can
         // prove slot 72 fails closed while the CSPRNG is unseeded.
@@ -3111,6 +3163,16 @@ config.serialPorts = [serialConfig]
 // M97g (#2084): --no-entropy leaves entropyDevices empty — the guest sees
 // no DID 0x1044 device, the boot seed fails, and slot 72 must refuse.
 config.entropyDevices = noEntropy ? [] : [VZVirtioEntropyDeviceConfiguration()]
+// M183b (issue #3172): --balloon attaches ONE
+// VZVirtioTraditionalMemoryBalloonDeviceConfiguration (VZ allows exactly
+// one per VM). OFF by default — the flags-off configuration stays
+// byte-identical. The device is the host-reclaim mechanism: the runner's
+// --balloon-target-after triggers write targetVirtualMachineMemorySize,
+// and the guest's virtio_balloon driver inflates/deflates toward the
+// resulting num_pages on its polled idle pass.
+if balloonEnabled {
+    config.memoryBalloonDevices = [VZVirtioTraditionalMemoryBalloonDeviceConfiguration()]
+}
 
 var machineView: VZVirtualMachineView?
 var machineWindow: NSWindow?
@@ -4401,6 +4463,12 @@ print("VIRELAIOS VM runner")
 print("  host: arm64 (Apple silicon), macOS \(osVersion.majorVersion).\(osVersion.minorVersion)")
 print("  disk: \(overlayBasePath ?? diskImagePath)")
 print("  memory: \(memoryMiB) MiB, cpus: \(cpuCount)")
+if balloonEnabled {
+    print("  balloon: ENABLED (M183b #3172: VZVirtioTraditionalMemoryBalloonDeviceConfiguration — host reclaim via targetVirtualMachineMemorySize; the guest's virtio_balloon driver inflates/deflates toward num_pages)")
+}
+for t in balloonTargetTriggers {
+    print("  balloon-target-after: \"\(t.marker)\" → \(t.targetMiB) MiB (M183b: targetVirtualMachineMemorySize write on serial marker)")
+}
 if let p = activeProfile {
     print("  profile: \(p.url.path) identity=\(p.identity) (\(p.created ? "created" : "loaded"))")
 }
@@ -5674,6 +5742,36 @@ func noteVMEnd(_ state: VZVirtualMachine.State) {
         state: "\(state.rawValue)",
         reason: vmDelegate.stopReasons.reason ?? StopReasonRecorder.noReason,
         serialLines: inspector.ingestedCount))
+}
+
+// M183b (#3172): marker-driven balloon target writes
+// (`--balloon-target-after <marker>:<MiB>`). When a trigger's marker
+// appears in the serial stream the runner writes that many MiB to the
+// device's targetVirtualMachineMemorySize — the public VZ property the
+// header documents as the balloon request channel: a value below
+// memorySize asks the guest to inflate, a return to memorySize asks it
+// to deflate. The serial marker is CHOREOGRAPHY (when the host asks);
+// the guest's own inflate/deflate markers are the evidence. Each
+// trigger fires once; a missing device is named on stdout, never
+// silent. The write itself is dispatched on the VM's queue (the
+// SuspendCtl/restore precedent — VZ device mutation rides runner.queue).
+func fireBalloonTargetsIfMarker(_ text: String) {
+    for i in balloonTargetTriggers.indices {
+        if balloonTargetTriggers[i].fired { continue }
+        let trigger = balloonTargetTriggers[i]
+        guard text.contains(trigger.marker) else { continue }
+        balloonTargetTriggers[i].fired = true
+        guard let balloon = runner.vm.memoryBalloonDevices.first
+                as? VZVirtioTraditionalMemoryBalloonDevice else {
+            FileHandle.standardOutput.write(Data("balloon: target write dropped — no VZVirtioTraditionalMemoryBalloonDevice (marker \"\(trigger.marker)\")\n".utf8))
+            continue
+        }
+        let target = trigger.targetMiB * 1024 * 1024
+        FileHandle.standardOutput.write(Data("balloon: target \(trigger.targetMiB)MiB after \"\(trigger.marker)\"\n".utf8))
+        runner.queue.async {
+            balloon.targetVirtualMachineMemorySize = target
+        }
+    }
 }
 
 // M114a (#2454, index #2447): `--host-cmd-after <marker>:<verb>` — the
@@ -8553,6 +8651,7 @@ func scriptPoll(matchedAt: Date? = nil) {
     fireHostClipInIfMarker(lastText)
     fireHostDropIfMarker(lastText)
     fireHostCmdsIfMarker(lastText)
+    fireBalloonTargetsIfMarker(lastText)
     // Fix 3: the liveness heartbeat — unbuffered stderr every 30 s.
     if Date().timeIntervalSince(scriptPollLastBeat) >= 30 {
         scriptPollLastBeat = Date()

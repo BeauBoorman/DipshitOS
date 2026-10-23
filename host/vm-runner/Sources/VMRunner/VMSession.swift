@@ -612,6 +612,14 @@ final class VMSessionRegistry {
         }
         config.serialPorts = [serialConfig]
         config.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]
+        // M183b (#3172): the balloon attach is a runner flag, not a
+        // profile-device field (VMProfile.Devices is outside this card's
+        // Touches) — a `--balloon` argv arms it for sessions exactly as
+        // it does the flag-runner path; off by default either way.
+        if CommandLine.arguments.contains("--balloon")
+            || CommandLine.arguments.contains("--balloon-target-after") {
+            config.memoryBalloonDevices = [VZVirtioTraditionalMemoryBalloonDeviceConfiguration()]
+        }
         // The verb IS the window — a session always gets a scanout and
         // the view to show it; the profile's device flags gate input and
         // the optional channels.

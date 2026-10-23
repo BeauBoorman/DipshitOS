@@ -5,6 +5,8 @@
 # asserts zombies=0, not a pinned count).
 # The negative boots must relinquish init's tasks before direct fallback.
 # exec-order: assert-proven -- observation scripts run only after the hosted shell prompt.
+# M183b: the balloon leg boots the flag-attached device and drives a host
+# target shrink + restore; `pages` free= is the observed drop/recover.
 vgate_name live-boot-order "M92: mid-boot restart, dependency order, kill receipt and single-seat fallback"
 vgate_share seed
 vgate_runner_flags -Xswiftc -DSPIKE
@@ -357,4 +359,41 @@ assert re.search(r"procs: [^\n]*name=INIT.ELF [^\n]*state=exited", serial), "ini
 assert not re.search(r"procs: [^\n]*name=INIT(?:PRE|DEP).BIN [^\n]*state=running", serial), "orphaned init child"
 assert serial.count("gotabwm: registered\n") == 1, "fallback double-launched seat"
 assert serial.count("gotabwm: first-boot workspace") == 1, "fallback double-launched shell"
+PY
+# M183b (issue #3172): the virtio-balloon reclaim leg. --balloon attaches
+# VZ's traditional memory-balloon device; the two --balloon-target-after
+# triggers are the host's writes to targetVirtualMachineMemorySize — a
+# shrink to 448 MiB (inflate 64 MiB = 16384 pages) on the m183b-pre echo,
+# a restore to 512 MiB (full deflate) on m183b-inflated. The guest's
+# `pages` free= readout is the observed drop and recover.
+vgate_file balloon-observe.txt <<'EOS'
+pages
+echo m183b-pre
+EOS
+vgate_file balloon-inflated.txt <<'EOS'
+pages
+echo m183b-inflated
+EOS
+vgate_file balloon-deflated.txt <<'EOS'
+pages
+echo m183b-deflated
+EOS
+vgate_run balloon -- --balloon --balloon-target-after 'm183b-pre:448' --balloon-target-after 'm183b-inflated:512' --script '$RUN_DIR/balloon-observe.txt' --script2 '$RUN_DIR/balloon-inflated.txt' --script2-after 'balloon: inflate' --script3 '$RUN_DIR/balloon-deflated.txt' --script3-after 'balloon: deflate' --script-expect 'm183b-deflated' --timeout 120
+vgate_assert balloon serial-contains 'balloon: armed did='
+vgate_assert balloon serial-contains 'balloon: inflate pages='
+vgate_assert balloon serial-contains 'balloon: deflate pages='
+vgate_assert balloon python <<'PY'
+import os, pathlib, re
+serial = pathlib.Path(os.environ["VG_SER"]).read_text(errors="replace")
+frees = [int(m, 16) for m in re.findall(r"pages: armed=1 total=0x[0-9a-f]+ free=0x([0-9a-f]+)", serial)]
+assert len(frees) >= 3, ("expected 3 `pages` readouts (pre/inflated/deflated)", frees)
+pre, inflated, deflated = frees[0], frees[1], frees[2]
+assert inflated <= pre - 16384, ("inflate did not drop free by 64 MiB", pre, inflated)
+assert deflated >= inflated + 16384, ("deflate did not return the pages", inflated, deflated)
+assert deflated >= pre - 64, ("free did not recover to ~pre level", pre, deflated)
+inflates = re.findall(r"balloon: inflate pages=(\d+)", serial)
+deflates = re.findall(r"balloon: deflate pages=(\d+)", serial)
+assert sum(int(n) for n in inflates) >= 16384, ("inflated pages short of target", inflates)
+assert sum(int(n) for n in deflates) >= 16384, ("deflated pages short of restore", deflates)
+print("balloon leg: free %s -> %s -> %s pages (host-driven inflate/deflate observed)" % (pre, inflated, deflated))
 PY
