@@ -33,10 +33,14 @@
 # honest fixture: it holds real runnable Ms instead of parking between
 # yields, which is exactly what tick-attributed accounting measures.
 #
-# Run 04 is the PULSE half: PULSE.ELF's negotiated read prints
+# Run 04 is the PULSE half — and, since M194f (#3286), PULSE's registry-
+# pinned owning leg: PULSE.ELF's negotiated read prints
 # `pulse: usage cpux10= memused= memtotal=` right after `pulse: ready` when
 # the v2 rows arrived — absent on a v1 kernel — and a `2` chord repaints the
-# Processes tab with real CPU%/MEM columns over the same busy guest.
+# Processes tab with real CPU%/MEM columns over the same busy guest. The
+# `2` rides after `pulse: tick` (the armed 1 Hz timer's first marker), the
+# close waits on `pulse: key 2`, and the run ends on `pulse OK`, so the
+# leg pins face + tick + key + named quit.
 #
 # Run 06 (issue #2411, M111d) is the gpu tab leg: GPUTRIANGLE's `gemm`
 # journey runs one real Metal compute submit first (slot-90 sys_gpucomp,
@@ -484,7 +488,12 @@ PY
 # PULSE.ELF on the default seat: its usage seam negotiates the v2 row, so
 # `pulse: usage` is the proof the bars have real numerators — it is absent
 # on a pre-0047 kernel. The `2` chord repaints the Processes tab (CPU%/MEM
-# columns) before the close; `pulse: repainted` gates it.
+# columns) before the close. M194f (#3286) completes the owning-leg shape
+# and repairs the chord race at once: the `2` rides AFTER `pulse: tick` —
+# on a GOSCALE-busy guest the ready-anchored chord could outrun HID
+# routing and never land — and the close waits on `pulse: key 2`, so the
+# leg proves tick + key + repaint before the named quit, and the run ends
+# on `pulse OK`, the last line of the app's own exit path.
 vgate_file script4p.txt <<'EOS'
 exec GOSCALE.ELF
 EOS
@@ -504,10 +513,10 @@ vgate_run 04 -- \
     --script2 '$RUN_DIR/script4q.txt' \
     --script2-after 'goscale: released m=4' \
     --input-chords '2' \
-    --input-chords-after 'pulse: ready' \
+    --input-chords-after 'pulse: tick' \
     --script3 '$RUN_DIR/script4r.txt' \
-    --script3-after 'pulse: repainted' \
-    --script-expect 'pulse: close' --timeout 240
+    --script3-after 'pulse: key 2' \
+    --script-expect 'pulse OK' --timeout 240
 
 vgate_assert 04 serial-contains 'exec: loaded GOSCALE.ELF'
 vgate_assert 04 serial-contains 'exec: loaded PULSE.ELF'
@@ -516,7 +525,9 @@ vgate_assert 04 serial-contains 'pulse: procs '
 vgate_assert 04 serial-contains 'pulse: usage cpux10='
 vgate_assert 04 serial-contains 'pulse: key 2'
 vgate_assert 04 serial-contains 'pulse: repainted'
+vgate_assert 04 serial-contains 'pulse: tick'
 vgate_assert 04 serial-contains 'pulse: close'
+vgate_assert 04 serial-contains 'pulse OK'
 vgate_assert 04 serial-absent '[EXC] parking:'
 
 vgate_assert 04 python <<'PY'
