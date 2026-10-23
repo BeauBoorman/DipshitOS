@@ -81,6 +81,45 @@ func TestFoldedAndEscapedFields(t *testing.T) {
 	}
 }
 
+func TestOtherFieldsNamedCounted(t *testing.T) {
+	// M193c (#3255): properties the bound does not honour are named and
+	// counted on the card — never dropped silently. The honoured set and
+	// the card's own BEGIN/END/VERSION frame do not count.
+	r, ok := Parse([]byte(card(
+		"VERSION:4.0\r\n" +
+			"FN:Grace Hopper\r\n" +
+			"N:Hopper;Grace;;;\r\n" +
+			"ADR;TYPE=home:;;1 Infinite Loop;Cupertino;CA;;;\r\n" +
+			"ADR;TYPE=work:;;2 Main St;;;;\r\n" +
+			"PHOTO;ENCODING=b:AAAA\r\n" +
+			"X-SPOUSE:M\r\n" +
+			"REV:2024-01-01T00:00:00Z\r\n")))
+	if !ok || len(r.Cards) != 1 {
+		t.Fatalf("r=%+v ok=%v", r, ok)
+	}
+	c := r.Cards[0]
+	want := map[string]int{"N": 1, "ADR": 2, "PHOTO": 1, "X-SPOUSE": 1, "REV": 1}
+	if len(c.Other) != len(want) {
+		t.Fatalf("other=%v want %v", c.Other, want)
+	}
+	for k, n := range want {
+		if c.Other[k] != n {
+			t.Fatalf("other[%q]=%d want %d (all=%v)", k, c.Other[k], n, c.Other)
+		}
+	}
+}
+
+func TestOtherAbsentOnHonouredOnlyCard(t *testing.T) {
+	r, ok := Parse([]byte(card(
+		"VERSION:4.0\r\nFN:Ada Lovelace\r\nEMAIL:ada@example.com\r\n")))
+	if !ok || len(r.Cards) != 1 {
+		t.Fatalf("r=%+v ok=%v", r, ok)
+	}
+	if len(r.Cards[0].Other) != 0 {
+		t.Fatalf("a fully-honoured card carries no Other: %v", r.Cards[0].Other)
+	}
+}
+
 func TestMultiCardFirstN(t *testing.T) {
 	body := ""
 	for i := 0; i < MaxCards+2; i++ {

@@ -4,7 +4,8 @@
 // + the M85a primary protocol, the same encoder imgcat proved), the first
 // qlTextLines of a text file, page one of a document rendered by the M89
 // pdf engine into the same sixel path at the same 96x64 cap (M192e
-// #3250), or a type/size/mtime card for everything else (mtime by the
+// #3250), a .vcf's painted contact card with its GOMAIL hand-off (M193c
+// #3255), or a type/size/mtime card for everything else (mtime by the
 // M134a slot-79 stat — meta_guest.go/meta_host.go own the platform
 // half). Space or Esc hands the frame back to the list; j/k scroll a
 // text arm taller than the pane.
@@ -25,6 +26,7 @@ import (
 	"virelai/mime"
 	"virelai/pdf"
 	"virelai/rss/keys"
+	"virelai/vcard"
 	"virelai/vi"
 	"virelai/webrender"
 )
@@ -78,6 +80,24 @@ type quickLook struct {
 	cellH      uint32
 	doc        bool // the raster is a document's page one, not an image file
 	pages      int  // the document's page count (the subtitle's 1/N)
+
+	// M193c (#3255): the contact-card face's payload on the card arm —
+	// non-nil when the pane shows a .vcf's parsed cards instead of the
+	// type/size/mtime facts.
+	ct *qlContact
+}
+
+// qlContact is the M193c contact face's state: the parse's honoured
+// prefix and its refusals, the one card the face paints (idx — a
+// multi-card file steps with n/N, never a taller card), the highlighted
+// email row the mail hand-off fires on (mail), or the named refusal the
+// bytes earned (refuse — the same honesty rule as the card arm's
+// refuse word).
+type qlContact struct {
+	res    vcard.Result
+	idx    int
+	mail   int
+	refuse string
 }
 
 // decodeImage is the decode seam — webrender.DecodeImage in both builds —
@@ -200,6 +220,18 @@ func (m *model) openQuickLook() {
 		id := mime.Sniff(ql.name, head)
 		ql.typeName = id.String()
 		switch {
+		case isVCFPath(ql.name):
+			// M193c (#3255): a .vcf's claim is the contact face —
+			// extension-named like the opens=text/vcard route itself.
+			// The listing's own size refuses SourceLimit before the
+			// read (the document arm's rule); the read's own failure
+			// and the parse's refusals name themselves on the card.
+			ql.typeName = "text/vcard"
+			if ql.size > maxContactBytes {
+				ql.ct = &qlContact{refuse: "SourceLimit"}
+			} else {
+				ql.ct = armContact(data, rc)
+			}
 		case rc < 0:
 			ql.kind = qlCard
 		case id == mime.Image && ql.armImage(data):
@@ -261,6 +293,18 @@ func (m *model) openQL(ql quickLook) {
 		m.emit(markerQuick + ql.name + " kind=text lines=" +
 			vi.Itoa64(int64(len(ql.lines))))
 	default:
+		if ql.ct != nil {
+			// M193c: the contact face's DECISION names itself, then
+			// the shown card's rows — the same marker family the
+			// serial face printed, post-paint like every receipt.
+			msg := markerQuick + ql.name + " kind=contact"
+			if ql.ct.refuse != "" {
+				msg += " refused=" + ql.ct.refuse
+			}
+			m.emit(msg)
+			m.emitContact()
+			break
+		}
 		msg := markerQuick + ql.name + " kind=card type=" + ql.typeName
 		if ql.refuse != "" {
 			msg += " refused=" + ql.refuse
@@ -285,9 +329,14 @@ func (m *model) closeQuickLook() {
 
 // qlKey is the modeQuickLook keyboard contract: space/Esc/backspace close,
 // the nav keys scroll a text arm inside its 40-line window, Ctrl-C quits.
-// Every other key is swallowed — the pane owns the keyboard while it
-// stands, like every other modal surface in this app.
+// The contact face owns its own contract (contactKey — M193c). Every other
+// key is swallowed — the pane owns the keyboard while it stands, like
+// every other modal surface in this app.
 func (m *model) qlKey(ev keys.Event) {
+	if m.ql.ct != nil {
+		m.contactKey(ev)
+		return
+	}
 	switch ev.Key {
 	case keys.KeyEsc, keys.KeyBackspace:
 		m.closeQuickLook()
@@ -469,14 +518,30 @@ func (m model) qlSubtitle() string {
 	case qlText:
 		return "text · " + vi.Itoa64(int64(len(m.ql.lines))) + " lines"
 	default:
+		if ct := m.ql.ct; ct != nil {
+			// M193c: the contact face's facts row — the refusal when
+			// the bytes never yielded a card, the 1/N position in the
+			// honoured prefix otherwise.
+			if ct.refuse != "" {
+				return "contact · refused " + ct.refuse
+			}
+			if len(ct.res.Cards) == 0 {
+				return "contact · no honoured card"
+			}
+			return "contact · card " + vi.Itoa64(int64(ct.idx+1)) + "/" +
+				vi.Itoa64(int64(len(ct.res.Cards)))
+		}
 		return "card · " + m.ql.typeName
 	}
 }
 
 // qlCardRows is the card arm's body: name, type, size, mtime and ctime —
 // and for a mount-table row the kernel's own state words instead of a
-// stat it cannot serve.
+// stat it cannot serve. A .vcf's card is the M193c contact face instead.
 func (m model) qlCardRows() []string {
+	if m.ql.ct != nil {
+		return m.contactRows()
+	}
 	out := []string{"  " + m.ql.name}
 	if m.ql.vol != "" {
 		out = append(out,
@@ -669,4 +734,362 @@ func sixelNumber(b *bytes.Buffer, n int) {
 		}
 	}
 	b.Write(digits[i:])
+}
+
+// --- .vcf contact-card face (M193c #3255) ----------------------------------
+//
+// One face, three doors. The opens=text/vcard exec line (`exec
+// GOFILES.ELF <path>.vcf`) opens the pane on the parsed card over the
+// parent dir's listing (main hands the path to openContact); space on a
+// .vcf row arms the same face through the sniff switch; a .vcf dropped
+// mid-session paints where it lands (dropContact → openContactBlob).
+// What the pane shows is a bounded renderer over vcard.Parse: FN/ORG/
+// TEL/EMAIL rows, the unhonoured properties named-counted, one honoured
+// card at a time — never M187d's serial rows in a window.
+//
+// The highlighted email row is the 'mail this address' hand-off: Enter
+// (or 'm') queues GOMAIL.ELF's `send --to <addr>` — the only compose
+// entrypoint GOMAIL owns — through the same launch seam every other
+// open dispatch takes, so the kernel's refusal is named by drainLaunch
+// rather than faked here.
+//
+// Field values pass contactField (sanitizePreview flattened to one
+// line) so a hostile FN cannot smuggle escape bytes into the frame or a
+// serial marker — the serial face's own rule.
+
+// markerContact is the contact face's marker family — `gofiles: contact
+// fn=…` rows mirroring the painted card, and `mail <addr>` naming the
+// hand-off the exec line carries.
+const markerContact = "gofiles: contact "
+
+// maxContactBytes bounds the .vcf read — one contact file is a few
+// hundred bytes; the cap is the honest too-large boundary.
+const maxContactBytes = 64 * 1024
+
+// contactFieldMax bounds one list the face paints (tels, emails, and
+// the mail cursor's reach): past it the rows count what they cannot
+// show ("+n more"), never a taller card.
+const contactFieldMax = 6
+
+// isVCFPath is the face's admission: the opens= route and the sniff
+// switch both route on the extension, exactly like fileMime's
+// text/vcard spelling. A directory named *.vcf parses as a refusal, not
+// a listing — the same refusal any non-vcard file gets.
+func isVCFPath(p string) bool {
+	return strings.HasSuffix(strings.ToLower(p), ".vcf")
+}
+
+// armContact decides the face's payload: the honoured parse, or the
+// named refusal — an unreadable read, the SourceLimit the read bound
+// earns (a ≥64 KiB .vcf is refused by name, never parsed halfway), or
+// the parser's own "not-vcard".
+func armContact(data []byte, rc int64) *qlContact {
+	ct := &qlContact{}
+	switch {
+	case rc < 0:
+		ct.refuse = "unreadable rc=" + vi.Itoa64(rc)
+	case len(data) >= maxContactBytes:
+		ct.refuse = "SourceLimit" // the read bound — goreader's word
+	default:
+		res, ok := vcard.Parse(data)
+		if !ok {
+			ct.refuse = "not-vcard"
+		} else {
+			ct.res = res
+		}
+	}
+	return ct
+}
+
+// openContact is the opens=text/vcard exec line's face: the .vcf the
+// kernel handed argv parses into the pane over the parent's listing.
+func (m *model) openContact(path string) {
+	ql := quickLook{name: baseName(path), path: path, kind: qlCard, typeName: "text/vcard"}
+	data, rc := readHead(path, maxContactBytes)
+	ql.ct = armContact(data, rc)
+	m.openQL(ql)
+}
+
+// openContactBlob is the drop half of opens=text/vcard: the seat's
+// admission already filtered the mime, so the payload paints where it
+// lands — the same face, fed by bytes instead of a path.
+func (m *model) openContactBlob(b []byte) {
+	ql := quickLook{name: "drop", kind: qlCard, typeName: "text/vcard"}
+	ql.ct = armContact(b, int64(len(b)))
+	m.openQL(ql)
+}
+
+// contactRows is the contact face's body: the honoured card's FN
+// headline, ORG/TEL/EMAIL rows inside the field bound (overflows named
+// "+n more"), the highlighted email row carrying the hand-off's own
+// words, the unhonoured properties named-counted, then the accounting —
+// the 1/N card position, each refused card's why, the truncated tail.
+func (m model) contactRows() []string {
+	ct := m.ql.ct
+	if ct.refuse != "" {
+		return []string{
+			"  " + contactField(m.ql.name),
+			"  refused  " + ct.refuse,
+		}
+	}
+	res := ct.res
+	if len(res.Cards) == 0 {
+		out := []string{
+			"  " + contactField(m.ql.name),
+			"  (no honoured card)",
+		}
+		for _, rf := range res.Refusals {
+			out = append(out, "  refused  "+rf.Why)
+		}
+		return out
+	}
+	c := res.Cards[ct.idx]
+	out := []string{"  " + contactField(c.FN)}
+	if c.ORG != "" {
+		out = append(out, "  org      "+contactField(c.ORG))
+	}
+	for i, t := range c.TEL {
+		if i >= contactFieldMax {
+			out = append(out, "  tel      +"+vi.Itoa64(int64(len(c.TEL)-i))+" more")
+			break
+		}
+		out = append(out, "  tel      "+contactField(t))
+	}
+	shown := len(c.EMAIL)
+	if shown > contactFieldMax {
+		shown = contactFieldMax
+	}
+	for i := 0; i < shown; i++ {
+		cur := "  "
+		if i == ct.mail {
+			cur = "> "
+		}
+		row := cur + "email    " + contactField(c.EMAIL[i])
+		if i == ct.mail {
+			row += "  · enter mails via GOMAIL"
+		}
+		out = append(out, row)
+	}
+	if len(c.EMAIL) > shown {
+		out = append(out, "  email    +"+vi.Itoa64(int64(len(c.EMAIL)-shown))+" more")
+	}
+	if len(c.EMAIL) == 0 {
+		out = append(out, "  mail     — (no address)")
+	}
+	if len(c.Other) > 0 {
+		out = append(out, "  also     "+otherFieldsLine(c.Other))
+	}
+	if len(res.Cards) > 1 {
+		out = append(out, "  cards    "+vi.Itoa64(int64(ct.idx+1))+"/"+
+			vi.Itoa64(int64(len(res.Cards)))+" · n/N steps")
+	}
+	for _, rf := range res.Refusals {
+		out = append(out, "  refused  "+rf.Why)
+	}
+	if over := res.Total - len(res.Cards) - len(res.Refusals); over > 0 {
+		out = append(out, "  truncated "+vi.Itoa64(int64(over))+" over the parse bound")
+	}
+	return out
+}
+
+// otherFieldsLine renders the named-count of properties the bound does
+// not carry — "ADR=2 N=1" in name order, the tail counted past six
+// names. Sorted so the row never depends on map order.
+func otherFieldsLine(other map[string]int) string {
+	names := make([]string, 0, len(other))
+	for n := range other {
+		names = append(names, n)
+	}
+	for i := 1; i < len(names); i++ {
+		for j := i; j > 0 && names[j] < names[j-1]; j-- {
+			names[j], names[j-1] = names[j-1], names[j]
+		}
+	}
+	var b strings.Builder
+	const maxOtherNames = 6
+	for i, n := range names {
+		if i >= maxOtherNames {
+			b.WriteString(" +")
+			b.WriteString(vi.Itoa64(int64(len(names) - i)))
+			break
+		}
+		if i > 0 {
+			b.WriteByte(' ')
+		}
+		b.WriteString(n)
+		b.WriteByte('=')
+		b.WriteString(vi.Itoa64(int64(other[n])))
+	}
+	return b.String()
+}
+
+// emitContact mirrors the painted card to serial — the same rows the
+// face shows, so a gate reading markers sees exactly what painted. On a
+// card step the new card's rows re-emit: the serial always describes
+// the card on screen, never the whole file.
+func (m *model) emitContact() {
+	ct := m.ql.ct
+	if ct.refuse != "" {
+		m.emit(markerContact + "refused " + ct.refuse)
+		return
+	}
+	res := ct.res
+	if len(res.Cards) == 0 {
+		m.emit(markerContact + "refused empty")
+		for _, rf := range res.Refusals {
+			m.emit(markerContact + "refused " + rf.Why)
+		}
+		return
+	}
+	c := res.Cards[ct.idx]
+	m.emit(markerContact + "fn=" + contactField(c.FN))
+	if c.ORG != "" {
+		m.emit(markerContact + "org=" + contactField(c.ORG))
+	}
+	for i, t := range c.TEL {
+		if i >= contactFieldMax {
+			m.emit(markerContact + "truncated tel +" +
+				vi.Itoa64(int64(len(c.TEL)-i)))
+			break
+		}
+		m.emit(markerContact + "tel=" + contactField(t))
+	}
+	shown := len(c.EMAIL)
+	if shown > contactFieldMax {
+		shown = contactFieldMax
+	}
+	for i := 0; i < shown; i++ {
+		m.emit(markerContact + "email=" + contactField(c.EMAIL[i]))
+	}
+	if len(c.EMAIL) > shown {
+		m.emit(markerContact + "truncated email +" +
+			vi.Itoa64(int64(len(c.EMAIL)-shown)))
+	}
+	if len(c.Other) > 0 {
+		m.emit(markerContact + "also=" + otherFieldsLine(c.Other))
+	}
+	for _, rf := range res.Refusals {
+		m.emit(markerContact + "refused " + rf.Why)
+	}
+	line := markerContact + "done cards=" + vi.Itoa64(int64(len(res.Cards)))
+	if res.Total != len(res.Cards) {
+		line += " total=" + vi.Itoa64(int64(res.Total))
+	}
+	m.emit(line)
+}
+
+// contactKey is the contact face's keyboard contract: j/k and the
+// verticals move the mail cursor inside the shown card's bounded email
+// list, n/N or the horizontals step the honoured cards one at a time,
+// Enter/'m' fires the mail hand-off, space/Esc/backspace close,
+// Ctrl-C quits.
+func (m *model) contactKey(ev keys.Event) {
+	switch ev.Key {
+	case keys.KeyEsc, keys.KeyBackspace:
+		m.closeQuickLook()
+	case keys.KeyUp:
+		m.contactStep(-1)
+	case keys.KeyDown:
+		m.contactStep(1)
+	case keys.KeyLeft:
+		m.contactCardStep(-1)
+	case keys.KeyRight:
+		m.contactCardStep(1)
+	case keys.KeyEnter:
+		m.contactMail()
+	case keys.KeyCtrlC:
+		m.quit = true
+	case keys.KeyRune:
+		switch ev.Rune {
+		case ' ':
+			m.closeQuickLook()
+		case 'j':
+			m.contactStep(1)
+		case 'k':
+			m.contactStep(-1)
+		case 'n':
+			m.contactCardStep(1)
+		case 'N':
+			m.contactCardStep(-1)
+		case 'm':
+			m.contactMail()
+		}
+	}
+}
+
+// contactStep moves the mail cursor inside the shown card's painted
+// email list — the bound's own reach, clamped at both ends.
+func (m *model) contactStep(delta int) {
+	ct := m.ql.ct
+	if ct == nil || ct.refuse != "" || len(ct.res.Cards) == 0 {
+		return
+	}
+	shown := len(ct.res.Cards[ct.idx].EMAIL)
+	if shown > contactFieldMax {
+		shown = contactFieldMax
+	}
+	if shown == 0 {
+		return
+	}
+	ct.mail += delta
+	if ct.mail < 0 {
+		ct.mail = 0
+	}
+	if ct.mail >= shown {
+		ct.mail = shown - 1
+	}
+}
+
+// contactCardStep turns a multi-card file one card at a time, clamped —
+// the cursor lands on the new card's first mail row and the marker set
+// re-mirrors the card now on screen.
+func (m *model) contactCardStep(delta int) {
+	ct := m.ql.ct
+	if ct == nil || len(ct.res.Cards) < 2 {
+		return
+	}
+	ct.idx += delta
+	if ct.idx < 0 {
+		ct.idx = 0
+	}
+	if ct.idx >= len(ct.res.Cards) {
+		ct.idx = len(ct.res.Cards) - 1
+	}
+	ct.mail = 0
+	m.emitContact()
+}
+
+// contactMail is the 'mail this address' hand-off: the highlighted
+// email row queues GOMAIL.ELF's `send --to <addr>` through the launch
+// seam — the decision marker names the address and the handler, and
+// drainLaunch names the outcome. A card with no address says so on the
+// status row instead of queueing a doomed exec.
+func (m *model) contactMail() {
+	ct := m.ql.ct
+	if ct == nil || ct.refuse != "" || len(ct.res.Cards) == 0 {
+		m.status = "contact: no card to mail"
+		return
+	}
+	c := ct.res.Cards[ct.idx]
+	shown := len(c.EMAIL)
+	if shown > contactFieldMax {
+		shown = contactFieldMax
+	}
+	if shown == 0 {
+		m.status = "contact: no address to mail"
+		return
+	}
+	if ct.mail >= shown {
+		ct.mail = shown - 1
+	}
+	addr := c.EMAIL[ct.mail]
+	m.emit(markerContact + "mail " + contactField(addr) + " handler=GOMAIL.ELF")
+	m.launch = launchReq{bin: "GOMAIL.ELF", args: []string{"send", "--to", addr}}
+	m.status = "mail " + contactField(addr) + " via GOMAIL"
+}
+
+// contactField is the face-safe form of one card field: sanitized like
+// a preview line, flattened to one line — the serial face's own rule.
+func contactField(s string) string {
+	return strings.ReplaceAll(sanitizePreview([]byte(s)), "\n", " ")
 }

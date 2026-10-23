@@ -4,7 +4,9 @@
 // The bound is the card's: BEGIN:VCARD in VERSION 3.0 or 4.0 carrying
 // FN, TEL, EMAIL and ORG — the contact-card fields. Everything else an
 // exporter writes (N, ADR, PHOTO, REV, folded notes, custom X- rows) is
-// skipped by shape. What the bound cannot honour is a named refusal:
+// skipped by shape but NEVER silently: Card.Other names and counts each
+// unhonoured property so the face can account for what it did not paint
+// (M193c #3255). What the bound cannot honour is a named refusal:
 //
 //	not-vcard   no BEGIN:VCARD anywhere in the bytes
 //	version     a VERSION that is not 3.0 or 4.0 — the field
@@ -27,6 +29,10 @@ type Card struct {
 	ORG   string
 	TEL   []string
 	EMAIL []string
+	// Other names-and-counts the properties the bound does not honour —
+	// N, ADR, PHOTO, custom X- rows. A contact face prints them as an
+	// accounting row rather than dropping them silently (M193c #3255).
+	Other map[string]int
 }
 
 // Refusal names the why on a rejected file or card.
@@ -78,7 +84,7 @@ func Parse(b []byte) (Result, bool) {
 				inCard = false
 			}
 		default:
-			if !inCard || cur == nil {
+			if !inCard || cur == nil || name == "" {
 				continue
 			}
 			switch name {
@@ -99,6 +105,13 @@ func Parse(b []byte) (Result, bool) {
 				}
 			case "ORG":
 				cur.ORG = unescape(strings.TrimSpace(value))
+			default:
+				// A property the bound does not carry: named and
+				// counted on the card, never dropped silently.
+				if cur.Other == nil {
+					cur.Other = map[string]int{}
+				}
+				cur.Other[name]++
 			}
 		}
 	}

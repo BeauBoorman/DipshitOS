@@ -371,3 +371,212 @@ func TestSixelEncodeRLEAndPaletteBound(t *testing.T) {
 		t.Fatalf("a 97px-wide raster must refuse with errSixelBounds, got %v", err)
 	}
 }
+
+// --- M193c (#3255): the .vcf contact-card face ---------------------------
+
+// vcfFixture is one honoured card with an unhonoured tail — the shape
+// the contact face lays out, N counted on the `also` row.
+const vcfFixture = "BEGIN:VCARD\r\n" +
+	"VERSION:4.0\r\n" +
+	"FN:Grace Hopper\r\n" +
+	"ORG:Cognition\r\n" +
+	"TEL;TYPE=cell:+1-555-0100\r\n" +
+	"EMAIL:grace@example.com\r\n" +
+	"EMAIL:hopper@navy.mil\r\n" +
+	"N:Hopper;Grace;;;\r\n" +
+	"END:VCARD\r\n"
+
+func TestQuickLookContactFaceRows(t *testing.T) {
+	fileBacker(t, map[string][]byte{"/host/FM/CONTACT.VCF": []byte(vcfFixture)})
+	m := testModel(entry("CONTACT.VCF", false))
+	m.handleKey(runeKey(' '))
+	if m.mode != modeQuickLook || m.ql.ct == nil || m.ql.kind != qlCard {
+		t.Fatalf("space on a .vcf must open the contact face: mode=%d ct=%v",
+			m.mode, m.ql.ct)
+	}
+	got := pendingJoined(&m)
+	for _, want := range []string{
+		markerQuick + "CONTACT.VCF kind=contact",
+		"gofiles: contact fn=Grace Hopper",
+		"gofiles: contact org=Cognition",
+		"gofiles: contact tel=+1-555-0100",
+		"gofiles: contact email=grace@example.com",
+		"gofiles: contact email=hopper@navy.mil",
+		"gofiles: contact also=N=1",
+		"gofiles: contact done cards=1",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("contact marker %q missing: %q", want, got)
+		}
+	}
+	frame := m.render()
+	for _, want := range []string{
+		"contact · card 1/1",
+		"  Grace Hopper",
+		"org      Cognition",
+		"tel      +1-555-0100",
+		"> email    grace@example.com  · enter mails via GOMAIL",
+		"also     N=1",
+	} {
+		if !strings.Contains(frame, want) {
+			t.Fatalf("card row %q missing from the frame", want)
+		}
+	}
+	if strings.Contains(frame, "\x1bPq") {
+		t.Fatal("the contact face must not emit a sixel")
+	}
+}
+
+func TestContactMailHandoffQueuesGOMAIL(t *testing.T) {
+	fileBacker(t, map[string][]byte{"/host/FM/CONTACT.VCF": []byte(vcfFixture)})
+	m := testModel(entry("CONTACT.VCF", false))
+	m.handleKey(runeKey(' '))
+	// j moves the mail cursor to the second address; Enter fires it.
+	m.handleKey(runeKey('j'))
+	if m.ql.ct.mail != 1 {
+		t.Fatalf("j must move the mail cursor: mail=%d", m.ql.ct.mail)
+	}
+	m.handleKey(keys.Event{Key: keys.KeyEnter})
+	lr, ok := m.takeLaunch()
+	if !ok || lr.bin != "GOMAIL.ELF" {
+		t.Fatalf("the hand-off must queue GOMAIL.ELF: %+v ok=%v", lr, ok)
+	}
+	if len(lr.args) != 3 || lr.args[0] != "send" || lr.args[1] != "--to" ||
+		lr.args[2] != "hopper@navy.mil" {
+		t.Fatalf("hand-off argv = %v, want send --to hopper@navy.mil", lr.args)
+	}
+	if lr.path != "" {
+		t.Fatalf("the mail hand-off carries no file path: %q", lr.path)
+	}
+	if got := pendingJoined(&m); !strings.Contains(got,
+		"gofiles: contact mail hopper@navy.mil handler=GOMAIL.ELF") {
+		t.Fatalf("hand-off decision marker missing: %q", got)
+	}
+}
+
+func TestContactFaceRefusalsAreNamed(t *testing.T) {
+	// Not a vcard at all — the extension claims it, the parse names it.
+	fileBacker(t, map[string][]byte{
+		"/host/FM/BAD.VCF": []byte("a text file that borrowed a .vcf name"),
+	})
+	m := testModel(entry("BAD.VCF", false))
+	m.handleKey(runeKey(' '))
+	if m.ql.ct == nil || m.ql.ct.refuse != "not-vcard" {
+		t.Fatalf("bad vcf = ct=%+v", m.ql.ct)
+	}
+	got := pendingJoined(&m)
+	for _, want := range []string{
+		markerQuick + "BAD.VCF kind=contact refused=not-vcard",
+		"gofiles: contact refused not-vcard",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("refusal marker %q missing: %q", want, got)
+		}
+	}
+	frame := m.render()
+	if !strings.Contains(frame, "refused  not-vcard") {
+		t.Fatal("the face must name the refusal")
+	}
+	// Oversized: the read bound refuses by name before the parse runs.
+	big := entry("BIG.VCF", false)
+	big.Size = maxContactBytes + 1
+	m = testModel(big)
+	m.handleKey(runeKey(' '))
+	if m.ql.ct == nil || m.ql.ct.refuse != "SourceLimit" {
+		t.Fatalf("oversized vcf = ct=%+v", m.ql.ct)
+	}
+	m.handleKey(runeKey('m'))
+	if _, ok := m.takeLaunch(); ok {
+		t.Fatal("a refused card must not queue a mail hand-off")
+	}
+}
+
+func TestContactFaceBoundsAndCardStep(t *testing.T) {
+	// Two honoured cards, the first carrying more fields than the face's
+	// bound: overflow rows name "+n more", n steps to the second card.
+	var b strings.Builder
+	b.WriteString("BEGIN:VCARD\r\nVERSION:4.0\r\nFN:Many Fields\r\n")
+	for i := 0; i < contactFieldMax+3; i++ {
+		b.WriteString("TEL:+1-555-000" + string(rune('0'+i)) + "\r\n")
+	}
+	b.WriteString("END:VCARD\r\n")
+	b.WriteString("BEGIN:VCARD\r\nVERSION:4.0\r\nFN:Second Person\r\n" +
+		"EMAIL:two@example.com\r\nEND:VCARD\r\n")
+	fileBacker(t, map[string][]byte{"/host/FM/MULTI.VCF": []byte(b.String())})
+	m := testModel(entry("MULTI.VCF", false))
+	m.handleKey(runeKey(' '))
+	frame := m.render()
+	if !strings.Contains(frame, "tel      +3 more") {
+		t.Fatal("the tel overflow must be named on the card")
+	}
+	if !strings.Contains(frame, "cards    1/2") {
+		t.Fatal("the multi-card accounting row is missing")
+	}
+	m.handleKey(runeKey('n'))
+	if m.ql.ct.idx != 1 || m.ql.ct.mail != 0 {
+		t.Fatalf("n must step to card 2 with the cursor reset: %+v", m.ql.ct)
+	}
+	if !strings.Contains(m.render(), "  Second Person") {
+		t.Fatal("card 2 must paint after the step")
+	}
+	if got := pendingJoined(&m); !strings.Contains(got, "gofiles: contact fn=Second Person") {
+		t.Fatalf("the card step must re-mirror the shown card: %q", got)
+	}
+	// 'm' mails the stepped card's single address.
+	m.handleKey(runeKey('m'))
+	lr, ok := m.takeLaunch()
+	if !ok || lr.args[2] != "two@example.com" {
+		t.Fatalf("hand-off after the step = %+v", lr)
+	}
+	// N past the first card clamps — no wrap, no panic.
+	m.handleKey(runeKey('N'))
+	if m.ql.ct.idx != 0 {
+		t.Fatalf("N must step back: idx=%d", m.ql.ct.idx)
+	}
+	m.handleKey(runeKey('N'))
+	if m.ql.ct.idx != 0 {
+		t.Fatalf("N at the first card clamps: idx=%d", m.ql.ct.idx)
+	}
+}
+
+func TestContactMailNoAddressNamesItself(t *testing.T) {
+	fileBacker(t, map[string][]byte{"/host/FM/NOMAIL.VCF": []byte(
+		"BEGIN:VCARD\r\nVERSION:4.0\r\nFN:No Address\r\nEND:VCARD\r\n")})
+	m := testModel(entry("NOMAIL.VCF", false))
+	m.handleKey(runeKey(' '))
+	if !strings.Contains(m.render(), "mail     — (no address)") {
+		t.Fatal("the face must name the absent hand-off")
+	}
+	m.handleKey(runeKey('m'))
+	if _, ok := m.takeLaunch(); ok {
+		t.Fatal("a card with no address must not queue a hand-off")
+	}
+	if m.status != "contact: no address to mail" {
+		t.Fatalf("status = %q", m.status)
+	}
+}
+
+func TestOpenContactArgvFace(t *testing.T) {
+	// The opens=text/vcard exec line's face: openContact arms the pane
+	// on the path directly — the same card space on the row earns.
+	fileBacker(t, map[string][]byte{"/host/FMV/CONTACT.VCF": []byte(vcfFixture)})
+	m := testModel(entry("CONTACT.VCF", false))
+	m.path = "/host/FMV"
+	m.openContact("/host/FMV/CONTACT.VCF")
+	if m.mode != modeQuickLook || m.ql.ct == nil {
+		t.Fatalf("the argv face must stand on the pane: mode=%d ct=%v",
+			m.mode, m.ql.ct)
+	}
+	if got := pendingJoined(&m); !strings.Contains(got,
+		"gofiles: contact fn=Grace Hopper") {
+		t.Fatalf("the argv face must mirror the card: %q", got)
+	}
+	if !strings.Contains(m.render(), "  Grace Hopper") {
+		t.Fatal("the argv face must paint the card")
+	}
+	// Esc hands the frame back to the parent's listing.
+	m.handleKey(keys.Event{Key: keys.KeyEsc})
+	if m.mode != modeNormal {
+		t.Fatalf("esc must close the face to the listing: mode=%d", m.mode)
+	}
+}

@@ -100,7 +100,7 @@
 # app's own marker; an app that never ran, never renamed, never settled or
 # never refused cannot pass.
 
-vgate_name go-fileman "M74a + M81a #1761 + M125c #2588 + M124b #2581 + M124d #2583 + M134b #2760 + M149a #2806 + M155a #2929 + M155b #2930 + M155c #2931 + M155d #2932 + M167a #2989 + M167b #2992 + M167c #2993 + M160c #2994 + M192e #3250: GOFILES navigates, previews, renames, trashes, restores, opens files, picks paths, resumes its session, opens with the right-click menu, lists the kernel mount table, spacebar-QuickLooks image, text and a PDF's page one, answers file properties with its ctime, birth, on-disk bytes and volume free facts, batch-moves and batch-deletes a marked set, and content-searches a seeded subtree within bounds, and runs the props + batch-move + search journey three times over, and toggles a thumbnail grid of cell-mosaic tiles with the focused image as a real sixel, and pins folders into FILES.FAV favorites that list with gone pins named missing, and browses a .tar in place as a read-only virtual directory with QuickLook on its members, and (M187d #3185) routes a .vcf through the opens=text/vcard manifest row into the contact-card face"
+vgate_name go-fileman "M74a + M81a #1761 + M125c #2588 + M124b #2581 + M124d #2583 + M134b #2760 + M149a #2806 + M155a #2929 + M155b #2930 + M155c #2931 + M155d #2932 + M167a #2989 + M167b #2992 + M167c #2993 + M160c #2994 + M192e #3250 + M193c #3255: GOFILES navigates, previews, renames, trashes, restores, opens files, picks paths, resumes its session, opens with the right-click menu, lists the kernel mount table, spacebar-QuickLooks image, text and a PDF's page one, answers file properties with its ctime, birth, on-disk bytes and volume free facts, batch-moves and batch-deletes a marked set, and content-searches a seeded subtree within bounds, and runs the props + batch-move + search journey three times over, and toggles a thumbnail grid of cell-mosaic tiles with the focused image as a real sixel, and pins folders into FILES.FAV favorites that list with gone pins named missing, and browses a .tar in place as a read-only virtual directory with QuickLook on its members, and routes a .vcf through the opens=text/vcard manifest row into a painted contact-card face whose email row hands off to GOMAIL's send --to"
 vgate_share seed
 vgate_runner_flags -Xswiftc -DSPIKE
 
@@ -2325,19 +2325,25 @@ print("FMD3 verified: M1..M3 moved into INTO byte-exact; " +
       " alloc=" + m.group(2) + " free=" + m.group(3))
 PY
 
-# --- M187d (#3185): run 21 — the .vcf contact card via Open With ----------
+# --- M193c (#3255): run 21 — the .vcf contact-card face + GOMAIL hand-off --
 # GOFILES in /host/FMV on the kernel desktop (the run 01–10 shape),
 # right-click CONTACT.VCF, descend "Open With…". The manifest's opens=
 # rows decide the submenu: text/vcard is accepted by the bare text
 # family (NOTE, GOEDIT, GOSHEET) AND by GOFILES's own opens=text/vcard
 # subtype row — four candidates, the manager itself at row 2. Picking it
-# execs the opens= route's line (`GOFILES.ELF <path>.vcf`), whose argv
-# face parses the VCARD and prints the contact rows on serial — a
-# details face like `vol`, never a window. The pointer clicks mirror
-# run 10's: same window origin, same list row, the submenu row one step
-# deeper (GOFILES sits under GOEDIT in manifest order).
+# execs the opens= route's line (`GOFILES.ELF <path>.vcf`), whose face is
+# now real: a second GOFILES window opens on the parent dir with the
+# pane painting the parsed card — FN/ORG/TEL/EMAIL rows, N named-counted
+# on the `also` row — and the highlighted email row carrying the 'mail
+# this address' hand-off. `dui focus 3` hands the new window the keys
+# (the same anchor every phase-1 boot uses), and Enter execs
+# `GOMAIL.ELF send --to grace@example.com` — the only compose entrypoint
+# GOMAIL owns; its serial receipt (account line or the named refusal
+# with no GOMAIL.TXT staged) is the third reporter. The pointer clicks
+# mirror run 10's: same window origin, same list row, the submenu row
+# one step deeper (GOFILES sits under GOEDIT in manifest order).
 vgate_setup_python <<'PY'
-import os
+import os, shutil, sys
 share = os.environ.get("VG_SHARE") or os.path.join(os.environ["RUN_DIR"], "share")
 fmv = os.path.join(share, "FMV")
 os.makedirs(fmv, exist_ok=True)
@@ -2349,28 +2355,45 @@ with open(os.path.join(fmv, "CONTACT.VCF"), "w", newline="") as f:
         "ORG:Cognition",
         "TEL;TYPE=cell:+1-555-0100",
         "EMAIL:grace@example.com",
+        "N:Hopper;Grace;;;",
         "END:VCARD",
         ""]))
-print("staged FMV/CONTACT.VCF")
+# The hand-off's target: GOMAIL-GATE is the gate-roots build (the
+# go-mail.spec pattern) staged under the name the opens= argv names.
+gomail = os.path.join(".build", "go", "GOMAIL-GATE.ELF")
+if not os.path.exists(gomail):
+    sys.exit("GOMAIL-GATE.ELF missing (expected " + gomail + ") - build it "
+             "first: bash tools/go/build-web.sh gomail GOMAIL --gate")
+shutil.copy(gomail, os.path.join(share, "GOMAIL.ELF"))
+print("staged FMV/CONTACT.VCF + GOMAIL.ELF")
 PY
 
 vgate_file script-21.txt <<'EOF'
 exec GOFILES.ELF /host/FMV
 EOF
 
+vgate_file script2-21.txt <<'EOF'
+dui focus 3
+EOF
+
 vgate_file script3-21.txt <<'EOF'
+dui close 3
 dui close 2
 echo rx-go-fileman-contact-ok
 EOF
 
 vgate_run 21 -- \
     --screen '$RUN_DIR/fileman-contact-screen' \
-    --via-virtio \
+    --input --via-virtio \
     --script '$RUN_DIR/script-21.txt' \
     --pointer-virtio '40,88,rc;68,104,c;172,136,c' \
     --pointer-virtio-after 'gofiles: ready' \
+    --script2 '$RUN_DIR/script2-21.txt' \
+    --script2-after 'gofiles: contact done cards=1' \
+    --input-chords 'return' \
+    --input-chords-after 'dui focus: focused=3' \
     --script3 '$RUN_DIR/script3-21.txt' \
-    --script3-after 'gofiles: contact done cards=1' \
+    --script3-after 'gomail: closed' \
     --script-expect 'rx-go-fileman-contact-ok' --timeout 300
 
 vgate_assert 21 serial-contains 'exec: loaded GOFILES.ELF'
@@ -2382,16 +2405,33 @@ vgate_assert 21 serial-contains 'gofiles: entry CONTACT.VCF file'
 vgate_assert 21 serial-contains 'gofiles: menu CONTACT.VCF mime=text/vcard apps=4'
 vgate_assert 21 serial-contains 'gofiles: menu openwith CONTACT.VCF mime=text/vcard candidates=4'
 
-# The pick and the launch: the decision/outcome marker pair, and the
-# launched GOFILES's own argv face printing the card's fields.
+# The pick and the launch: the decision/outcome marker pair — the second
+# GOFILES is the contact face's window, listing the card's parent dir.
 vgate_assert 21 serial-contains 'gofiles: open chose CONTACT.VCF type=text handler=GOFILES.ELF'
 vgate_assert 21 serial-contains 'gofiles: open launched CONTACT.VCF handler=GOFILES.ELF pid='
+vgate_assert 21 serial-contains 'gofiles: list /host/FMV n=1'
+
+# The painted card's serial mirror: the DECISION row then the shown
+# card's fields — the `also` row name-counting the N the bound skips.
+vgate_assert 21 serial-contains 'gofiles: quicklook CONTACT.VCF kind=contact'
 vgate_assert 21 serial-contains 'gofiles: contact fn=Grace Hopper'
 vgate_assert 21 serial-contains 'gofiles: contact org=Cognition'
 vgate_assert 21 serial-contains 'gofiles: contact tel=+1-555-0100'
 vgate_assert 21 serial-contains 'gofiles: contact email=grace@example.com'
+vgate_assert 21 serial-contains 'gofiles: contact also=N=1'
 vgate_assert 21 serial-contains 'gofiles: contact done cards=1'
 
+# The mail hand-off: Enter on the highlighted email row names the exec
+# line, the launch outcome follows, and GOMAIL's own receipt prints —
+# no GOMAIL.TXT staged, so 'account missing host' is the honest answer.
+# ('exec: loaded' is the console's own marker; an in-app launch never
+# earns one — the gomail: pair IS the exec's evidence.)
+vgate_assert 21 serial-contains 'gofiles: contact mail grace@example.com handler=GOMAIL.ELF'
+vgate_assert 21 serial-contains 'gofiles: open launched grace@example.com handler=GOMAIL.ELF pid='
+vgate_assert 21 serial-contains 'gomail: account missing host'
+vgate_assert 21 serial-contains 'gomail: closed'
+
+vgate_assert 21 serial-contains 'dui close: closed=3'
 vgate_assert 21 serial-contains 'dui close: closed=2'
 vgate_assert 21 serial-contains 'rx-go-fileman-contact-ok'
 vgate_assert 21 serial-absent 'gofiles: open launch refused'
