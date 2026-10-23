@@ -43,7 +43,7 @@ All of them additionally answer to the schema-v2 manifest grammar
 | Code Editor | app | GOEDIT.ELF | appver 1 | tools/gate/specs/go-edit.spec | shipped |
 | Files | app | GOFILES.ELF | appver 1 | tools/gate/specs/go-fileman.spec | shipped |
 | Terminal | app | GOTERM.ELF | appver 2 | tools/gate/specs/go-term.spec | shipped |
-| Web | app | WEB.ELF | — | tools/gate/specs/live-web.spec | shipped |
+| Web | app | WEB.ELF | appver 1 | tools/gate/specs/live-web.spec | shipped |
 | Pulse | app | PULSE.ELF | — | — | shipped |
 | Shell | app | GOSH.ELF | — | tools/gate/specs/go-sh.spec | shipped |
 | Help | app | GOHELP.ELF | — | tools/gate/specs/go-help.spec | shipped |

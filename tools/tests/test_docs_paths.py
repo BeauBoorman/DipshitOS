@@ -17,7 +17,8 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[2]
-DOCS = ["docs/TEAMS.md", "docs/app-authoring.md", "docs/component-registry.md"]
+DOCS = ["docs/TEAMS.md", "docs/app-authoring.md", "docs/app-refresh.md",
+        "docs/component-registry.md"]
 
 BACKTICK = re.compile(r"`([^`\n]+)`")
 # A token is a repo-path candidate when it contains a '/', a glob '*',

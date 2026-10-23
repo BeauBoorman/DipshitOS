@@ -11,8 +11,10 @@ and fails when:
   * a cited tools/gate/specs/*.spec, `ADR NNNN`, `Release*` const, or
     repo path does not resolve;
   * an `appver N` cell disagrees with the `StateVersion` the app's
-    package under user/go/ registers with the tabapp harness — in either
-    direction, so a new registration showing `—` is drift too;
+    package under user/go/ registers with the tabapp harness — or with
+    the version a non-tabapp app stamps on the envelope itself via a
+    direct `PostStateSave` call — in either direction, so a new
+    registration showing `—` is drift too;
   * a cell carries a kind/state/version token outside the grammar the
     registry documents in its "Row grammar" section.
 """
@@ -38,6 +40,13 @@ APPVER_RE = re.compile(r"^appver\s+(\d+)$")
 PIN_RE = re.compile(r"^pin\s+(\S+)$")
 RELEASE_CONST_RE = re.compile(r"^Release[A-Z][A-Za-z0-9]*$")
 STATEVERSION_RE = re.compile(r"StateVersion:\s*([A-Za-z_][A-Za-z0-9_]*|\d+)")
+# An app outside the tabapp harness stamps the envelope itself; the
+# version is PostStateSave's second argument. The trailing [,)] keeps a
+# dotted receiver (t.StateVersion) from matching — that is a field read,
+# not a literal the const pass can resolve.
+POSTSTATESAVE_RE = re.compile(
+    r"PostStateSave\([^,]+,\s*([A-Za-z_][A-Za-z0-9_]*|\d+)\s*[,)]"
+)
 
 
 def registry_rows():
@@ -114,13 +123,17 @@ def app_package_dir(binary):
 
 
 def registered_state_versions(pkg_dir):
-    """The distinct integer StateVersions a package registers.
+    """The distinct integer versions a package stamps on state envelopes.
 
-    Two passes: collect `StateVersion:` field values across the package,
-    then resolve const-valued ones against every non-test file (the
-    registration and the const usually live in different files). A set is
-    returned so more than one distinct value is visible to the caller —
-    one registration is the contract, two is ambiguity the test flags.
+    Two surfaces feed it: `StateVersion:` field values (tabapp
+    registrations) and the version argument of direct `PostStateSave`
+    calls (apps that carry the envelope outside the harness, like
+    browser's stateAppVer). Two passes: collect literal and const-token
+    values across the package, then resolve const-valued ones against
+    every non-test file (the registration and the const usually live in
+    different files). A set is returned so more than one distinct value
+    is visible to the caller — one registration is the contract, two is
+    ambiguity the test flags.
     """
     texts = [
         go.read_text(errors="replace")
@@ -130,12 +143,13 @@ def registered_state_versions(pkg_dir):
     values = set()
     pending = []
     for text in texts:
-        for m in STATEVERSION_RE.finditer(text):
-            token = m.group(1)
-            if token.isdigit():
-                values.add(int(token))
-            else:
-                pending.append(token)
+        for pattern in (STATEVERSION_RE, POSTSTATESAVE_RE):
+            for m in pattern.finditer(text):
+                token = m.group(1)
+                if token.isdigit():
+                    values.add(int(token))
+                else:
+                    pending.append(token)
     for token in pending:
         pat = re.compile(
             r"(?:const\s+)?" + re.escape(token) + r"\s*(?:u?int?\d*\s*)?=\s*(\d+)\b"
