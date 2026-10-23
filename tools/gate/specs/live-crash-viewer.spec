@@ -218,3 +218,54 @@ report(go_crashes(1))
 assert "STRACE.ELF" not in serial, "separate tracer process is forbidden"
 capture()
 PY
+
+# ---------------------------------------------------------------------------
+# M161b (#2974): the seat watchdog. CRASHFIX's wedge mode answers the state
+# asks for 5 s then stops polling them — two unanswered rounds earn the
+# not-responding banner. The Close chord runs the ordinary close seam, the
+# kernel tears the window down, and the fixture — asleep but watching its
+# own window — exits. `idle` is the control: it answers forever and must
+# never draw a wedged line.
+vgate_file wedge.txt <<'EOF2'
+exec CRASHFIX.ELF wedge 5
+EOF2
+
+vgate_file wedge-done.txt <<'EOF2'
+echo rx-wedge-ok
+EOF2
+
+vgate_run 07 -- --screen '$RUN_DIR/wd-wedge' --via-virtio --script '$RUN_DIR/wedge.txt' --script-after 'gotabwm: present' --input-chords 'ctrl-shift-w' --input-chords-after 'gotabwm: watchdog wedged' --script2 '$RUN_DIR/wedge-done.txt' --script2-after 'gotabwm: watchdog closed' --script-expect 'rx-wedge-ok' --timeout 150
+vgate_assert 07 serial-contains 'gotabwm: watchdog force-quit armed'
+vgate_assert 07 serial-contains 'crashfix: wedge secs=5'
+vgate_assert 07 serial-contains 'crashfix: wedged'
+vgate_assert 07 serial-contains 'gotabwm: watchdog wedged id='
+vgate_assert 07 serial-contains 'gotabwm: watchdog closed id='
+vgate_assert 07 serial-contains ' how=close'
+vgate_assert 07 serial-contains 'crashfix: window gone'
+vgate_assert 07 serial-contains 'rx-wedge-ok'
+# Wedge->close ordering, and the process really exited (status 0).
+vgate_assert 07 python <<'PY'
+import os, re, sys
+ser = open(os.environ["VG_SER"], errors="replace").read()
+wedged = re.search(r"gotabwm: watchdog wedged id=(\d+) app=(\S+) rounds=(\d+)", ser)
+assert wedged, "no wedged marker"
+closed = re.search(r"gotabwm: watchdog closed id=%s how=close" % wedged[1], ser)
+assert closed and closed.start() > wedged.end(), "no matching closed how=close after wedged"
+assert re.search(r"tasks user-exec exited status=0", ser[closed.end():]), "CRASHFIX did not exit after Close"
+assert "watchdog recovered" not in ser, "a still-asleep app must not report recovery"
+print("watchdog wedge ok: id=%s app=%s rounds=%s" % wedged.groups())
+PY
+
+vgate_file idle.txt <<'EOF2'
+exec CRASHFIX.ELF idle
+EOF2
+
+vgate_file idle-done.txt <<'EOF2'
+echo rx-idle-ok
+EOF2
+
+vgate_run 08 -- --screen '$RUN_DIR/wd-idle' --via-virtio --script '$RUN_DIR/idle.txt' --script-after 'gotabwm: present' --script2 '$RUN_DIR/idle-done.txt' --script2-after 'crashfix: idle alive=60' --script-expect 'rx-idle-ok' --timeout 150
+vgate_assert 08 serial-contains 'crashfix: idle'
+vgate_assert 08 serial-contains 'crashfix: idle alive=60'
+vgate_assert 08 serial-absent 'gotabwm: watchdog wedged'
+vgate_assert 08 serial-contains 'rx-idle-ok'

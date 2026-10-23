@@ -149,6 +149,10 @@ func collectStateAsks() {
 func serveStateSave(req vi.WmRpc) bool {
 	id := uint32(req.ID)
 	stateAskPend[req.ID] = false
+	// M161b (#2974): a served kind-20 is the app's proof of life — the
+	// watchdog's answer latch runs before any early return below, because
+	// "the app answered" and "the blob decoded" are separate verdicts.
+	watchdogNoteAnswer(req.ID)
 	i := tabs.index(id)
 	if i < 0 {
 		return false

@@ -1039,6 +1039,14 @@ func handleWmPointer(e vi.Event) {
 		return
 	}
 	if down {
+		// M161b (#2974): a not-responding banner is chrome over its pane —
+		// painted under the toasts and modal menus (checked above) but
+		// over the app's content, so its press is consumed here and never
+		// forwarded. The hit decides consumption like the toast's does.
+		if wid, act := watchdogHit(px, py, vi.ScanoutWidth, vi.ScanoutHeight); wid != 0 {
+			watchdogPress(wid, act)
+			return
+		}
 		if powerBtnHit(px, py, vi.ScanoutWidth, vi.ScanoutHeight) {
 			menuGesture = true
 			railDragFrom, contentDown, sashDragging = -1, false, false

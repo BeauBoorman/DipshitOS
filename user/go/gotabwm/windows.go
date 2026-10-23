@@ -356,6 +356,13 @@ func launcherWindowEvent(e vi.Event) {
 		// quit (0) — the crash arm runs while the row is still live so
 		// writeSession records it for the next boot's re-exec.
 		pid, status, crashed := seatCrashStatus(id)
+		// M161b (#2974): a force-quit the watchdog armed is an ordered
+		// kill, not a crash — wdKilled keeps the status-137 exit from
+		// parking a snapshot slot and restarting the app the user just
+		// asked to be rid of.
+		if crashed && wdKilled[id] {
+			crashed = false
+		}
 		if crashed {
 			crashLog(MarkerCrash + "id=" + vi.Itoa64(int64(id)) +
 				" pid=" + vi.Itoa64(int64(pid)) +

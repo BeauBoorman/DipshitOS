@@ -185,6 +185,11 @@ func dropRpcBinding(id uint32) {
 	// M124e (#2584): a staged selection handoff dies the same way. The
 	// seat's primary BUFFER survives — it outlives its publisher.
 	dropSelWindow(id)
+	// M161b (#2974): the liveness record, banner state and the kill latch
+	// die with the window they describe — a reused id is never born
+	// wedged, never inherits an outstanding ask, and never suppresses a
+	// real crash under its predecessor's force-quit flag.
+	watchdogDrop(id)
 }
 
 func dropAllRpcBindings() {
@@ -771,13 +776,25 @@ func closeTabByID(id uint32) bool {
 	// window dies — the app's blob lands on its record in time for
 	// CloseTab to carry it into the reopen LIFO. Bounded: a dead or
 	// silent app costs stateAskRounds once.
-	askStateSave(id, "close")
+	// M161b (#2974): skip the ask when the watchdog has already proven the
+	// app cannot answer — a wedged or spinning pane would only burn the
+	// collect's full round budget on silence it already reported.
+	if id > 255 || (!wdWedged[id] && !wdBusy[id]) {
+		askStateSave(id, "close")
+	}
 	collectStateAsks()
 	if closeWin(id) != 0 {
 		return false
 	}
 	vi.ConsoleLine(MarkerHostClose + vi.Itoa64(int64(id)))
 	vi.ConsoleLine(MarkerTabClose + vi.Itoa64(int64(id)))
+	// M161b (#2974): a flagged pane leaving through the close path is the
+	// watchdog's `closed how=close` — the banner's Close verb, the close
+	// chord, and the close-x all land here, so the marker lives here too
+	// (the flags survive until the mirror's dropRpcBinding).
+	if id <= 255 && (wdWedged[id] || wdBusy[id]) {
+		wdLog(MarkerWatchdogClosed + "id=" + vi.Itoa64(int64(id)) + " how=close")
+	}
 	closed := tabs.CloseTab(id)
 	syncHostedFromStrip()
 	if closed {
