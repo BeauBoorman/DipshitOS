@@ -24,6 +24,10 @@
 # header and body hits with no dial at all. Run 09 is the cache-miss
 # leg: a dead transport names itself offline, paints remembered rows,
 # and refuses seq 9 by name; run 10 serves a remembered body offline.
+# Runs c1-c3 (M193d #3256) are the comms-chain mail leg, K=3: `send
+# --to grace@example.com` — the exact argv shape the M193c contact
+# face's mail-them row execs (two-token --to, no subject/body flags) —
+# submits over SMTP+TLS, the fixture transcript carrying the RCPT.
 #
 # exec-order: assert-proven — runs end on markers only the app prints
 # from fixture traffic ('gomail: refuse attachment report.pdf',
@@ -37,7 +41,7 @@
 # binary is what every run execs under the GOMAIL.ELF name. Fixture
 # transcripts land in $RUN_DIR/maild-<port>.log for the python asserts.
 
-vgate_name go-mail "M187c #3184 + M193a #3253: GOMAIL.ELF — IMAP4 fetch/list/read + SMTP submit over tls.Dial (pinned fixture chain), plaintext consent refusal + grant, attachment/html truth-in-bounds, + use-able folders, bounded /host/MAIL cache, offline search + cache-miss legs"
+vgate_name go-mail "M187c #3184 + M193a #3253 + M193d #3256: GOMAIL.ELF — IMAP4 fetch/list/read + SMTP submit over tls.Dial (pinned fixture chain), plaintext consent refusal + grant, attachment/html truth-in-bounds, + use-able folders, bounded /host/MAIL cache, offline search + cache-miss legs, + the chain's send --to leg in the contact face's own argv shape, K=3"
 vgate_share seed
 vgate_runner_flags -Xswiftc -DSPIKE
 
@@ -645,7 +649,106 @@ vgate_assert 10 serial-contains 'gomail: offline read INBOX 1'
 vgate_assert 10 serial-contains 'gomail: body 1 text/plain'
 vgate_assert 10 serial-contains 'gomail: text line one of the gate body'
 vgate_assert 10 serial-contains 'gomail: closed'
-vgate_assert 10 serial-absent 'gomail: dial'
-vgate_assert 10 serial-absent 'gomail: cache-miss'
-vgate_assert 10 serial-absent 'gomail: error'
-vgate_assert 10 serial-absent '[EXC] parking:'
+
+# --- Runs c1-c3 (M193d #3256): the chain's mail leg, K=3 ---------------
+# The contact card's mail-them row execs `GOMAIL.ELF send --to
+# grace@example.com` — the two-token --to form, no subject/body flags.
+# Each leg drives that same verb shape at the SMTP+TLS fixture (the
+# --tls flag stands in for the account file's transport row, which the
+# spec's GOMAIL.TXT deliberately lacks): 'gomail: rcpt
+# grace@example.com' is the argv's own echo and the transcript's
+# RCPT TO:<grace@example.com> is the wire-level receipt. Three
+# identical tagged runs is the K=3 acceptance — the same boot, three
+# times, unchanged.
+vgate_file script-c.txt <<'EOF'
+net ip 10.0.0.1
+net arp 10.0.0.2
+exec GOMAIL.ELF --tls send --to grace@example.com
+EOF
+
+vgate_run c1 -- \
+    --screen '$RUN_DIR/screen-c1' \
+    --via-virtio \
+    --net '$RUN_DIR/cap-c1.bin' --net-arp-respond 10.0.0.2 \
+    --net-tcp-respond 10.0.0.2:465:relay --net-tcp-respond-relay 127.0.0.1:26465 \
+    --script '$RUN_DIR/script-c.txt' --script-expect 'gomail: sent bytes=' --timeout 240
+
+vgate_assert c1 serial-contains 'gomail: account /host/GOMAIL.TXT'
+vgate_assert c1 serial-contains 'gomail: dial 10.0.0.2 465 tls'
+vgate_assert c1 serial-contains 'gomail: smtp ready'
+vgate_assert c1 serial-contains 'gomail: mail gate@fixture.local'
+vgate_assert c1 serial-contains 'gomail: rcpt grace@example.com'
+vgate_assert c1 serial-contains 'gomail: sent bytes='
+vgate_assert c1 serial-contains 'gomail: closed'
+vgate_assert c1 serial-absent 'gomail: error'
+vgate_assert c1 serial-absent 'gomail: refuse'
+vgate_assert c1 serial-absent '[EXC] parking:'
+vgate_assert c1 python <<'PY'
+import os, sys
+log = open(os.path.join(os.environ["RUN_DIR"], "maild-26465.log")).read()
+need = ["c1 rx RCPT TO:<grace@example.com>",
+        "c1 rx MAIL FROM:<gate@fixture.local>",
+        "c1 rx DATA", "c1 rx .", "c1 rx QUIT",
+        "tx 250 2.0.0 queued as m001"]
+missing = [n for n in need if n not in log]
+if missing:
+    sys.exit("chain smtp fixture transcript missing: %r\n%s" % (missing, log))
+PY
+
+vgate_run c2 -- \
+    --screen '$RUN_DIR/screen-c2' \
+    --via-virtio \
+    --net '$RUN_DIR/cap-c2.bin' --net-arp-respond 10.0.0.2 \
+    --net-tcp-respond 10.0.0.2:465:relay --net-tcp-respond-relay 127.0.0.1:26465 \
+    --script '$RUN_DIR/script-c.txt' --script-expect 'gomail: sent bytes=' --timeout 240
+
+vgate_assert c2 serial-contains 'gomail: account /host/GOMAIL.TXT'
+vgate_assert c2 serial-contains 'gomail: dial 10.0.0.2 465 tls'
+vgate_assert c2 serial-contains 'gomail: smtp ready'
+vgate_assert c2 serial-contains 'gomail: mail gate@fixture.local'
+vgate_assert c2 serial-contains 'gomail: rcpt grace@example.com'
+vgate_assert c2 serial-contains 'gomail: sent bytes='
+vgate_assert c2 serial-contains 'gomail: closed'
+vgate_assert c2 serial-absent 'gomail: error'
+vgate_assert c2 serial-absent 'gomail: refuse'
+vgate_assert c2 serial-absent '[EXC] parking:'
+vgate_assert c2 python <<'PY'
+import os, sys
+log = open(os.path.join(os.environ["RUN_DIR"], "maild-26465.log")).read()
+need = ["c2 rx RCPT TO:<grace@example.com>",
+        "c2 rx MAIL FROM:<gate@fixture.local>",
+        "c2 rx DATA", "c2 rx .", "c2 rx QUIT",
+        "tx 250 2.0.0 queued as m001"]
+missing = [n for n in need if n not in log]
+if missing:
+    sys.exit("chain smtp fixture transcript missing: %r\n%s" % (missing, log))
+PY
+
+vgate_run c3 -- \
+    --screen '$RUN_DIR/screen-c3' \
+    --via-virtio \
+    --net '$RUN_DIR/cap-c3.bin' --net-arp-respond 10.0.0.2 \
+    --net-tcp-respond 10.0.0.2:465:relay --net-tcp-respond-relay 127.0.0.1:26465 \
+    --script '$RUN_DIR/script-c.txt' --script-expect 'gomail: sent bytes=' --timeout 240
+
+vgate_assert c3 serial-contains 'gomail: account /host/GOMAIL.TXT'
+vgate_assert c3 serial-contains 'gomail: dial 10.0.0.2 465 tls'
+vgate_assert c3 serial-contains 'gomail: smtp ready'
+vgate_assert c3 serial-contains 'gomail: mail gate@fixture.local'
+vgate_assert c3 serial-contains 'gomail: rcpt grace@example.com'
+vgate_assert c3 serial-contains 'gomail: sent bytes='
+vgate_assert c3 serial-contains 'gomail: closed'
+vgate_assert c3 serial-absent 'gomail: error'
+vgate_assert c3 serial-absent 'gomail: refuse'
+vgate_assert c3 serial-absent '[EXC] parking:'
+vgate_assert c3 python <<'PY'
+import os, sys
+log = open(os.path.join(os.environ["RUN_DIR"], "maild-26465.log")).read()
+need = ["c3 rx RCPT TO:<grace@example.com>",
+        "c3 rx MAIL FROM:<gate@fixture.local>",
+        "c3 rx DATA", "c3 rx .", "c3 rx QUIT",
+        "tx 250 2.0.0 queued as m001"]
+missing = [n for n in need if n not in log]
+if missing:
+    sys.exit("chain smtp fixture transcript missing: %r\n%s" % (missing, log))
+PY

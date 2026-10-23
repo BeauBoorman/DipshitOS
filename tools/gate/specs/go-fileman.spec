@@ -84,7 +84,7 @@
 # third window). Three identical tagged runs is the acceptance itself:
 # the journey either passes unchanged on every boot or it is not done.
 #
-# M192e (#3250) adds run 21: the document arm of the spacebar pane.
+# M192e (#3250) adds run 22: the document arm of the spacebar pane.
 # FMPDF holds a seeded two-tone single-page PDF and a .pdf-named text
 # file. Space on the non-document earns the card arm with the engine's
 # refusal named on the marker; the real document renders page one
@@ -95,12 +95,27 @@
 # render lands in that gap — and the close script's settle is stretched
 # past it so the pane still stands when the framebuffer is read.
 #
+# M193c (#3255) adds run 21: a seeded CONTACT.VCF opens through the
+# opens=text/vcard manifest row into a painted contact-card face, and
+# Enter on the email row execs `GOMAIL.ELF send --to grace@example.com`
+# — the receipt is GOMAIL's own 'account missing host' because no
+# account file is aboard.
+#
+# M193d (#3256) adds runs c1-c3: the comms-chain leg, K=3. The same
+# .vcf -> card -> mail-them path, but each boot script first clones a
+# staged CHAINMAIL.TXT onto GOMAIL.TXT (a clone inside the leg's own
+# boot, so run 21's missing-account refusal keeps its coverage): the
+# exec'd `send --to` dials the SMTP fixture over TLS and submits, and
+# the wire transcript's RCPT TO:<grace@example.com> is the argv-level
+# proof — no compose window exists, so the exec line is the honest
+# surface.
+#
 # exec-order: assert-proven -- each run ends on its own `rx-go-fileman-*`
 # marker, which only its closing script prints, and that script waits on the
 # app's own marker; an app that never ran, never renamed, never settled or
 # never refused cannot pass.
 
-vgate_name go-fileman "M74a + M81a #1761 + M125c #2588 + M124b #2581 + M124d #2583 + M134b #2760 + M149a #2806 + M155a #2929 + M155b #2930 + M155c #2931 + M155d #2932 + M167a #2989 + M167b #2992 + M167c #2993 + M160c #2994 + M192e #3250 + M193c #3255: GOFILES navigates, previews, renames, trashes, restores, opens files, picks paths, resumes its session, opens with the right-click menu, lists the kernel mount table, spacebar-QuickLooks image, text and a PDF's page one, answers file properties with its ctime, birth, on-disk bytes and volume free facts, batch-moves and batch-deletes a marked set, and content-searches a seeded subtree within bounds, and runs the props + batch-move + search journey three times over, and toggles a thumbnail grid of cell-mosaic tiles with the focused image as a real sixel, and pins folders into FILES.FAV favorites that list with gone pins named missing, and browses a .tar in place as a read-only virtual directory with QuickLook on its members, and routes a .vcf through the opens=text/vcard manifest row into a painted contact-card face whose email row hands off to GOMAIL's send --to"
+vgate_name go-fileman "M74a + M81a #1761 + M125c #2588 + M124b #2581 + M124d #2583 + M134b #2760 + M149a #2806 + M155a #2929 + M155b #2930 + M155c #2931 + M155d #2932 + M167a #2989 + M167b #2992 + M167c #2993 + M160c #2994 + M192e #3250 + M193c #3255 + M193d #3256: GOFILES navigates, previews, renames, trashes, restores, opens files, picks paths, resumes its session, opens with the right-click menu, lists the kernel mount table, spacebar-QuickLooks image, text and a PDF's page one, answers file properties with its ctime, birth, on-disk bytes and volume free facts, batch-moves and batch-deletes a marked set, and content-searches a seeded subtree within bounds, and runs the props + batch-move + search journey three times over, and toggles a thumbnail grid of cell-mosaic tiles with the focused image as a real sixel, and pins folders into FILES.FAV favorites that list with gone pins named missing, and browses a .tar in place as a read-only virtual directory with QuickLook on its members, and routes a .vcf through the opens=text/vcard manifest row into a painted contact-card face whose email row hands off to GOMAIL's send --to — the chain leg carrying an account so the exec'd argv completes a real SMTP+TLS submit"
 vgate_share seed
 vgate_runner_flags -Xswiftc -DSPIKE
 
@@ -1295,7 +1310,7 @@ vgate_run 14 -- \
     --script-expect 'gofiles OK' --timeout 240
 
 vgate_assert 14 serial-contains 'gofiles: ready'
-vgate_assert 14 serial-contains 'gofiles: hints n=49'
+vgate_assert 14 serial-contains 'gofiles: hints n=53'
 vgate_assert 14 serial-contains 'gofiles: hints row ctrl+shift+p summon the command palette'
 vgate_assert 14 serial-contains 'gofiles: hints row ctrl+shift+c copy the terminal selection'
 vgate_assert 14 serial-contains 'gofiles: hints row ctrl+shift+k clear the terminal scrollback'
@@ -2328,9 +2343,9 @@ PY
 # --- M193c (#3255): run 21 — the .vcf contact-card face + GOMAIL hand-off --
 # GOFILES in /host/FMV on the kernel desktop (the run 01–10 shape),
 # right-click CONTACT.VCF, descend "Open With…". The manifest's opens=
-# rows decide the submenu: text/vcard is accepted by the bare text
-# family (NOTE, GOEDIT, GOSHEET) AND by GOFILES's own opens=text/vcard
-# subtype row — four candidates, the manager itself at row 2. Picking it
+# rows decide the submenu: text/vcard draws the text-family acceptors
+# plus GOFILES's own opens=text/vcard subtype row — five candidates,
+# the manager itself at row 2. Picking it
 # execs the opens= route's line (`GOFILES.ELF <path>.vcf`), whose face is
 # now real: a second GOFILES window opens on the parent dir with the
 # pane painting the parsed card — FN/ORG/TEL/EMAIL rows, N named-counted
@@ -2401,9 +2416,9 @@ vgate_assert 21 serial-contains 'gofiles: list /host/FMV n=1'
 vgate_assert 21 serial-contains 'gofiles: entry CONTACT.VCF file'
 
 # The menu read the subtype spelling and the manifest rows: the bare
-# text family plus the new text/vcard row — four candidates.
-vgate_assert 21 serial-contains 'gofiles: menu CONTACT.VCF mime=text/vcard apps=4'
-vgate_assert 21 serial-contains 'gofiles: menu openwith CONTACT.VCF mime=text/vcard candidates=4'
+# text family plus the new text/vcard row — five candidates.
+vgate_assert 21 serial-contains 'gofiles: menu CONTACT.VCF mime=text/vcard apps=5'
+vgate_assert 21 serial-contains 'gofiles: menu openwith CONTACT.VCF mime=text/vcard candidates=5'
 
 # The pick and the launch: the decision/outcome marker pair — the second
 # GOFILES is the contact face's window, listing the card's parent dir.
@@ -2439,7 +2454,7 @@ vgate_assert 21 serial-absent 'gofiles: menu closed'
 vgate_assert 21 serial-absent 'gofiles: contact refused'
 vgate_assert 21 serial-absent '[EXC] parking:'
 vgate_assert 21 serial-absent 'exited status=139'
-# --- M192e (#3250) run 21: QuickLook's document arm -------------------
+# --- M192e (#3250) run 22: QuickLook's document arm -------------------
 # FMPDF holds two rows, name-sorted: BAD.PDF (a text file wearing the
 # extension — the engine's UnsupportedStructure is the card's named
 # refusal) then PAGE.PDF (a real single-page document — two field fills,
@@ -2450,11 +2465,11 @@ vgate_assert 21 serial-absent 'exited status=139'
 # teardown, so it anchors both the scanout and the close script — the
 # pane still stands when the capture reads it (the run-16 barrier
 # pattern: markers flush post-paint).
-vgate_file script-21.txt <<'EOFQ'
+vgate_file script-22.txt <<'EOFQ'
 exec GOFILES.ELF /host/FMPDF
 EOFQ
 
-vgate_file script2-21.txt <<'EOFQ'
+vgate_file script2-22.txt <<'EOFQ'
 dui close 2
 echo rx-go-fileman-quicklook-pdf-ok
 EOFQ
@@ -2494,33 +2509,33 @@ with open(os.path.join(fmpdf, "BAD.PDF"), "wb") as f:
 print("staged FMPDF: BAD.PDF + PAGE.PDF (%d bytes, red/blue page one)" % len(pdf))
 PY
 
-vgate_run 21 -- \
+vgate_run 22 -- \
     --screen '$RUN_DIR/fileman-quicklook-pdf' \
     --input --via-virtio \
-    --script '$RUN_DIR/script-21.txt' \
+    --script '$RUN_DIR/script-22.txt' \
     --input-chords 'space,escape,j,space' \
     --input-chords-after 'gofiles: ready' \
     --screenshot-after 'gofiles: quicklook PAGE.PDF kind=pdf' \
     --screenshot-after-delay 1 \
-    --script2 '$RUN_DIR/script2-21.txt' \
+    --script2 '$RUN_DIR/script2-22.txt' \
     --script2-after 'gofiles: quicklook PAGE.PDF kind=pdf' \
     --script2-delay 3 \
     --script-expect 'gofiles OK' --timeout 240
 
-vgate_assert 21 serial-contains 'exec: loaded GOFILES.ELF'
-vgate_assert 21 serial-contains 'gofiles: list /host/FMPDF n=2'
-vgate_assert 21 serial-contains 'gofiles: entry BAD.PDF file'
-vgate_assert 21 serial-contains 'gofiles: entry PAGE.PDF file'
+vgate_assert 22 serial-contains 'exec: loaded GOFILES.ELF'
+vgate_assert 22 serial-contains 'gofiles: list /host/FMPDF n=2'
+vgate_assert 22 serial-contains 'gofiles: entry BAD.PDF file'
+vgate_assert 22 serial-contains 'gofiles: entry PAGE.PDF file'
 # The non-document wears the engine's refusal by name on the card marker.
-vgate_assert 21 serial-contains 'gofiles: quicklook BAD.PDF kind=card type=document refused=UnsupportedStructure'
-vgate_assert 21 serial-contains 'gofiles: quicklook close'
+vgate_assert 22 serial-contains 'gofiles: quicklook BAD.PDF kind=card type=document refused=UnsupportedStructure'
+vgate_assert 22 serial-contains 'gofiles: quicklook close'
 # Page one armed the sixel path at the bank bound — named, not an image.
-vgate_assert 21 serial-contains 'gofiles: quicklook PAGE.PDF kind=pdf 96x64 thumb=96x64'
-vgate_assert 21 serial-contains 'gofiles: close'
-vgate_assert 21 serial-contains 'gofiles OK'
-vgate_assert 21 serial-contains 'rx-go-fileman-quicklook-pdf-ok'
-vgate_assert 21 serial-absent '[EXC] parking:'
-vgate_assert 21 serial-absent 'exited status=139'
+vgate_assert 22 serial-contains 'gofiles: quicklook PAGE.PDF kind=pdf 96x64 thumb=96x64'
+vgate_assert 22 serial-contains 'gofiles: close'
+vgate_assert 22 serial-contains 'gofiles OK'
+vgate_assert 22 serial-contains 'rx-go-fileman-quicklook-pdf-ok'
+vgate_assert 22 serial-absent '[EXC] parking:'
+vgate_assert 22 serial-absent 'exited status=139'
 
 # The scanout: the same 2x capture the run-16 assert reads (client
 # x=64..1088 y=96..832, cell 16x32 px). The 96x64 thumb centres in the
@@ -2528,7 +2543,7 @@ vgate_assert 21 serial-absent 'exited status=139'
 # x=480..672, y=384..512. Page one's two fills land red on the left
 # half (x<576) and blue on the right — the same hue-preserving-shift
 # dominance the M149a boxes carry, inset past the cell edges.
-vgate_assert 21 snapshot 'fileman-quicklook-pdf-after' <<'PY'
+vgate_assert 22 snapshot 'fileman-quicklook-pdf-after' <<'PY'
 import struct, sys, zlib
 
 d = open(sys.argv[1], "rb").read()
@@ -2595,4 +2610,344 @@ blue = count(592, 662, 392, 504,
 print("pdf page-one sixel: red=%d blue=%d" % (red, blue))
 assert red >= 2000, "page-one left field ink absent from the pane"
 assert blue >= 2000, "page-one right field ink absent from the pane"
+PY
+# --- M193d (#3256): runs c1-c3 — the comms chain leg, K=3 --------------
+# The run-21 path again — seeded CONTACT.VCF, right-click "Open With…",
+# the painted contact face, Enter on the email row — but each of these
+# boots carries an account: the script clears any GOMAIL.TXT a sibling
+# iteration left and clones the staged CHAINMAIL.TXT into place (a clone
+# inside the leg's own boot, so run 21's 'account missing host' refusal
+# keeps its coverage). The exec'd `GOMAIL.ELF send --to
+# grace@example.com` — no flags, the exact argv the face produces —
+# dials the SMTP fixture over TLS and submits. 'gomail: rcpt
+# grace@example.com' is the argv's own echo and the fixture
+# transcript's RCPT TO:<grace@example.com> is the wire-level receipt:
+# the exec line IS the assert, there is no compose window. Three
+# identical tagged runs is the acceptance itself (the d1-d3 pattern):
+# the chain passes unchanged on every boot or it is not done.
+vgate_setup_python <<'PY'
+import os, shutil, subprocess, sys, time
+
+run = os.environ["RUN_DIR"]
+share = os.environ.get("VG_SHARE") or os.path.join(run, "share")
+
+gomail = os.path.join(".build", "go", "GOMAIL-GATE.ELF")
+if not os.path.exists(gomail):
+    sys.exit("GOMAIL-GATE.ELF missing (expected " + gomail + ") - build it "
+             "first: bash tools/go/build-web.sh gomail GOMAIL --gate")
+shutil.copy(gomail, os.path.join(share, "GOMAIL.ELF"))
+
+# The account the chain boots clone into place — tls=on is the stored
+# transport answer, so the flag-free exec'd argv dials SMTP:465 over
+# TLS at 10.0.0.2 with the pinned fixture chain's SNI.
+with open(os.path.join(share, "CHAINMAIL.TXT"), "w") as f:
+    f.write("# go-fileman chain-leg account\n"
+            "host=10.0.0.2\n"
+            "user=gate\n"
+            "pass=gate-pass\n"
+            "from=gate@fixture.local\n"
+            "sni=leaf.example.com\n"
+            "tls=on\n")
+print("staged CHAINMAIL.TXT (account for the chain boots' clone)")
+
+# A multi-connection SMTP+TLS fixture — the go-mail.spec pattern,
+# trimmed to submission only; c1-c3 each open one session.
+fixture = os.path.join(run, "chainmaild.py")
+with open(fixture, "w") as f:
+    f.write('''
+import socket, ssl, sys, time
+
+port, logpath, cert, key = int(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4]
+logf = open(logpath, "w", buffering=1)
+
+def log(s):
+    logf.write(s + "\\n")
+
+def send(conn, line):
+    conn.sendall(line.encode() + b"\\r\\n")
+    log("tx " + line)
+
+def recvline(conn, buf):
+    while b"\\n" not in buf:
+        chunk = conn.recv(4096)
+        if not chunk:
+            return None, buf
+        buf += chunk
+    line, buf = buf.split(b"\\n", 1)
+    return line.decode("utf-8", "replace").rstrip("\\r"), buf
+
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+ctx.minimum_version = ssl.TLSVersion.TLSv1_3
+ctx.maximum_version = ssl.TLSVersion.TLSv1_3
+ctx.load_cert_chain(cert, key)
+
+srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+srv.bind(("127.0.0.1", port))
+srv.listen(4)
+srv.settimeout(1800)
+log("listening smtp-tls")
+
+for idx in range(4):
+    conn, _ = srv.accept()
+    conn = ctx.wrap_socket(conn, server_side=True)
+    log("c%d tls ok" % idx)
+    send(conn, "220 fixture ESMTP ready")
+    buf = b""
+    data = False
+    deadline = time.time() + 120
+    while time.time() < deadline:
+        conn.settimeout(max(1.0, deadline - time.time()))
+        try:
+            line, buf = recvline(conn, buf)
+        except socket.timeout:
+            break
+        if line is None:
+            break
+        log("c%d rx %s" % (idx, line))
+        if data:
+            if line == ".":
+                data = False
+                send(conn, "250 2.0.0 queued as m001")
+            continue
+        verb = line.split(" ", 1)[0].upper()
+        if verb in ("EHLO", "HELO"):
+            send(conn, "250-fixture greets virelai")
+            send(conn, "250 AUTH PLAIN")
+        elif verb == "AUTH":
+            send(conn, "235 2.7.0 authenticated")
+        elif verb == "MAIL":
+            send(conn, "250 2.1.0 sender ok")
+        elif verb == "RCPT":
+            send(conn, "250 2.1.5 rcpt ok")
+        elif verb == "DATA":
+            send(conn, "354 end with <CR><LF>.<CR><LF>")
+            data = True
+        elif verb == "QUIT":
+            send(conn, "221 2.0.0 bye")
+            break
+    conn.close()
+    log("c%d close" % idx)
+srv.close()
+log("fixture done")
+''')
+
+# The same pinned leaf.example.com chain go-mail's TLS legs serve.
+cfx = os.path.join("user", "src", "lib", "tls", "vectors", "fx")
+chain = os.path.join(cfx, "chain-ec.pem")
+mailkey = os.path.join(cfx, "leaf-ec.key")
+if not os.path.exists(chain) or not os.path.exists(mailkey):
+    sys.exit("pinned fixture chain missing under %s" % cfx)
+
+subprocess.run(["sh", "-c", "lsof -ti tcp:27465 | xargs kill -9"],
+               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+logpath = os.path.join(run, "chainmaild-27465.log")
+open(logpath, "w").close()
+proc = subprocess.Popen([sys.executable, fixture, "27465", logpath,
+                         chain, mailkey],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT,
+                        start_new_session=True)
+print("chain fixture smtp-tls pid=%d on 127.0.0.1:27465" % proc.pid)
+time.sleep(0.4)
+if proc.poll() is not None:
+    sys.exit("chain fixture exited early rc=%s" % proc.returncode)
+PY
+
+vgate_file script-c.txt <<'EOF'
+net ip 10.0.0.1
+net arp 10.0.0.2
+vf rm SESSION.TABS
+vf rm GOMAIL.TXT
+vf clone CHAINMAIL.TXT GOMAIL.TXT
+exec GOFILES.ELF /host/FMV
+EOF
+
+vgate_file script2-c.txt <<'EOF'
+dui focus 3
+EOF
+
+vgate_file script3-c.txt <<'EOF'
+dui close 3
+dui close 2
+echo rx-go-fileman-chain-ok
+EOF
+
+vgate_run c1 -- \
+    --screen '$RUN_DIR/fileman-chain-c1' \
+    --input --via-virtio \
+    --net '$RUN_DIR/cap-c1.bin' --net-arp-respond 10.0.0.2 \
+    --net-tcp-respond 10.0.0.2:465:relay --net-tcp-respond-relay 127.0.0.1:27465 \
+    --script '$RUN_DIR/script-c.txt' \
+    --pointer-virtio '40,88,rc;68,104,c;172,136,c' \
+    --pointer-virtio-after 'gofiles: ready' \
+    --script2 '$RUN_DIR/script2-c.txt' \
+    --script2-after 'gofiles: contact done cards=1' \
+    --input-chords 'return' \
+    --input-chords-after 'dui focus: focused=3' \
+    --script3 '$RUN_DIR/script3-c.txt' \
+    --script3-after 'gomail: closed' \
+    --script-expect 'rx-go-fileman-chain-ok' --timeout 300
+
+vgate_run c2 -- \
+    --screen '$RUN_DIR/fileman-chain-c2' \
+    --input --via-virtio \
+    --net '$RUN_DIR/cap-c2.bin' --net-arp-respond 10.0.0.2 \
+    --net-tcp-respond 10.0.0.2:465:relay --net-tcp-respond-relay 127.0.0.1:27465 \
+    --script '$RUN_DIR/script-c.txt' \
+    --pointer-virtio '40,88,rc;68,104,c;172,136,c' \
+    --pointer-virtio-after 'gofiles: ready' \
+    --script2 '$RUN_DIR/script2-c.txt' \
+    --script2-after 'gofiles: contact done cards=1' \
+    --input-chords 'return' \
+    --input-chords-after 'dui focus: focused=3' \
+    --script3 '$RUN_DIR/script3-c.txt' \
+    --script3-after 'gomail: closed' \
+    --script-expect 'rx-go-fileman-chain-ok' --timeout 300
+
+vgate_run c3 -- \
+    --screen '$RUN_DIR/fileman-chain-c3' \
+    --input --via-virtio \
+    --net '$RUN_DIR/cap-c3.bin' --net-arp-respond 10.0.0.2 \
+    --net-tcp-respond 10.0.0.2:465:relay --net-tcp-respond-relay 127.0.0.1:27465 \
+    --script '$RUN_DIR/script-c.txt' \
+    --pointer-virtio '40,88,rc;68,104,c;172,136,c' \
+    --pointer-virtio-after 'gofiles: ready' \
+    --script2 '$RUN_DIR/script2-c.txt' \
+    --script2-after 'gofiles: contact done cards=1' \
+    --input-chords 'return' \
+    --input-chords-after 'dui focus: focused=3' \
+    --script3 '$RUN_DIR/script3-c.txt' \
+    --script3-after 'gomail: closed' \
+    --script-expect 'rx-go-fileman-chain-ok' --timeout 300
+
+vgate_assert c1 serial-contains 'vf: clone CHAINMAIL.TXT -> GOMAIL.TXT ok'
+vgate_assert c1 serial-contains 'exec: loaded GOFILES.ELF'
+vgate_assert c1 serial-contains 'gofiles: list /host/FMV n=1'
+vgate_assert c1 serial-contains 'gofiles: entry CONTACT.VCF file'
+vgate_assert c1 serial-contains 'gofiles: menu CONTACT.VCF mime=text/vcard apps=5'
+vgate_assert c1 serial-contains 'gofiles: menu openwith CONTACT.VCF mime=text/vcard candidates=5'
+vgate_assert c1 serial-contains 'gofiles: open chose CONTACT.VCF type=text handler=GOFILES.ELF'
+vgate_assert c1 serial-contains 'gofiles: open launched CONTACT.VCF handler=GOFILES.ELF pid='
+vgate_assert c1 serial-contains 'gofiles: quicklook CONTACT.VCF kind=contact'
+vgate_assert c1 serial-contains 'gofiles: contact fn=Grace Hopper'
+vgate_assert c1 serial-contains 'gofiles: contact email=grace@example.com'
+vgate_assert c1 serial-contains 'gofiles: contact done cards=1'
+vgate_assert c1 serial-contains 'gofiles: contact mail grace@example.com handler=GOMAIL.ELF'
+vgate_assert c1 serial-contains 'gofiles: open launched grace@example.com handler=GOMAIL.ELF pid='
+vgate_assert c1 serial-contains 'gomail: account /host/GOMAIL.TXT'
+vgate_assert c1 serial-contains 'gomail: dial 10.0.0.2 465 tls'
+vgate_assert c1 serial-contains 'gomail: smtp ready'
+vgate_assert c1 serial-contains 'gomail: mail gate@fixture.local'
+vgate_assert c1 serial-contains 'gomail: rcpt grace@example.com'
+vgate_assert c1 serial-contains 'gomail: sent bytes='
+vgate_assert c1 serial-contains 'gomail: closed'
+vgate_assert c1 serial-contains 'dui close: closed=3'
+vgate_assert c1 serial-contains 'dui close: closed=2'
+vgate_assert c1 serial-contains 'rx-go-fileman-chain-ok'
+vgate_assert c1 serial-absent 'gomail: account missing host'
+vgate_assert c1 serial-absent 'gomail: refuse'
+vgate_assert c1 serial-absent 'gomail: error'
+vgate_assert c1 serial-absent 'gofiles: contact refused'
+vgate_assert c1 serial-absent '[EXC] parking:'
+vgate_assert c1 serial-absent 'exited status=139'
+vgate_assert c1 python <<'PY'
+import os, sys
+log = open(os.path.join(os.environ["RUN_DIR"], "chainmaild-27465.log")).read()
+need = ["c0 tls ok", "c0 rx EHLO virelai",
+        "c0 rx AUTH PLAIN AGdhdGUAZ2F0ZS1wYXNz",
+        "c0 rx MAIL FROM:<gate@fixture.local>",
+        "c0 rx RCPT TO:<grace@example.com>",
+        "c0 rx DATA", "c0 rx .", "c0 rx QUIT",
+        "tx 250 2.0.0 queued as m001"]
+missing = [n for n in need if n not in log]
+if missing:
+    sys.exit("chain smtp fixture transcript missing: %r\n%s" % (missing, log))
+PY
+
+vgate_assert c2 serial-contains 'vf: clone CHAINMAIL.TXT -> GOMAIL.TXT ok'
+vgate_assert c2 serial-contains 'exec: loaded GOFILES.ELF'
+vgate_assert c2 serial-contains 'gofiles: list /host/FMV n=1'
+vgate_assert c2 serial-contains 'gofiles: entry CONTACT.VCF file'
+vgate_assert c2 serial-contains 'gofiles: menu CONTACT.VCF mime=text/vcard apps=5'
+vgate_assert c2 serial-contains 'gofiles: menu openwith CONTACT.VCF mime=text/vcard candidates=5'
+vgate_assert c2 serial-contains 'gofiles: open chose CONTACT.VCF type=text handler=GOFILES.ELF'
+vgate_assert c2 serial-contains 'gofiles: open launched CONTACT.VCF handler=GOFILES.ELF pid='
+vgate_assert c2 serial-contains 'gofiles: quicklook CONTACT.VCF kind=contact'
+vgate_assert c2 serial-contains 'gofiles: contact fn=Grace Hopper'
+vgate_assert c2 serial-contains 'gofiles: contact email=grace@example.com'
+vgate_assert c2 serial-contains 'gofiles: contact done cards=1'
+vgate_assert c2 serial-contains 'gofiles: contact mail grace@example.com handler=GOMAIL.ELF'
+vgate_assert c2 serial-contains 'gofiles: open launched grace@example.com handler=GOMAIL.ELF pid='
+vgate_assert c2 serial-contains 'gomail: account /host/GOMAIL.TXT'
+vgate_assert c2 serial-contains 'gomail: dial 10.0.0.2 465 tls'
+vgate_assert c2 serial-contains 'gomail: smtp ready'
+vgate_assert c2 serial-contains 'gomail: mail gate@fixture.local'
+vgate_assert c2 serial-contains 'gomail: rcpt grace@example.com'
+vgate_assert c2 serial-contains 'gomail: sent bytes='
+vgate_assert c2 serial-contains 'gomail: closed'
+vgate_assert c2 serial-contains 'dui close: closed=3'
+vgate_assert c2 serial-contains 'dui close: closed=2'
+vgate_assert c2 serial-contains 'rx-go-fileman-chain-ok'
+vgate_assert c2 serial-absent 'gomail: account missing host'
+vgate_assert c2 serial-absent 'gomail: refuse'
+vgate_assert c2 serial-absent 'gomail: error'
+vgate_assert c2 serial-absent 'gofiles: contact refused'
+vgate_assert c2 serial-absent '[EXC] parking:'
+vgate_assert c2 serial-absent 'exited status=139'
+vgate_assert c2 python <<'PY'
+import os, sys
+log = open(os.path.join(os.environ["RUN_DIR"], "chainmaild-27465.log")).read()
+need = ["c1 tls ok", "c1 rx EHLO virelai",
+        "c1 rx AUTH PLAIN AGdhdGUAZ2F0ZS1wYXNz",
+        "c1 rx MAIL FROM:<gate@fixture.local>",
+        "c1 rx RCPT TO:<grace@example.com>",
+        "c1 rx DATA", "c1 rx .", "c1 rx QUIT",
+        "tx 250 2.0.0 queued as m001"]
+missing = [n for n in need if n not in log]
+if missing:
+    sys.exit("chain smtp fixture transcript missing: %r\n%s" % (missing, log))
+PY
+
+vgate_assert c3 serial-contains 'vf: clone CHAINMAIL.TXT -> GOMAIL.TXT ok'
+vgate_assert c3 serial-contains 'exec: loaded GOFILES.ELF'
+vgate_assert c3 serial-contains 'gofiles: list /host/FMV n=1'
+vgate_assert c3 serial-contains 'gofiles: entry CONTACT.VCF file'
+vgate_assert c3 serial-contains 'gofiles: menu CONTACT.VCF mime=text/vcard apps=5'
+vgate_assert c3 serial-contains 'gofiles: menu openwith CONTACT.VCF mime=text/vcard candidates=5'
+vgate_assert c3 serial-contains 'gofiles: open chose CONTACT.VCF type=text handler=GOFILES.ELF'
+vgate_assert c3 serial-contains 'gofiles: open launched CONTACT.VCF handler=GOFILES.ELF pid='
+vgate_assert c3 serial-contains 'gofiles: quicklook CONTACT.VCF kind=contact'
+vgate_assert c3 serial-contains 'gofiles: contact fn=Grace Hopper'
+vgate_assert c3 serial-contains 'gofiles: contact email=grace@example.com'
+vgate_assert c3 serial-contains 'gofiles: contact done cards=1'
+vgate_assert c3 serial-contains 'gofiles: contact mail grace@example.com handler=GOMAIL.ELF'
+vgate_assert c3 serial-contains 'gofiles: open launched grace@example.com handler=GOMAIL.ELF pid='
+vgate_assert c3 serial-contains 'gomail: account /host/GOMAIL.TXT'
+vgate_assert c3 serial-contains 'gomail: dial 10.0.0.2 465 tls'
+vgate_assert c3 serial-contains 'gomail: smtp ready'
+vgate_assert c3 serial-contains 'gomail: mail gate@fixture.local'
+vgate_assert c3 serial-contains 'gomail: rcpt grace@example.com'
+vgate_assert c3 serial-contains 'gomail: sent bytes='
+vgate_assert c3 serial-contains 'gomail: closed'
+vgate_assert c3 serial-contains 'dui close: closed=3'
+vgate_assert c3 serial-contains 'dui close: closed=2'
+vgate_assert c3 serial-contains 'rx-go-fileman-chain-ok'
+vgate_assert c3 serial-absent 'gomail: account missing host'
+vgate_assert c3 serial-absent 'gomail: refuse'
+vgate_assert c3 serial-absent 'gomail: error'
+vgate_assert c3 serial-absent 'gofiles: contact refused'
+vgate_assert c3 serial-absent '[EXC] parking:'
+vgate_assert c3 serial-absent 'exited status=139'
+vgate_assert c3 python <<'PY'
+import os, sys
+log = open(os.path.join(os.environ["RUN_DIR"], "chainmaild-27465.log")).read()
+need = ["c2 tls ok", "c2 rx EHLO virelai",
+        "c2 rx AUTH PLAIN AGdhdGUAZ2F0ZS1wYXNz",
+        "c2 rx MAIL FROM:<gate@fixture.local>",
+        "c2 rx RCPT TO:<grace@example.com>",
+        "c2 rx DATA", "c2 rx .", "c2 rx QUIT",
+        "tx 250 2.0.0 queued as m001"]
+missing = [n for n in need if n not in log]
+if missing:
+    sys.exit("chain smtp fixture transcript missing: %r\n%s" % (missing, log))
 PY

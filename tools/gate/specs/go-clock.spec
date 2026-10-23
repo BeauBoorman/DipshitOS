@@ -87,6 +87,12 @@
 #           overdue gocal3 record and the reopened app restores it and
 #           fires once, marked late — the persisted row re-armed and
 #           fired, closing edit -> export -> re-parse -> restore -> fire.
+#   run 14  M193d (#3256) comms-chain leg: the same edit -> export ->
+#           re-parse chain compressed into one boot — the staged gocal3
+#           row edits 0900 -> 0700 in place, `export` publishes
+#           EDITOUT.ICS through WriteFileSafe, the store is then cleared
+#           and `import` re-parses the app's own export into a fresh
+#           list, the verdict naming the round-tripped instant.
 #
 # HOST PREREQUISITES (the gate fails honestly when missing):
 #   bash tools/go/build-goclock.sh  ->  .build/go/GOCLOCK.ELF
@@ -96,7 +102,7 @@
 # exec-order: assert-proven -- each run ends on a marker only its own
 # stage chain can produce.
 
-vgate_name go-clock "issue #2794 M144a + #2795 M144b + #2916 M152b + #3185 M187d + #3254 M193b: GOCLOCK.ELF — world clock, stopwatch, timer, alarm->toast over one multiplexed kernel timer; the gocal3 alarm list (up to 7, once/daily, toggled, summary'd) persists through save_state + its own share file, gocal1/gocal2 still read, late-fire on start; the .ics import verb lands VEVENTs into the same store and the export verb writes it back — alarms edit in place and re-import their own export"
+vgate_name go-clock "issue #2794 M144a + #2795 M144b + #2916 M152b + #3185 M187d + #3254 M193b + #3256 M193d: GOCLOCK.ELF — world clock, stopwatch, timer, alarm->toast over one multiplexed kernel timer; the gocal3 alarm list (up to 7, once/daily, toggled, summary'd) persists through save_state + its own share file, gocal1/gocal2 still read, late-fire on start; the .ics import verb lands VEVENTs into the same store and the export verb writes it back — alarms edit in place and re-import their own export, the chain leg proving edit -> export -> re-parse inside one boot"
 vgate_share seed
 vgate_runner_flags -Xswiftc -DSPIKE
 vgate_repeat 3 BOOTS
@@ -1305,7 +1311,6 @@ vgate_assert 11 share-contains 'GOCLOCK.ALARM' 'gocal3 2 1813069800 1430 o+ Quar
 # No imported deadline fires inside the leg — both instants are 2027.
 vgate_assert 11 serial-absent 'goclock: fired alarm'
 vgate_assert 11 serial-absent 'goclock: alarm file bad'
-=======
 vgate_assert 11 serial-absent '[EXC] parking:'
 vgate_assert 11 serial-absent 'exited status=139'
 
@@ -1441,4 +1446,96 @@ vgate_assert 13 serial-absent 'goclock: import refused'
 vgate_assert 13 serial-absent 'goclock: alarm file bad'
 vgate_assert 13 serial-absent 'goclock: deadline full'
 vgate_assert 13 serial-absent 'exited status=139'
->>>>>>> 50a1daf2 (M193b (#3254): GOCLOCK events you can edit — ical write-back)
+
+# --- run 14 (M193d #3256): the comms-chain clock leg ---------------------
+# Runs 12/13 split the round trip across two boots; the acceptance leg
+# compresses edit -> export -> re-parse into one. The monitor stages the
+# pre-edit gocal3 row (0900 Reveille), the windowed app edits its HHMM to
+# 0700 in place and quits, then a serial-detached GOSH runs the last two
+# hops through `source /host/GOCHAIN.SH` — GOSH's foreground exec waits
+# on each child, so `export` fully publishes EDITOUT.ICS and the store is
+# cleared (`echo gocal3 0 >`, the same WriteFileSafe-adjacent seam) BEFORE
+# `import` re-parses the app's own export into an empty list: 'import
+# 07:00 daily Reveille' + 'added=1 refused=0' is the independent-reader
+# verdict — ordering a same-burst console script could never guarantee.
+vgate_setup_python <<'PY'
+import os
+share = os.environ.get("VG_SHARE") or os.path.join(os.environ["RUN_DIR"], "share")
+with open(os.path.join(share, "GOCHAIN.SH"), "w") as f:
+    f.write("exec GOCLOCK.ELF export /host/EDITOUT.ICS\n"
+            "echo gocal3 0 > /host/GOCLOCK.ALARM\n"
+            "exec GOCLOCK.ELF import /host/EDITOUT.ICS\n")
+print("staged GOCHAIN.SH (export -> clear store -> re-parse)")
+PY
+
+vgate_file script-14.txt <<'EOF'
+vf rm SESSION.TABS
+vf rm GOCLOCK.ALARM
+vf rm EDITOUT.ICS
+write GOCLOCK.ALARM gocal3 1 1813136400 0900 d+ Reveille
+EOF
+
+vgate_file script2-14.txt <<'EOF'
+exec GOCLOCK.ELF
+EOF
+
+vgate_file script3-14.txt <<'EOF'
+exec GOSH.ELF -c "source /host/GOCHAIN.SH"
+EOF
+
+vgate_run 14 -- \
+    --screen '$RUN_DIR/screen-14' \
+    --via-virtio \
+    --script '$RUN_DIR/script-14.txt' \
+    --script2 '$RUN_DIR/script2-14.txt' \
+    --script2-after 'gotabwm: mode live' \
+    --input-chords 'right,right,right,e,backspace,backspace,backspace,backspace,0,7,0,0,return,q' \
+    --input-chords-after 'goclock: alarm restored 09:00 daily' \
+    --script3 '$RUN_DIR/script3-14.txt' \
+    --script3-after 'goclock OK' \
+    --script-expect 'goclock: import done' --timeout 300
+
+vgate_assert 14 serial-contains 'write: ok (persisted '
+vgate_assert 14 serial-contains 'exec: loaded GOCLOCK.ELF'
+# The staged row restored, edited in place, and republished.
+vgate_assert 14 serial-contains 'goclock: alarm restored 09:00 daily'
+vgate_assert 14 serial-contains 'goclock: alarm edited 07:00 daily'
+vgate_assert 14 serial-contains 'goclock: alarm saved'
+vgate_assert 14 serial-contains 'goclock OK'
+# The export verb wrote the list out through WriteFileSafe inside the
+# GOSH-sequenced tail.
+vgate_assert 14 serial-contains 'exec: loaded GOSH.ELF'
+vgate_assert 14 serial-contains 'goclock: export done n=1 bound=8'
+vgate_assert 14 share-contains 'EDITOUT.ICS' 'BEGIN:VCALENDAR'
+vgate_assert 14 share-contains 'EDITOUT.ICS' 'SUMMARY:Reveille'
+vgate_assert 14 share-contains 'EDITOUT.ICS' 'RRULE:FREQ=DAILY'
+# The same boot's import re-parsed the app's own export into a fresh
+# list — the round trip closing inside the leg.
+vgate_assert 14 serial-contains 'goclock: import 07:00 daily Reveille'
+vgate_assert 14 serial-contains 'goclock: import done added=1 refused=0'
+vgate_assert 14 serial-absent 'goclock: alarm refused'
+vgate_assert 14 serial-absent 'goclock: alarm file bad'
+vgate_assert 14 serial-absent 'goclock: export refused'
+vgate_assert 14 serial-absent 'goclock: import refused'
+vgate_assert 14 serial-absent 'goclock: deadline full'
+vgate_assert 14 serial-absent 'gosh: error'
+vgate_assert 14 serial-absent '[EXC] parking:'
+vgate_assert 14 serial-absent 'exited status=139'
+
+# Byte-level on the emitted file — the same reader's-field-set proof
+# run 12 carries: DTSTART for the re-anchored 07:00 UTC instant, the
+# carried SUMMARY, RRULE:FREQ=DAILY, nothing else.
+vgate_assert 14 python <<'PY'
+import os, re, sys
+p = os.path.join(os.environ["VG_SHARE"], "EDITOUT.ICS")
+b = open(p, "rb").read()
+want = (rb"BEGIN:VCALENDAR\r\nVERSION:2\.0\r\n"
+        rb"PRODID:-//VirelaiOS//ical//EN\r\n"
+        rb"BEGIN:VEVENT\r\nDTSTART:\d{8}T070000Z\r\n"
+        rb"SUMMARY:Reveille\r\nRRULE:FREQ=DAILY\r\n"
+        rb"END:VEVENT\r\nEND:VCALENDAR\r\n")
+if not re.fullmatch(want, b):
+    sys.exit("EDITOUT.ICS = %r, want one daily 07:00Z event 'Reveille'" % b)
+print("chain leg EDITOUT.ICS = one VEVENT, DTSTART %s" %
+      re.search(rb"DTSTART:(\S+)", b).group(1).decode())
+PY
