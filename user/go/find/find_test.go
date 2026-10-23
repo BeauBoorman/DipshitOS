@@ -64,3 +64,34 @@ func TestAll(t *testing.T) {
 		t.Fatalf("All empty buf = %v want nil", got)
 	}
 }
+
+// ContainsFold is the M191b name-search predicate: folded on both sides,
+// a-z onto A-Z only — "verb" reaches VERB.TXT, and the byte-exact All
+// stays untouched ("verb" is not a byte match there, it is a folded one).
+func TestContainsFold(t *testing.T) {
+	fold := func(s string) []byte {
+		b := []byte(s)
+		for i := range b {
+			b[i] = FoldByte(b[i])
+		}
+		return b
+	}
+	if !ContainsFold([]byte("VERB.TXT"), fold("verb")) {
+		t.Fatal("lower-case needle must reach an upper-case name")
+	}
+	if !ContainsFold([]byte("verb.txt"), fold("VERB")) {
+		t.Fatal("the fold runs both directions")
+	}
+	if ContainsFold([]byte("VERB.TXT"), fold("zerb")) {
+		t.Fatal("a folded scan is still exact per byte")
+	}
+	if ContainsFold([]byte("ab"), fold("abc")) {
+		t.Fatal("a needle longer than the name cannot match")
+	}
+	if ContainsFold([]byte("VERB.TXT"), fold("")) {
+		t.Fatal("the empty needle is not a hit")
+	}
+	if FoldByte('a') != 'A' || FoldByte('Z') != 'Z' || FoldByte('5') != '5' {
+		t.Fatal("the fold is a-z onto A-Z only")
+	}
+}

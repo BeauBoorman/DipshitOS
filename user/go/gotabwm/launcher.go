@@ -14,10 +14,21 @@
 // `argv=` field's fixed arguments ride the exec, and the decode receipt says
 // what the manifest said — how many rows, the highest row version, and how
 // many rows spoke each trailing key (a zero is reported, not hidden).
+//
+// M191b (#3243): the launcher learns verbs. A non-empty filter adds a
+// second result kind — bounded filename hits under the share — and every
+// row carries a verb affordance (Tab or the horizontal arrows): open,
+// reveal in GOFILES, and the manifest's opens= candidates for the hit's
+// mime spelling. The M165f "Search files for" hand-off rides last on
+// this face too — content search stays GOFILES' walk, never inline.
 package main
 
 import (
+	"errors"
+
 	"virelai/draw"
+	"virelai/find"
+	"virelai/mime"
 	"virelai/theme"
 	"virelai/vi"
 	"virelai/webrender/qoi"
@@ -36,12 +47,20 @@ const (
 	MarkerLaunchEmpty = "gotabwm: launcher empty"
 	MarkerAppsDecode  = "gotabwm: apps decode n="
 
+	// M191b (#3243): the filename-hit walk, the verb affordance and the
+	// launcher's own face of the M165f search hand-off.
+	MarkerLaunchFiles  = "gotabwm: launcher files "
+	MarkerLaunchVerb   = "gotabwm: launcher verb "
+	MarkerLaunchSearch = "gotabwm: launcher search q="
+
 	hidUsageSpace  uint8 = 0x2C
 	hidUsageEnter  uint8 = 0x28
 	hidUsageEscape uint8 = 0x29
 	hidUsageBksp   uint8 = 0x2A
+	hidUsageLeft   uint8 = 0x50
 	hidUsageDown   uint8 = 0x51
 	hidUsageUp     uint8 = 0x52
+	hidUsageRight  uint8 = 0x4F
 
 	// The strip: docked at the left edge, full scanout height. The seat's
 	// 2px accent rule marks the edge facing the desktop, the same mark the
@@ -73,6 +92,23 @@ const (
 	emblemMaxBytes = 65536
 	emblemMaxDim   = 256
 	emblemMaxPix   = 256 * 256
+
+	// M191b: the filename-hit bounds. The walk covers the share's subtree
+	// to M155c's own depth and never counts more entries than GOFILES'
+	// search looks at files — the launcher's budget is the walk's, not
+	// doubled (the M155c walk bounds are the card's ceiling).
+	launchFileMaxDepth = 4
+	launchFileMaxVisit = 256
+	// The entry cap is the rows a strip can honestly offer — GOFILES'
+	// 64-hit bound is the content walk's, not a name list's.
+	launchFileMaxHits = 16
+	launchFilesRoot   = "/host"
+	launchMaxPath     = 64 // the kernel path cap (files' maxPath)
+
+	// launchFileIdx0 is the filtered-index sentinel file hits sit at:
+	// hit j encodes as launchFileIdx0-j, so every file index is <= -2 —
+	// distinct from the manifest indices (>=0) and paletteSearchIdx (-1).
+	launchFileIdx0 = -2
 )
 
 type launcherState struct {
@@ -93,11 +129,29 @@ type launcherState struct {
 	// M165f (#2978): the palette's synthetic "Search files for '<q>'"
 	// row. Not a results entry — refresh rebuilds it on each filter
 	// change and filtered carries the paletteSearchIdx sentinel for it,
-	// always last.
+	// always last. M191b gives the launcher's own face the same row: a
+	// query with no name hit still has one honest answer, and it is the
+	// hand-off, not an inline content search.
 	search paletteEntry
 	width      int
 	height     int
 	launching  bool
+
+	// M191b: the filename hits. filtered rows encoded <= launchFileIdx0
+	// index into hits; hitsVisit is the entries the last walk counted
+	// and hitsTrunc names the bound that stopped it ("" when none did).
+	hits      []launchHit
+	hitsTrunc string
+	hitsVisit int
+	// The verb affordance. verbSel is the selection verbs were built
+	// for (-1 disarmed — selection moves and filter changes disarm, a
+	// pointer click on a different row disarms the same way), verb is
+	// the armed index into verbs, and verbs is the cached list: verb 0
+	// is the row's own open, verb 1 reveal-in-GOFILES, the rest the
+	// opens= candidates for the hit's mime spelling.
+	verbSel int
+	verb    int
+	verbs   []launchVerb
 
 	// emblem is the decoded mascot raster, decoded once lazily (the
 	// god-menu button paints it every tick, long before the first
@@ -113,6 +167,25 @@ type emblemState struct {
 	tried bool
 	w, h  int
 	pix   []uint32
+}
+
+// launchHit is one filename hit — the second result kind M191b adds.
+// path is what the verbs act on, name the base name the row paints, dir
+// the parent GOFILES opens at on a reveal.
+type launchHit struct {
+	path string
+	name string
+	dir  string
+}
+
+// launchVerb is one row's verb affordance. name is the marker word and
+// the second-line text ("open", "reveal", "open-with <Label>"); bin/argv
+// are the exec when the verb commits — bin == "" on the manifest row's
+// own "open", which is not a verb exec but the M82a contract itself.
+type launchVerb struct {
+	name string
+	bin  string
+	argv []string
 }
 
 var launch launcherState
@@ -172,21 +245,34 @@ func (l *launcherState) panelH() int {
 
 func (l *launcherState) refresh() {
 	l.painted = false
+	l.hits, l.hitsTrunc, l.hitsVisit = nil, "", 0
+	l.verb, l.verbSel, l.verbs = 0, -1, nil
 	if l.palette {
 		l.filtered = rankPalette(l.results, l.filter)
-		if l.filter != "" {
-			// M165f: a non-empty query always offers the file-search
-			// hand-off, ranked last — ranking itself is unchanged.
-			l.search = paletteEntry{
-				kind:   palSearch,
-				label:  "Search files for '" + l.filter + "'",
-				detail: "files · " + gofilesBin + " --search",
-				arg:    l.filter,
-			}
-			l.filtered = append(l.filtered, paletteSearchIdx)
-		}
 	} else {
 		l.filtered = rankApps(l.catalog, l.filter)
+		if l.filter != "" {
+			// M191b: filename hits are the second result kind — a
+			// bounded name walk of the share ranked after the app
+			// rows, never a content scan.
+			l.walkFiles(l.filter)
+			for j := range l.hits {
+				l.filtered = append(l.filtered, launchFileIdx0-j)
+			}
+		}
+	}
+	if l.filter != "" {
+		// M165f: a non-empty query always offers the file-search
+		// hand-off, ranked last — ranking itself is unchanged. M191b
+		// extends the same synthetic row to the launcher's own face,
+		// where it is the answer to a content-intent query.
+		l.search = paletteEntry{
+			kind:   palSearch,
+			label:  "Search files for '" + l.filter + "'",
+			detail: "files · " + gofilesBin + " --search",
+			arg:    l.filter,
+		}
+		l.filtered = append(l.filtered, paletteSearchIdx)
 	}
 	if l.sel >= len(l.filtered) {
 		l.sel = len(l.filtered) - 1
@@ -276,6 +362,8 @@ func loadLauncherCatalog() {
 	launch.catalog, launch.reasons, launch.filtered, launch.results = nil, nil, nil, nil
 	launch.filter, launch.sel, launch.first = "", 0, 0
 	launch.painted, launch.launching = false, false
+	launch.hits, launch.hitsTrunc, launch.hitsVisit = nil, "", 0
+	launch.verb, launch.verbSel, launch.verbs = 0, -1, nil
 	body, r := readAppsFile(appsPath, appsMaxBytes)
 	if r < 0 || body == nil {
 		launch.catalog = nil
@@ -348,6 +436,39 @@ func execSelected() {
 		}
 		return
 	}
+	if launch.sel >= 0 && launch.sel < len(launch.filtered) {
+		ci := launch.filtered[launch.sel]
+		switch {
+		case ci == paletteSearchIdx:
+			// The M165f hand-off row — the launcher's own face runs
+			// the same `GOFILES.ELF --search <q>` the palette's does.
+			if !ensureLauncherFocus() {
+				return
+			}
+			if !launchExecSearch(launch.search.arg) {
+				return
+			}
+			launch.launching = true
+			if releaseLauncherFocus(false) {
+				finishLauncher()
+			}
+			return
+		case ci <= launchFileIdx0, launch.verbArmed():
+			// M191b: a filename hit — or any row with an armed verb —
+			// dispatches its verb, not the manifest contract.
+			launch.execVerbRow(ci)
+			return
+		}
+	}
+	launch.execManifestRow()
+}
+
+// execManifestRow is Enter on a manifest row: the M82a contract — the
+// probe's named refusal first (unstaged binary, seat entry), then the
+// exec with the row's fixed argv=. The verb affordance hands control
+// back here for the row's own "open" so a wrapped-around verb never
+// bypasses the checks.
+func (l *launcherState) execManifestRow() {
 	e, ok := launch.selected()
 	if !ok || e.Bin == "" {
 		return
@@ -404,6 +525,277 @@ func joinSpace(args []string) string {
 		out += a
 	}
 	return out
+}
+
+// --- M191b (#3243): filename hits + verb rows -----------------------------
+//
+// The launcher finds; these verbs make it act. A non-empty filter adds a
+// second result kind — filenames under the share matching the query — and
+// every result row carries a verb affordance (Tab or the horizontal
+// arrows cycle): open (the row's own Enter), reveal in GOFILES (the file
+// manager open at the containing folder), and one open-with row per
+// manifest opens= candidate for the hit's mime spelling. Content search
+// is not a verb — the M165f hand-off row stays the answer to 'find
+// inside files', on this face exactly as on the palette's.
+
+// launchDirList is the walk's directory seam — vi.DirList on the guest,
+// swapped by the host tests (the searchDirList/readAppsFile pattern).
+var launchDirList = vi.DirList
+
+var errLaunchRead = errors.New("launcher: head unreadable")
+
+// launchHeadRead adapts the share-file seam to mime.Open's ReadFunc.
+func launchHeadRead(p string, max int) ([]byte, error) {
+	b, rc := readAppsFile(p, max)
+	if rc < 0 {
+		return nil, errLaunchRead
+	}
+	return b, nil
+}
+
+// walkFiles runs the bounded name walk for one filter change. Every
+// bound the walk reaches is named in the marker (truncated=<bound>) the
+// way GOFILES names its own: the hits already collected are real.
+func (l *launcherState) walkFiles(q string) {
+	needle := make([]byte, len(q))
+	for i := 0; i < len(q); i++ {
+		needle[i] = find.FoldByte(q[i])
+	}
+	l.walkFilesDir(launchFilesRoot, 0, needle)
+	line := MarkerLaunchFiles + "q=" + q +
+		" n=" + vi.Itoa64(int64(len(l.hits))) +
+		" visited=" + vi.Itoa64(int64(l.hitsVisit))
+	if l.hitsTrunc != "" {
+		line += " truncated=" + l.hitsTrunc
+	}
+	vi.ConsoleLine(line)
+}
+
+// walkFilesDir lists one directory, collects its matching filenames,
+// then descends — files before subdirs, the same order GOFILES' search
+// walks so a too-deep directory cannot cut off same-depth files the
+// bound still covers. Every listed entry counts toward the traversal
+// bound; only files can match.
+func (l *launcherState) walkFilesDir(dir string, depth int, needle []byte) {
+	var ents [vi.MaxDirEntries]vi.DirEntry
+	n, rc := launchDirList(dir, ents[:])
+	if rc < 0 {
+		return // an unreadable dir contributes nothing — its parent still counts
+	}
+	for i := 0; i < n; i++ {
+		if l.hitsTrunc != "" {
+			return
+		}
+		if l.hitsVisit >= launchFileMaxVisit {
+			l.hitsTrunc = "visited"
+			return
+		}
+		l.hitsVisit++
+		if ents[i].Dir() {
+			continue
+		}
+		name := ents[i].NameString()
+		if !find.ContainsFold([]byte(name), needle) {
+			continue
+		}
+		path, ok := launchJoin(dir, name)
+		if !ok {
+			continue
+		}
+		if len(l.hits) >= launchFileMaxHits {
+			l.hitsTrunc = "hits"
+			return
+		}
+		l.hits = append(l.hits, launchHit{path: path, name: name, dir: dir})
+	}
+	for i := 0; i < n; i++ {
+		if l.hitsTrunc != "" {
+			return
+		}
+		if !ents[i].Dir() {
+			continue
+		}
+		if depth+1 > launchFileMaxDepth {
+			l.hitsTrunc = "depth"
+			return
+		}
+		child, ok := launchJoin(dir, ents[i].NameString())
+		if !ok {
+			continue
+		}
+		l.walkFilesDir(child, depth+1, needle)
+	}
+}
+
+// launchJoin joins a dir entry to its parent under the kernel path cap —
+// a name that cannot form a legal path is visited but never a hit.
+func launchJoin(dir, name string) (string, bool) {
+	if name == "" || name == "." || name == ".." {
+		return "", false
+	}
+	out := dir + "/" + name
+	if len(out) > launchMaxPath {
+		return "", false
+	}
+	return out, true
+}
+
+// verbsFor builds the selected row's verb list. Every result gets open
+// and reveal; the manifest's opens= rows whose admission takes the
+// file's mime spelling follow as open-with. The hand-off row is the one
+// row with a single gesture — verbs are for results, not affordances.
+func (l *launcherState) verbsFor(ci int) []launchVerb {
+	switch {
+	case ci == paletteSearchIdx:
+		return nil
+	case ci <= launchFileIdx0:
+		j := launchFileIdx0 - ci
+		if j < 0 || j >= len(l.hits) {
+			return nil
+		}
+		h := l.hits[j]
+		vs := []launchVerb{l.openFileVerb(h)}
+		vs = append(vs, launchVerb{name: "reveal", bin: gofilesBin, argv: []string{h.dir}})
+		return append(vs, l.openWithVerbs(h.path, h.name)...)
+	case ci >= 0 && ci < len(l.catalog):
+		// A manifest row's file is its binary on the share: reveal
+		// lists /host, open-with routes the .ELF's own spelling.
+		path := "/host/" + l.catalog[ci].Bin
+		vs := []launchVerb{{name: "open"}}
+		vs = append(vs, launchVerb{name: "reveal", bin: gofilesBin, argv: []string{"/host"}})
+		return append(vs, l.openWithVerbs(path, l.catalog[ci].Bin)...)
+	}
+	return nil
+}
+
+// openFileVerb resolves a filename hit's open: the M81b mime dispatch
+// GOFILES' Enter takes, with GOFILES at the containing folder as the
+// no-handler (and unreadable) fallback — the drop-open precedent.
+func (l *launcherState) openFileVerb(h launchHit) launchVerb {
+	req, err := mime.Open(h.path, "/", launchHeadRead)
+	if err != nil {
+		return launchVerb{name: "open", bin: gofilesBin, argv: []string{h.dir}}
+	}
+	return launchVerb{name: "open", bin: req.Handler.Bin, argv: []string{req.Target}}
+}
+
+// openWithVerbs is the opens= candidate list for one path: every
+// manifest row whose opens= accepts the file's mime spelling, in
+// manifest order — the same candidates GOFILES' Open With… submenu
+// computes for it. An unreadable head has no spelling and no rows.
+func (l *launcherState) openWithVerbs(path, name string) []launchVerb {
+	head, rc := readAppsFile(path, mime.HeadBytes)
+	if rc < 0 {
+		return nil
+	}
+	mt := mime.Spelling(name, head)
+	var out []launchVerb
+	for _, e := range l.catalog {
+		if !opensAccepts(e.Opens, mt) {
+			continue
+		}
+		argv := append(append([]string{}, e.Args...), path)
+		out = append(out, launchVerb{name: "open-with " + e.Label, bin: e.Bin, argv: argv})
+	}
+	return out
+}
+
+// hitRowText is the two-line text for a non-manifest row: the hand-off
+// sentinel paints the palette row's own label/detail, a filename hit its
+// base name and containing folder.
+func (l *launcherState) hitRowText(ci int) (label, detail string) {
+	if ci == paletteSearchIdx {
+		return l.search.label, l.search.detail
+	}
+	j := launchFileIdx0 - ci
+	if j < 0 || j >= len(l.hits) {
+		return "", ""
+	}
+	return l.hits[j].name, l.hits[j].dir
+}
+
+// stepVerb cycles the armed verb on the selected row — Tab and the
+// horizontal arrows walk the list in either direction. Selection moves
+// and filter changes disarm (verbSel no longer names the selection).
+func (l *launcherState) stepVerb(delta int) {
+	if l.palette || l.sel < 0 || l.sel >= len(l.filtered) {
+		return
+	}
+	ci := l.filtered[l.sel]
+	if l.sel != l.verbSel {
+		l.verb, l.verbSel, l.verbs = 0, l.sel, l.verbsFor(ci)
+	}
+	if n := len(l.verbs); n >= 2 {
+		l.verb = (l.verb + delta + n) % n
+		l.painted = false
+		vi.ConsoleLine(MarkerLaunchVerb + l.verbs[l.verb].name)
+	}
+}
+
+// verbArmed reports whether the selection still owns a built verb list.
+func (l *launcherState) verbArmed() bool {
+	return l.sel == l.verbSel && l.verb < len(l.verbs)
+}
+
+// effVerb is the verb Enter commits: the armed one, verb 0 (the row's
+// own open) otherwise.
+func (l *launcherState) effVerb() int {
+	if l.verbArmed() {
+		return l.verb
+	}
+	return 0
+}
+
+// execVerbRow runs the armed verb on the row filtered[sel] names — or
+// the row's open when no verb is armed. The manifest row's own "open" is
+// not a verb exec: it falls back to the manifest path itself so its
+// refusal contract (unstaged binary, seat entry) stands unchanged.
+func (l *launcherState) execVerbRow(ci int) {
+	vs := l.verbsFor(ci)
+	if len(vs) == 0 {
+		return
+	}
+	i := l.effVerb()
+	if i >= len(vs) {
+		i = 0
+	}
+	v := vs[i]
+	if v.bin == "" {
+		l.execManifestRow()
+		return
+	}
+	if !ensureLauncherFocus() {
+		return
+	}
+	if _, err := execApp(v.bin, v.argv...); err != nil {
+		vi.ConsoleLine(MarkerLaunchMissing + v.bin)
+		l.err = "Launch failed: " + v.bin
+		seatRefusalErr(err, "exec "+v.bin, v.bin)
+		return
+	}
+	vi.ConsoleLine(MarkerLaunchExec + v.bin + " argv=" + joinSpace(v.argv))
+	l.launching = true
+	if releaseLauncherFocus(false) {
+		finishLauncher()
+	}
+}
+
+// launchExecSearch is the launcher face's half of the M165f hand-off:
+// the palette's own exec shape — the 64-byte bound, the named refusal —
+// under this face's marker name.
+func launchExecSearch(q string) bool {
+	if len(q) > paletteSearchMax {
+		launch.err = "Search query too long (64 B max)"
+		return false
+	}
+	if _, err := execApp(gofilesBin, "--search", q); err != nil {
+		vi.ConsoleLine(MarkerLaunchMissing + gofilesBin)
+		launch.err = "Launch failed: " + gofilesBin
+		seatRefusalErr(err, "exec "+gofilesBin, gofilesBin)
+		return false
+	}
+	vi.ConsoleLine(MarkerLaunchSearch + q)
+	return true
 }
 
 // rankApps is the #2054 result model, three tiers over the catalog:
@@ -523,6 +915,14 @@ func handleLauncherKey(e vi.Event) bool {
 			launch.refresh()
 			emitLaunchFilter()
 		}
+		return true
+	case hidUsageTab, hidUsageRight:
+		// M191b: the verb affordance — Tab and the horizontal arrows
+		// cycle the selected row's verbs in either direction.
+		launch.stepVerb(1)
+		return true
+	case hidUsageLeft:
+		launch.stepVerb(-1)
 		return true
 	}
 	// Type-to-filter even if Ctrl is still down from the summon chord
@@ -695,6 +1095,22 @@ func paintLauncher(scan []byte, width, height int) int {
 			seatText(c, row, x+6, y+13, seatSmallPx, launchText(e.detail, 29), tok.Muted)
 			continue
 		}
+		if ci == paletteSearchIdx || ci <= launchFileIdx0 {
+			// M191b: the filename hits and the M165f hand-off share the
+			// palette rows' two-line shape — name and context (the
+			// containing folder, or the armed verb's name on the
+			// selected row).
+			label, detail := launch.hitRowText(ci)
+			if i == launch.sel && launch.verbArmed() {
+				detail = launch.verbs[launch.verb].name
+			}
+			row := widgets.Rect{X: x, Y: y, W: w, H: rh}
+			paintLauncherRow(c, row, i == launch.sel)
+			written += seatArea(c, row)
+			seatText(c, row, x+6, y+3, seatTextPx, launchText(label, 29), tok.Ink)
+			seatText(c, row, x+6, y+13, seatSmallPx, launchText(detail, 29), tok.Muted)
+			continue
+		}
 		if ci < 0 || ci >= len(launch.catalog) {
 			continue
 		}
@@ -712,6 +1128,13 @@ func paintLauncher(scan []byte, width, height int) int {
 			ink = tok.InkMuted
 			seatText(c, row, x+6, y+3, seatTextPx, launchText(launch.catalog[ci].Label, 28), ink)
 			seatText(c, row, x+6, y+13, seatSmallPx, launchText(reason, 28), tok.Muted)
+			continue
+		}
+		if i == launch.sel && launch.verbArmed() {
+			// The armed verb takes the row's second line — the affordance
+			// made visible, exactly like the file rows'.
+			seatText(c, row, x+6, y+3, seatTextPx, launchText(launch.catalog[ci].Label, 28), ink)
+			seatText(c, row, x+6, y+13, seatSmallPx, launchText(launch.verbs[launch.verb].name, 28), tok.Muted)
 			continue
 		}
 		seatText(c, row, x+6, y+6, seatTextPx, launchText(launch.catalog[ci].Label, 29), ink)

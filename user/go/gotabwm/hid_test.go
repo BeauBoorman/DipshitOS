@@ -858,7 +858,10 @@ func TestLauncherCtrlSpaceToggleAndFilter(t *testing.T) {
 	if launch.filter != "calc" {
 		t.Fatalf("filter = %q want calc", launch.filter)
 	}
-	if len(launch.filtered) != 1 || launch.catalog[launch.filtered[0]].Bin != "GOCALC.ELF" {
+	// M191b: the manifest hit ranks first; the M165f hand-off row is the
+	// one synthetic row a non-empty filter always carries last.
+	if len(launch.filtered) != 2 || launch.catalog[launch.filtered[0]].Bin != "GOCALC.ELF" ||
+		launch.filtered[1] != paletteSearchIdx {
 		t.Fatalf("filtered = %v", launch.filtered)
 	}
 	// #2054 AC-C4: Esc is two-step — clear the typed query, then dismiss.

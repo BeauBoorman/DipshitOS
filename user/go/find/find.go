@@ -71,3 +71,40 @@ func at(buf []byte, off int, pat []byte) bool {
 	}
 	return true
 }
+
+// FoldByte is the ASCII case fold the name matchers share: a-z fold onto
+// A-Z, every other byte is itself (no Unicode case folding — the same
+// plain-bytes rule GOFILES' content walk documents).
+func FoldByte(c byte) byte {
+	if c >= 'a' && c <= 'z' {
+		return c - ('a' - 'A')
+	}
+	return c
+}
+
+// ContainsFold reports whether pat occurs anywhere in s under the ASCII
+// fold — the same left-to-right scan shape at() runs, with both sides
+// compared folded. It is the predicate a NAME search wants (the
+// launcher's filename hits, M191b): callers pass the needle pre-folded
+// (FoldByte over each byte) so a per-candidate check stays a scan, never
+// a re-fold. The byte-exact All/From stay the editors' rules — a find
+// bar honours what the document says, a name lookup honours what the
+// user meant.
+func ContainsFold(s, patFolded []byte) bool {
+	if len(patFolded) == 0 || len(patFolded) > len(s) {
+		return false
+	}
+	for i := 0; i+len(patFolded) <= len(s); i++ {
+		ok := true
+		for j := 0; j < len(patFolded); j++ {
+			if FoldByte(s[i+j]) != patFolded[j] {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			return true
+		}
+	}
+	return false
+}

@@ -77,6 +77,11 @@
 # ctrl+shift+pageup/pagedown move the focused cell, ctrl+shift+n pins it to
 # the front, ctrl+shift+w closes it. Reopen/duplicate keep runs 04/05.
 #
+# Run 21 (M191b / #3243): launcher verbs + filename hits — the filename
+# hit as a second result kind, Tab arming the reveal verb, GOFILES
+# opening the containing folder, and the M165f hand-off row as this
+# face's answer to a content-intent query.
+#
 # Runs 17–19 (M121e / #2568): the undo chord on every surface it routes.
 # One boot per surface — a focus switch cannot ride inside a chord batch:
 # the seat's WM_KEY mirror lags the app's own KEY_DOWN delivery (measured
@@ -102,7 +107,7 @@
 #   bash tools/go/build-goterm.sh    ->  .build/go/GOTERM.ELF
 #   bash tools/go/build-gocalc.sh    ->  .build/go/GOCALC.ELF
 #   bash tools/go/build-goset.sh     ->  .build/go/GOSET.ELF   (run 08)
-#   bash tools/go/build-files.sh     ->  .build/go/GOFILES.ELF (run 18)
+#   bash tools/go/build-files.sh     ->  .build/go/GOFILES.ELF (runs 18-21)
 #
 # exec-order: assert-proven -- each run ends on a script-only marker
 # (`rx-gotabwm-hid-ok` / `rx-gotabwm-hid-drag-ok`), and every stage gate
@@ -227,6 +232,12 @@ fmu = os.path.join(share, "FMUNDO")
 os.makedirs(fmu, exist_ok=True)
 with open(os.path.join(fmu, "NOTE.TXT"), "w") as f:
     f.write("m121e trash-restore\n")
+# M191b (#3243): run 21's filename hit — a one-file dir so the reveal
+# verb's `GOFILES.ELF /host/LV` lands with VERB.TXT the selected row.
+lv = os.path.join(share, "LV")
+os.makedirs(lv, exist_ok=True)
+with open(os.path.join(lv, "VERB.TXT"), "w") as f:
+    f.write("m191b launcher verbs\n")
 ed = os.path.join(share, "EDIT")
 os.makedirs(ed, exist_ok=True)
 seed = os.path.join(ed, "SEED.TXT")
@@ -1406,7 +1417,9 @@ vgate_run 13 -- \
     --script3-after 'goedit: saved /host/EDIT/M87.TXT n=10' --script3-delay 8 \
     --script-expect 'rx-gotabwm-menu-ok' --timeout 300
 vgate_assert 13 serial-contains 'gotabwm: launcher focus sink='
-vgate_assert 13 serial-contains 'gotabwm: launcher filter q=calc n=1'
+# M191b: n=3 — the manifest row, the /host/GOCALC.ELF filename hit, and
+# the M165f hand-off row this face now carries too.
+vgate_assert 13 serial-contains 'gotabwm: launcher filter q=calc n=3'
 vgate_assert 13 serial-contains 'gotabwm: launcher restore id='
 vgate_assert 13 serial-contains 'goedit: saved /host/EDIT/M87.TXT n=10'
 vgate_assert 13 share-equals EDIT/M87.TXT $'seed-line\n'
@@ -1443,7 +1456,7 @@ vgate_run 14 -- \
     --pointer-virtio-after 'goedit: present' \
     --input-string 'calc' --input-string-after 'gotabwm: launcher open n=' \
     --input-chords 'escape,escape' \
-    --input-chords-after 'gotabwm: launcher filter q=calc n=1' \
+    --input-chords-after 'gotabwm: launcher filter q=calc n=3' \
     --script-expect 'gotabwm: launcher restore id=' --script-expect-tail 4 --timeout 120
 vgate_assert 14 serial-contains 'gotabwm: launcher filter q= n='
 vgate_assert 14 serial-contains 'gotabwm: launcher restore id='
@@ -1461,7 +1474,7 @@ edit = re.search(r"goedit: open id=(\d+)", s)
 sink = re.search(r"gotabwm: launcher focus sink=(\d+)", s)
 restore = re.search(r"gotabwm: launcher restore id=(\d+)", s)
 assert edit and sink and restore and edit[1] == restore[1] and sink[1] != edit[1]
-assert sink.start() < s.index("gotabwm: launcher filter q=calc n=1") < restore.start()
+assert sink.start() < s.index("gotabwm: launcher filter q=calc n=3") < restore.start()
 assert restore.start() < s.index("gotabwm: launcher dismiss")
 print("Escape restored the former live editor after filtering, without app input")
 PY
@@ -1956,4 +1969,80 @@ if app_m.group(1) != "5":
     sys.exit("app pasted n=%s, want the older clip's 5 bytes" % app_m.group(1))
 print("M190a leg: text push@%d uri push@%d menu@%d pick i=1@%d paste id=%s@%d app n=5@%d" % (
     txt_i, uri_i, open_i, pick_i, paste_m.group(1), paste_i, app_i))
+PYEOF
+
+# ---------------------------------------------------------------------------
+# Run 21 (M191b / #3243): launcher verbs + filename hits. Seat-only; the
+# filename hit is a real second result kind under a named bound. 'verb'
+# names no app — the /host/LV/VERB.TXT hit is row 0 — so Tab arms the
+# reveal verb and Enter execs GOFILES at the containing folder, whose
+# one-file listing lands on VERB.TXT. A second summon types a query with
+# no name match anywhere: the M165f hand-off row is the only offer left,
+# and Enter on it execs `GOFILES.ELF --search <q>` — the content-intent
+# answer stays the hand-off, never an inline snippet. Seat + two GOFILES
+# clients is the #1449 wall the seat-only legs stay inside.
+vgate_file script3-m191b.txt <<'SCRIPT'
+wm
+dui
+echo rx-gotabwm-verbs-ok
+SCRIPT
+
+vgate_run 21 -- \
+    --screen '$RUN_DIR/screen-21' \
+    --via-virtio \
+    --script '$RUN_DIR/script-bt1.txt' \
+    --script2 '$RUN_DIR/script2-launch.txt' \
+    --script2-after 'gotabwm: win focus' \
+    --input-chords 'ctrl-space,v,e,r,b,tab,return' \
+    --input-chords-after 'gotabwm: present' \
+    --input-chords2 'ctrl-space,z,z,z,q,q,return' \
+    --input-chords2-after 'gofiles: ready' \
+    --script3 '$RUN_DIR/script3-m191b.txt' \
+    --script3-after 'wm: unregistered, shim resumed' \
+    --script-expect 'rx-gotabwm-verbs-ok' --timeout 300
+
+vgate_assert 21 serial-contains 'VirelaiOS kernel has seized control.'
+vgate_assert 21 serial-contains 'exec: loaded GOTABWM.ELF'
+vgate_assert 21 serial-contains 'gotabwm: registered'
+vgate_assert 21 serial-contains 'gotabwm: launcher files q=verb n=1'
+vgate_assert 21 serial-contains 'gotabwm: launcher filter q=verb n=2'
+vgate_assert 21 serial-contains 'gotabwm: launcher verb reveal'
+vgate_assert 21 serial-contains 'gotabwm: launcher exec GOFILES.ELF argv=/host/LV'
+vgate_assert 21 serial-contains 'gofiles: list /host/LV n=1'
+vgate_assert 21 serial-contains 'gofiles: entry VERB.TXT file'
+# A name match nothing makes still offers the hand-off row: the lone
+# filtered row on 'zzzqq' is the M165f search hand-off, and Enter runs it.
+vgate_assert 21 serial-contains 'gotabwm: launcher files q=zzzqq n=0'
+vgate_assert 21 serial-contains 'gotabwm: launcher filter q=zzzqq n=1'
+vgate_assert 21 serial-contains 'gotabwm: launcher search q=zzzqq'
+vgate_assert 21 serial-contains 'gofiles: search arg q=zzzqq'
+vgate_assert 21 serial-exact 'exec: loaded GOFILES.ELF' 2
+vgate_assert 21 serial-contains 'gotabwm OK'
+vgate_assert 21 serial-contains 'wm: unregistered, shim resumed'
+vgate_assert 21 serial-contains 'rx-gotabwm-verbs-ok'
+vgate_assert 21 serial-absent 'gotabwm: launcher missing '
+vgate_assert 21 serial-absent '[EXC] parking:'
+vgate_assert 21 serial-absent 'exited status=139'
+vgate_assert 21 python <<'PYEOF'
+import os, re, sys
+ser = open(os.environ["VG_SER"], errors="replace").read().splitlines()
+
+def first_after(prefix, start=0):
+    for i in range(start, len(ser)):
+        if ser[i].startswith(prefix):
+            return i
+    sys.exit("missing %s after %d" % (prefix, start))
+
+files_i = first_after("gotabwm: launcher files q=verb n=1")
+verb_i = first_after("gotabwm: launcher verb reveal", files_i)
+exec_i = first_after("gotabwm: launcher exec GOFILES.ELF argv=/host/LV", verb_i)
+list_i = first_after("gofiles: list /host/LV n=1", exec_i)
+entry_i = first_after("gofiles: entry VERB.TXT file", list_i)
+search_i = first_after("gotabwm: launcher search q=zzzqq", entry_i)
+arg_i = first_after("gofiles: search arg q=zzzqq", search_i)
+if not (files_i < verb_i < exec_i < list_i < entry_i < search_i < arg_i):
+    sys.exit("verb leg out of order: files@%d verb@%d exec@%d list@%d entry@%d search@%d arg@%d" % (
+        files_i, verb_i, exec_i, list_i, entry_i, search_i, arg_i))
+print("M191b leg: hit@%d verb@%d exec@%d list@%d hand-off@%d arg@%d" % (
+    files_i, verb_i, exec_i, list_i, search_i, arg_i))
 PYEOF

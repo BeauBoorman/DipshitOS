@@ -237,7 +237,7 @@ func TestLauncherRanksPrefixSubstringThenFuzzy(t *testing.T) {
 			"RUNNER.ELF | Runner | r | dock=false | argv=--calc-mode\n" + // fuzzy via argv=
 			"GOFILES.ELF | Files | f\n")
 	launch.filter = "calc"
-	want := []int{1, 0, 2, 3}
+	want := []int{1, 0, 2, 3, paletteSearchIdx} // M191b: the hand-off row rides last
 	for i := 0; i < 100; i++ {
 		launch.refresh()
 		if len(launch.filtered) != len(want) {
@@ -329,8 +329,13 @@ func TestLauncherHitRejectsHeaderPaddingAndUnpaintedRows(t *testing.T) {
 	launch.filter = "no such app"
 	launch.refresh()
 	paintLauncher(scan, vi.ScanoutWidth, vi.ScanoutHeight)
-	if _, ok := launchRowAt(uint32(x), uint32(y)); ok {
-		t.Fatal("no-match message must not launch")
+	// M191b: a no-match filter still offers the M165f hand-off row —
+	// row 0 IS a real target; the empty region below it is not.
+	if i, ok := launchRowAt(uint32(x), uint32(y)); !ok || i != 0 {
+		t.Fatal("the hand-off row must be a real target")
+	}
+	if _, ok := launchRowAt(uint32(x), uint32(y+launch.rowH())); ok {
+		t.Fatal("the row under the lone hand-off must not hit")
 	}
 }
 
@@ -565,5 +570,238 @@ func TestLauncherEscapeRestoresFocusWithoutInterpretingSinkCopies(t *testing.T) 
 	handleWmKey(vi.Event{Kind: vi.EvWmKey, Arg0: uint32(hidUsageEscape)})
 	if launch.open || launch.sink != 0 || len(*closes) != 1 || (*raises)[len(*raises)-1] != 3 {
 		t.Fatal("Escape did not release the sink and restore the old app")
+	}
+}
+
+// --- M191b (#3243): filename hits + verb rows ---------------------------
+
+func dirEnt(name string, dir bool) vi.DirEntry {
+	var e vi.DirEntry
+	copy(e.Name[:], name)
+	if dir {
+		e.IsDir = 1
+	}
+	return e
+}
+
+// stubLaunchTree stubs the walk's directory seam with a path -> entries
+// table (searchDirList/mountRows pattern), plus readAppsFile for the
+// manifest and the mime heads.
+func stubLaunchTree(t *testing.T, tree map[string][]vi.DirEntry, files map[string]string) {
+	t.Helper()
+	oldDir, oldRead := launchDirList, readAppsFile
+	launchDirList = func(path string, buf []vi.DirEntry) (int, int64) {
+		ents, ok := tree[path]
+		if !ok {
+			return 0, -vi.ErrENOENT
+		}
+		n := len(ents)
+		if n > len(buf) {
+			n = len(buf)
+		}
+		copy(buf, ents[:n])
+		return n, 0
+	}
+	readAppsFile = func(path string, max int) ([]byte, int64) {
+		if path == appsPath {
+			return []byte("GOCALC.ELF | Calculator | c\nGOEDIT.ELF | Code Editor | e | dock=true | v=2 | opens=text,binary\nNOTE.ELF | Text Editor | n | dock=true | v=2 | opens=text\n"), 0
+		}
+		if s, ok := files[path]; ok {
+			b := []byte(s)
+			if len(b) > max {
+				b = b[:max]
+			}
+			return b, 0
+		}
+		return nil, -vi.ErrENOENT
+	}
+	t.Cleanup(func() { launchDirList, readAppsFile = oldDir, oldRead })
+}
+
+func TestLauncherFilenameHitsJoinTheResults(t *testing.T) {
+	defer saveSeatState()()
+	stubLaunchTree(t, map[string][]vi.DirEntry{
+		"/host":    {dirEnt("LV", true), dirEnt("GOCALC.ELF", false)},
+		"/host/LV": {dirEnt("VERB.TXT", false), dirEnt("OTHER.TXT", false)},
+	}, nil)
+	launch = launcherState{open: true}
+	loadLauncherCatalog()
+	launch.filter = "verb"
+	launch.refresh()
+	// The app rank holds the floor: file hits append after manifest rows
+	// and the hand-off sentinel rides last.
+	want := []int{launchFileIdx0, paletteSearchIdx}
+	if len(launch.filtered) != len(want) {
+		t.Fatalf("filtered = %v want %v", launch.filtered, want)
+	}
+	for i, v := range want {
+		if launch.filtered[i] != v {
+			t.Fatalf("filtered = %v want %v", launch.filtered, want)
+		}
+	}
+	h := launch.hits[0]
+	if h.path != "/host/LV/VERB.TXT" || h.name != "VERB.TXT" || h.dir != "/host/LV" {
+		t.Fatalf("hit = %+v", h)
+	}
+}
+
+func TestLauncherWalkNamesItsBounds(t *testing.T) {
+	defer saveSeatState()()
+	// The hits bound: more matching files than the entry cap, spread
+	// over two dirs — the kernel's own 16-row dir_list window bounds
+	// any single listing too.
+	var a, b []vi.DirEntry
+	for i := 0; i < 12; i++ {
+		a = append(a, dirEnt("VERBA"+string(rune('A'+i))+".TXT", false))
+		b = append(b, dirEnt("VERBB"+string(rune('A'+i))+".TXT", false))
+	}
+	a = append(a, dirEnt("D", true))
+	stubLaunchTree(t, map[string][]vi.DirEntry{"/host": a, "/host/D": b}, nil)
+	launch = launcherState{open: true}
+	launch.walkFiles("verb")
+	if launch.hitsTrunc != "hits" || len(launch.hits) != launchFileMaxHits {
+		t.Fatalf("trunc=%q n=%d want hits/%d", launch.hitsTrunc, len(launch.hits), launchFileMaxHits)
+	}
+	// The depth bound: a chain deeper than 4 holds its target unreachable.
+	launch = launcherState{open: true}
+	stubLaunchTree(t, map[string][]vi.DirEntry{
+		"/host":           {dirEnt("A", true)},
+		"/host/A":         {dirEnt("B", true)},
+		"/host/A/B":       {dirEnt("C", true)},
+		"/host/A/B/C":     {dirEnt("D", true)},
+		"/host/A/B/C/D":   {dirEnt("E", true)},
+		"/host/A/B/C/D/E": {dirEnt("VERB.TXT", false)},
+	}, nil)
+	launch.walkFiles("verb")
+	if launch.hitsTrunc != "depth" || len(launch.hits) != 0 {
+		t.Fatalf("trunc=%q n=%d want depth/0", launch.hitsTrunc, len(launch.hits))
+	}
+	// The visited bound: the traversal cap stops the walk even when the
+	// entry cap is nowhere near — 16 dirs of 16 entries each is 272
+	// visited rows inside the kernel's own 16-per-listing window.
+	launch = launcherState{open: true}
+	tree := map[string][]vi.DirEntry{"/host": {}}
+	for i := 0; i < 16; i++ {
+		d := "V" + string(rune('A'+i))
+		tree["/host"] = append(tree["/host"], dirEnt(d, true))
+		for j := 0; j < 16; j++ {
+			tree["/host/"+d] = append(tree["/host/"+d], dirEnt("Z"+string(rune('a'+j))+".TXT", false))
+		}
+	}
+	stubLaunchTree(t, tree, nil)
+	launch.walkFiles("verb")
+	if launch.hitsTrunc != "visited" {
+		t.Fatalf("trunc=%q want visited", launch.hitsTrunc)
+	}
+}
+
+func TestLauncherVerbsCycleAndDispatch(t *testing.T) {
+	defer saveSeatState()()
+	stubLauncherWindows(t)
+	stubLaunchTree(t, map[string][]vi.DirEntry{
+		"/host":    {dirEnt("LV", true)},
+		"/host/LV": {dirEnt("VERB.TXT", false)},
+	}, map[string]string{"/host/LV/VERB.TXT": "hello\n"})
+	launch = launcherState{}
+	openLauncher()
+	launch.filter = "verb"
+	launch.refresh()
+	if len(launch.filtered) != 2 {
+		t.Fatalf("filtered = %v want [hit hand-off]", launch.filtered)
+	}
+	// sel 0 is the file hit: verbs are open (mime dispatch -> GOEDIT),
+	// reveal (GOFILES at the parent), then the opens= candidates.
+	vs := launch.verbsFor(launch.filtered[0])
+	if len(vs) != 4 || vs[0].name != "open" || vs[0].bin != "GOEDIT.ELF" ||
+		vs[1].name != "reveal" || vs[1].bin != "GOFILES.ELF" ||
+		vs[2].bin != "GOEDIT.ELF" || vs[3].bin != "NOTE.ELF" {
+		t.Fatalf("verbs = %+v", vs)
+	}
+	calls := []string{}
+	oldExec := execApp
+	defer func() { execApp = oldExec }()
+	execApp = func(bin string, args ...string) (int64, error) {
+		calls = append(calls, bin+" "+joinSpace(args))
+		return 42, nil
+	}
+	// Tab arms reveal; Enter runs GOFILES at the containing folder.
+	launch.stepVerb(1)
+	if launch.verb != 1 {
+		t.Fatalf("verb = %d want 1 (reveal)", launch.verb)
+	}
+	execSelected()
+	if len(calls) != 1 || calls[0] != "GOFILES.ELF /host/LV" {
+		t.Fatalf("exec = %v want GOFILES.ELF /host/LV", calls)
+	}
+}
+
+func TestLauncherFileOpenFallsBackToReveal(t *testing.T) {
+	defer saveSeatState()()
+	// An unreadable head (or a type with no handler) opens GOFILES at
+	// the containing folder — the drop-open precedent, not a dead verb.
+	stubLaunchTree(t, map[string][]vi.DirEntry{
+		"/host":    {dirEnt("LV", true)},
+		"/host/LV": {dirEnt("BLOB.DAT", false)},
+	}, nil)
+	launch = launcherState{open: true}
+	launch.filter = "blob"
+	launch.refresh()
+	if len(launch.hits) != 1 {
+		t.Fatalf("hits = %v", launch.hits)
+	}
+	vs := launch.verbsFor(launch.filtered[0])
+	if vs[0].name != "open" || vs[0].bin != "GOFILES.ELF" || vs[0].argv[0] != "/host/LV" {
+		t.Fatalf("open fallback = %+v want GOFILES /host/LV", vs[0])
+	}
+}
+
+func TestLauncherHandOffRowExecsGofilesSearch(t *testing.T) {
+	defer saveSeatState()()
+	stubLauncherWindows(t)
+	stubLaunchTree(t, map[string][]vi.DirEntry{"/host": {}}, nil)
+	launch = launcherState{}
+	openLauncher()
+	launch.filter = "zzzqq"
+	launch.refresh()
+	// Nothing matches: the M165f hand-off row is the only offer, and
+	// Enter on it execs GOFILES --search with the query.
+	if len(launch.filtered) != 1 || launch.filtered[0] != paletteSearchIdx {
+		t.Fatalf("filtered = %v want [search]", launch.filtered)
+	}
+	calls := []string{}
+	oldExec := execApp
+	defer func() { execApp = oldExec }()
+	execApp = func(bin string, args ...string) (int64, error) {
+		calls = append(calls, bin+" "+joinSpace(args))
+		return 42, nil
+	}
+	execSelected()
+	if len(calls) != 1 || calls[0] != "GOFILES.ELF --search zzzqq" {
+		t.Fatalf("exec = %v want GOFILES.ELF --search zzzqq", calls)
+	}
+}
+
+func TestLauncherVerbDisarmsOnSelectionMove(t *testing.T) {
+	defer saveSeatState()()
+	stubLaunchTree(t, map[string][]vi.DirEntry{
+		"/host":    {dirEnt("LV", true)},
+		"/host/LV": {dirEnt("VERB.TXT", false), dirEnt("VERY.TXT", false)},
+	}, map[string]string{
+		"/host/LV/VERB.TXT": "a\n", "/host/LV/VERY.TXT": "b\n",
+	})
+	launch = launcherState{open: true}
+	loadLauncherCatalog()
+	launch.filter = "ver"
+	launch.refresh()
+	launch.stepVerb(1)
+	if !launch.verbArmed() {
+		t.Fatal("verb did not arm")
+	}
+	launch.sel = 1
+	if launch.verbArmed() {
+		t.Fatal("a selection move must disarm the verb")
+	}
+	if launch.effVerb() != 0 {
+		t.Fatal("disarmed verb must not commit")
 	}
 }

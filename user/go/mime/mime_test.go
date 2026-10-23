@@ -274,3 +274,31 @@ func TestIDNamesAreTheMarkerVocabulary(t *testing.T) {
 		}
 	}
 }
+
+// Spelling is the opens= vocabulary the manifest routes on: families
+// refined to the subtypes rows spell by name. Pinned so the launcher's
+// open-with (M191b) and GOFILES' menu can never drift on what a file IS.
+func TestSpelling(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		head string
+		want string
+	}{
+		{"NOTE.TXT", "hello\n", "text/plain"},
+		{"A.ICS", "BEGIN:VCALENDAR\n", "text/calendar"},
+		{"B.VCF", "BEGIN:VCARD\n", "text/vcard"},
+		{"P.PNG", "\x89PNG\r\n\x1a\nrest", "image/png"},
+		{"Q.QOI", "qoif\x00\x00", "image/qoi"},
+		{"G.GIF", "GIF89a\x00\x00", "image/gif"},
+		{"J.JPG", "\xff\xd8\xff\xe0rest", "image/jpeg"},
+		{"W.WAV", "RIFF\x00\x00\x00\x00WAVE", "audio"},
+		{"Z.ZIP", "PK\x03\x04rest", "archive"},
+		{"APP.ELF", "\x7fELFrest", "binary"},
+		{"R.PDF", "%PDF-1.4", "document"},
+		{"X.DAT", "\x00\x01\x02\x03", "application/octet-stream"},
+	} {
+		if got := Spelling(tc.name, []byte(tc.head)); got != tc.want {
+			t.Fatalf("Spelling(%q) = %q want %q", tc.name, got, tc.want)
+		}
+	}
+}

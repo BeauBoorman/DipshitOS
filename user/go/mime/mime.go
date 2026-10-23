@@ -256,6 +256,61 @@ func trimPartialRune(head []byte) int {
 	return len(head)
 }
 
+// Spelling names a file for the opens= vocabulary: the sniffed family
+// refined to a subtype for the formats the manifest's opens= rows route
+// by name (PNG/QOI/GIF/JPEG images; the extension-named text/calendar
+// and text/vcard cards), a bare family word elsewhere, and
+// "application/octet-stream" for bytes the table cannot name. It is the
+// vocabulary GOFILES' context menu and drag offers spell (files/drag.go's
+// fileMime, kept in step by hand — plus Document, which that copy predates
+// and names octet-stream), lifted here so every consumer matching manifest
+// opens= rows — the seat's launcher open-with, M191b — routes on one
+// spelling or the same file would earn different candidates per surface.
+func Spelling(name string, head []byte) string {
+	switch Sniff(name, head) {
+	case Text:
+		switch extOf(name) {
+		case "ics":
+			return "text/calendar"
+		case "vcf":
+			return "text/vcard"
+		}
+		return "text/plain"
+	case Image:
+		switch {
+		case at(head, 0, "\x89PNG\r\n\x1a\n"):
+			return "image/png"
+		case at(head, 0, "qoif"):
+			return "image/qoi"
+		case at(head, 0, "GIF87a"), at(head, 0, "GIF89a"):
+			return "image/gif"
+		case at(head, 0, "\xff\xd8\xff"):
+			return "image/jpeg"
+		}
+		return "image"
+	case Audio:
+		return "audio"
+	case Archive:
+		return "archive"
+	case Binary:
+		return "binary"
+	case Document:
+		return "document"
+	}
+	return "application/octet-stream"
+}
+
+// extOf is the lower-case extension a subtype spelling routes on — the
+// same admission rule byExt applies (no dot, or a leading dot only, is
+// no extension).
+func extOf(name string) string {
+	i := strings.LastIndexByte(name, '.')
+	if i <= 0 || i == len(name)-1 {
+		return ""
+	}
+	return strings.ToLower(name[i+1:])
+}
+
 // Handler is one app that can open a type: the binary to exec and the label a
 // menu shows for it.
 type Handler struct {
