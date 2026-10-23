@@ -46,6 +46,16 @@
 # Class A — deterministic, no Apple silicon, no VZ VM. Wired into
 # `just verify-portable` and GitHub CI (the class-A set).
 #
+# MUTATION ISOLATION: mutations are applied to a private copy of
+# kernel/src under a temp dir, never to the working tree. Earlier
+# revisions mutated in place behind a "<file>.mutated" backup; a SIGKILL
+# (execution timeout) cannot be trapped, so the live mutation and its
+# backup leaked into the tree and the next test run failed on leftover
+# state rather than a real regression. The shadow copy makes the source
+# tree provably clean under any kill; the EXIT trap drops the temp dir
+# on every trappable path, and an entry-time self-heal restores any
+# ".mutated" backup a pre-fix crashed run left behind.
+#
 # Usage:
 #   bash tools/verify-mutations.sh
 #
@@ -58,6 +68,32 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 fail() { echo "FAIL: $1" >&2; exit 1; }
+
+# Restore any "<file>.mutated" backups left in the tree by a killed run
+# of an earlier in-place revision (nothing else in the repo produces
+# that suffix; the current revision never creates them).
+heal_mutated() {
+    local b found=0
+    while IFS= read -r b; do
+        mv "$b" "${b%.mutated}"
+        found=1
+    done < <(find . -path ./.git -prune -o -name '*.mutated' -print)
+    [ "$found" -eq 1 ] && echo "verify-mutations: restored stale .mutated backup(s) from a prior killed run" >&2
+    return 0
+}
+heal_mutated
+
+SHADOW="$(mktemp -d "${TMPDIR:-/tmp}/verify-mutations.XXXXXX")"
+cleanup() {
+    rm -rf "$SHADOW"
+    heal_mutated
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+mkdir -p "$SHADOW/kernel"
+cp -R kernel/src "$SHADOW/kernel/src"
 
 echo "=== verify-mutations: the generalized bit-order mutation check ==="
 
@@ -75,10 +111,12 @@ while IFS='|' read -r label file old new modules; do
     echo
     echo "[mutation $n] $label ($file)"
     [ -f "$file" ] || fail "mutation target missing: $file"
-    cp "$file" "$file.mutated"
+    # Mutate the shadow copy; the working tree is never touched.
+    cp "$file" "$SHADOW/$file.mutated"
     # Literal replace; fail loudly if the anchor is gone (the code
     # structure changed and this mutation is now stale — better to know).
-    python3 - "$file" "$old" "$new" <<'PYEOF'
+    anchor_rc=0
+    python3 - "$SHADOW/$file" "$old" "$new" <<'PYEOF' || anchor_rc=$?
 import sys
 path, old, new = sys.argv[1], sys.argv[2], sys.argv[3]
 src = open(path).read()
@@ -87,21 +125,20 @@ if old not in src:
     sys.exit(2)
 open(path, "w").write(src.replace(old, new, 1))
 PYEOF
-    anchor_rc=$?
     if [ $anchor_rc -ne 0 ]; then
-        mv "$file.mutated" "$file"
+        mv "$SHADOW/$file.mutated" "$SHADOW/$file"
         fail "mutation $label: anchor not found in $file (the seam moved — refresh this manifest entry)"
     fi
 
     ok=0
     for m in $modules; do
-        if zig test "kernel/src/$m.zig" >/dev/null 2>&1; then
+        if zig test "$SHADOW/kernel/src/$m.zig" >/dev/null 2>&1; then
             echo "  !! $m did NOT fail under the mutation — the golden cannot detect this regression"
         else
             ok=1
         fi
     done
-    mv "$file.mutated" "$file"
+    mv "$SHADOW/$file.mutated" "$SHADOW/$file"
     if [ $ok -eq 0 ]; then
         fail "mutation $label: NO module failed — the goldens cannot detect this bit-order regression"
     fi
