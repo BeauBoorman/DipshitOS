@@ -19,6 +19,7 @@ func regFaces(t *testing.T) map[string]*Face {
 		"FIRACODE.TTF": loadFace(t, firaPath),
 		"CHROME.TTF":   loadFace(t, chromePath),
 		"NOTOSERF.TTF": loadFace(t, "../../../image/fonts/NotoSerif-Regular.ttf"),
+		"NOTOHEB.TTF":  loadFace(t, "../../../image/fonts/NotoSansHebrew-Regular.ttf"),
 	}
 }
 
@@ -60,13 +61,15 @@ func TestManifestParsesShippedShape(t *testing.T) {
 	// the M99o bold-italic: NOTOSERF is both the serif role's primary and the
 	// ui cascade's tail, NOTOCJK trails the symbol faces so every chain
 	// reaches it last, and INTERBI is the one row carrying weight=700 AND
-	// style=italic, sorted last so no other cascade moves.
+	// style=italic. M178a adds NOTOHEB as the ui cascade's Hebrew tail at
+	// order=6, after the styled rows.
 	want := []FaceSpec{
 		{File: "INTER.TTF", Role: "ui", Order: 1, Weight: 400},
 		{File: "INTERB.TTF", Role: "ui", Order: 2, Weight: 700},
 		{File: "INTERI.TTF", Role: "ui", Order: 3, Weight: 400, Italic: true},
 		{File: "NOTOSERF.TTF", Role: "ui", Order: 4, Weight: 400},
 		{File: "INTERBI.TTF", Role: "ui", Order: 5, Weight: 700, Italic: true},
+		{File: "NOTOHEB.TTF", Role: "ui", Order: 6, Weight: 400},
 		{File: "FIRACODE.TTF", Role: "mono", Order: 1, Weight: 400},
 		{File: "NOTOSERF.TTF", Role: "serif", Order: 1, Weight: 400},
 		{File: "CHROME.TTF", Role: "symbol", Order: 1, Weight: 400},
@@ -515,6 +518,46 @@ func TestSerifStyledQueriesRefuseByName(t *testing.T) {
 		ch := reg.Chain(q)
 		if ch == nil || ch.Primary() != faces["NOTOSERF.TTF"] {
 			t.Fatalf("%+v resolved %v, want the regular serif face", q, ch.Primary())
+		}
+	}
+}
+
+// TestChainHebrewReachesTheCoverageFace is the M178a cascade fact: a Hebrew
+// rune falls through every earlier ui face to NOTOHEB (real ink, no notdef),
+// while the Latin around it stays on the primary.
+func TestChainHebrewReachesTheCoverageFace(t *testing.T) {
+	faces := regFaces(t)
+	load, reads := fixtureLoader(t, faces)
+	specs, err := ParseManifest([]byte(`# test
+INTER.TTF    | role=ui | order=1
+INTERB.TTF   | role=ui | order=2 | weight=700
+NOTOHEB.TTF  | role=ui | order=6
+CHROME.TTF   | role=symbol | order=1
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	reg := NewRegistry(specs, load)
+	ui := reg.Chain(Query{Role: "ui"})
+	pieces := ui.Split("abאבגde")
+	if len(pieces) != 3 || pieces[1].Face != faces["NOTOHEB.TTF"] {
+		t.Fatalf("Hebrew run did not split onto NOTOHEB: %+v", pieces)
+	}
+	if pieces[0].Face != faces["INTER.TTF"] || pieces[2].Face != faces["INTER.TTF"] {
+		t.Fatalf("Latin did not stay on the primary: %+v", pieces)
+	}
+	if reg.Notdef() != 0 {
+		t.Errorf("a covered Hebrew rune counted as notdef (%d)", reg.Notdef())
+	}
+	// The cascade walked role order on the miss: INTER, INTERB, NOTOHEB — and
+	// the symbol face was never read for a covered rune.
+	want := []string{"INTER.TTF", "INTERB.TTF", "NOTOHEB.TTF"}
+	if len(*reads) != len(want) {
+		t.Fatalf("reads %v, want %v", *reads, want)
+	}
+	for i := range want {
+		if (*reads)[i] != want[i] {
+			t.Fatalf("reads %v, want %v", *reads, want)
 		}
 	}
 }

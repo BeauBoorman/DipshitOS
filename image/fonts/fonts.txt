@@ -1,42 +1,41 @@
 # VirelaiOS font registry manifest (M99l, #2189), staged as /host/FONTS.TXT.
-#
-# Wire format follows the APPS.TXT v2 shape: pipe-separated fields, '#' is a
-# comment, blank lines are skipped. Field 1 is the share file name (the 8.3
-# names frozen by M69d #1531 D1); the rest are order-insensitive `key=value`
-# fields, and unknown keys are ignored so a newer manifest still decodes.
+# Pipe-separated fields; '#' comments; field 1 is the share file name (8.3
+# names frozen by M69d #1531 D1); the rest are order-insensitive key=value
+# fields, unknown keys ignored so a newer manifest still decodes.
 #
 #   FILE.TTF | role=ui|mono|serif|symbol | order=N | weight=N | style=normal|italic
-#
-#   role    the slot a consumer asks for. symbol is the role nothing asks for
-#           directly: symbol faces are the tail of EVERY role's cascade.
-#   order   cascade rank inside a role (default 0); the lowest order is the
-#           role's default face. Rows are order-insensitive on the wire.
-#   weight  400 normal, 700 bold — a numeric weight, not a name. Absent = 400.
+#   role    the slot a consumer asks for; symbol faces are the tail of EVERY
+#           role's cascade.
+#   order   cascade rank inside a role (default 0); lowest is the default.
+#   weight  numeric: 400 normal, 700 bold. Absent = 400.
 #   style   normal | italic. Absent = normal.
 #
 # Coverage is never declared here: the registry reads each face's cmap at
 # load, so the file cannot lie about what a face covers. A rune the primary
-# lacks falls through the role's other faces in order, then the symbol faces;
-# one nothing covers paints the primary's .notdef and is counted
+# lacks falls through the role's other faces in order, then the symbol
+# faces; one nothing covers paints the primary's .notdef and is counted
 # (`fonts: notdef=N`), never dropped.
 #
 # Only the Go engine reads this manifest (ADR 0034 amendment A): the frozen
-# Zig paths keep their hard-coded face list, and a missing or refused manifest
+# Zig paths keep their hard-coded face list; a missing or refused manifest
 # falls back to that same set.
 #
-# M99m (#2190) coverage faces — both OFL 1.1, both static glyf TTFs instanced
-# from Google Fonts variable fonts and rebuilt by tools/fonts/build-faces.py
-# (pinned source URL + SHA-256 inside; fontTools is MIT). Neither engine
-# parses CFF, so the canonical CFF Noto CJK releases are unusable; these are
-# glyf builds. Excluded by name — they need complex shaping or bidi, both
-# named mountains: Arabic, Hebrew, Indic and Thai. Hangul is deferred: this
-# card ships a JP build, and Hangul syllables need a Noto Sans KR face.
+# M99m (#2190) coverage faces — OFL 1.1 static glyf TTFs instanced by
+# tools/fonts/build-faces.py from pinned sources. Excluded by name (need
+# complex shaping): Arabic, Indic, Thai. Hangul deferred (needs a KR face).
+#
+# M178a (#3144): NOTOHEB.TTF is the Hebrew face — same build recipe, subset
+# to the Hebrew block + presentation forms — sitting at the ui tail
+# (order=6). user/go/ttf/bidi.go reorders the fragment before glyph lookup,
+# so the face only ever sees Hebrew text; niqqud paints at its default
+# advance (no mark positioning — named limitation). Arabic stays refused:
+# its runes classify AL for bidi, but joining/shaping is out of scope.
+# HEADROOM: the guest caps this file at 4096 bytes (maxManifestBytes).
 #
 # NOTOSERF appears twice on purpose. The role=serif row is the face
-# font-family:serif resolves to (M99p #2193 wired the query). The
-# role=ui row puts the same face in today's ui cascade so runes only it
-# covers paint serif instead of .notdef; the faces map caches by file, so
-# the two rows still cost one lazy load.
+# font-family:serif resolves to (M99p #2193 wired the query); the role=ui
+# row puts it in the ui cascade so runes only it covers paint serif instead
+# of .notdef. The faces map caches by file — one lazy load for two rows.
 #
 #   face           source                          bytes   sha256
 #   NOTOSERF.TTF   Noto Serif 2.015 (var->Regular)  359680  7f5399a928da58075d578960e9ea89afa0a4588574894b4f20f11ae4a63c5f84
@@ -45,19 +44,20 @@
 #   INTERBI.TTF    Inter Bold Italic (4.001, the    425296  948405a16cdc62701da5f4005ed068ca5f4d27061d98f7974ccfc37831d9581d
 #                  same rsms/inter v4.1 extras/ttf
 #                  build as the pinned faces)
+#   NOTOHEB.TTF    Noto Sans Hebrew 3.001          11144   8c90e099d5ab5817a2adda0d7578410460b307f1385ca1cd1fcb2a3c16d77277
+#                  (var->Regular, Hebrew blocks)
 #
 # M99o (#2192): INTERBI is the bold-italic face — one row carries weight=700
-# AND style=italic, so only a {bold,italic} query selects it; it sorts after
-# the existing ui rows so every other chain's cascade order is unchanged.
-# Serif bold/italic policy is refusal-by-name: NOTOSERF has no styled rows,
-# so a serif {bold} / {italic} / {bold,italic} query degrades to the regular
-# serif face — real glyphs at real coverage, never a synthetic shear or
-# embolden.
+# AND style=italic, so only a {bold,italic} query selects it; it sorts last
+# so every other chain's cascade order is unchanged. Serif bold/italic is
+# refused by name: NOTOSERF has no styled rows, so a styled serif query
+# degrades to the regular serif face — never a synthetic shear/embolden.
 INTER.TTF    | role=ui     | order=1 | weight=400 | style=normal
 INTERB.TTF   | role=ui     | order=2 | weight=700 | style=normal
 INTERI.TTF   | role=ui     | order=3 | weight=400 | style=italic
 NOTOSERF.TTF | role=ui     | order=4 | weight=400 | style=normal
 INTERBI.TTF  | role=ui     | order=5 | weight=700 | style=italic
+NOTOHEB.TTF  | role=ui     | order=6 | weight=400 | style=normal
 FIRACODE.TTF | role=mono   | order=1 | weight=400 | style=normal
 NOTOSERF.TTF | role=serif  | order=1 | weight=400 | style=normal
 CHROME.TTF   | role=symbol | order=1 | weight=400 | style=normal

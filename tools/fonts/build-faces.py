@@ -22,8 +22,10 @@ Usage:
   python3 tools/fonts/build-faces.py --fetch DIR     # downloads + verifies into DIR first
 
 Outputs (written to image/fonts/):
-  NotoSerif-Regular.ttf   -> staged share name NOTOSERF.TTF (role=serif, ui tail)
-  NotoSansJP-Regular.ttf  -> staged share name NOTOCJK.TTF  (role=symbol tail)
+  NotoSerif-Regular.ttf    -> staged share name NOTOSERF.TTF (role=serif, ui tail)
+  NotoSansJP-Regular.ttf   -> staged share name NOTOCJK.TTF  (role=symbol tail)
+  NotoSansHebrew-Regular.ttf -> staged NOTOHEB.TTF (role=ui cascade tail; M178a
+                             #3144 — bidi lives in user/go/ttf/bidi.go)
 """
 
 import hashlib
@@ -49,6 +51,17 @@ SOURCES = {
                "ofl/notosansjp/NotoSansJP%5Bwght%5D.ttf",
         "sha256": "c2f3b4d463500a2ddcd3849cded1fceeb9fd6d1c32e6cbecd568453ba50fc68f",
         "family": "Noto Sans JP 2.004", "license": "OFL-1.1",
+    },
+    # M178a (#3144): the Hebrew face for the bidi arc. Same google/fonts
+    # commit pin as NotoSerif; OFL 1.1, no Reserved Font Name (METADATA.pb
+    # declares designer "Google", the OFL header names The Noto Project
+    # Authors only).
+    "NotoSansHebrew-var.ttf": {
+        "url": "https://raw.githubusercontent.com/google/fonts/"
+               "8b0a1d0f5983c89bc2b93f1b5fb55f9e252744b5/"
+               "ofl/notosanshebrew/NotoSansHebrew%5Bwdth%2Cwght%5D.ttf",
+        "sha256": "7ef36a2c3593758cdb622e1bdef4f84523e92fbc3ccc667438dd80ff54c2de88",
+        "family": "Noto Sans Hebrew 3.001", "license": "OFL-1.1",
     },
 }
 
@@ -92,6 +105,18 @@ KYOIKU = (
     "糖系紅納純絹縦縮署翌聖肺胃背胸脳腸腹臓臨至舌若著蒸蔵蚕衆裁装裏補視覧討訪訳詞誌認誕誠誤論諸警貴賃退遺郵郷針銭鋼閉閣降陛除障難革頂"
     "預骨"
 )
+
+
+# The Hebrew repertoire (M178a): the whole Hebrew block — letters, niqqud
+# (the combining points W1 attaches to the preceding letter at bidi-resolve
+# time; they paint at their default advance, no mark positioning) — and the
+# Hebrew Alphabetic Presentation Forms. Latin coverage stays with the ui
+# primaries: the registry cascade hands Latin runes to Inter first, so this
+# face keeps only what Inter lacks.
+HEBREW_BLOCKS = [
+    (0x0590, 0x05FF),  # Hebrew
+    (0xFB1D, 0xFB4F),  # Hebrew presentation forms
+]
 
 
 def fetch_sources(src_dir):
@@ -148,6 +173,17 @@ def build(src_dir, out_dir):
     cjk = prune(cjk, uni)
     out = os.path.join(out_dir, "NotoSansJP-Regular.ttf")
     cjk.save(out)
+    report(out)
+
+    # Hebrew (M178a): instanced at Regular weight and nominal width, then the
+    # bounded Hebrew subset above.
+    hebrew = instance("NotoSansHebrew-var.ttf", {"wght": 400, "wdth": 100})
+    uni = set()
+    for lo, hi in HEBREW_BLOCKS:
+        uni |= set(range(lo, hi + 1))
+    hebrew = prune(hebrew, uni)
+    out = os.path.join(out_dir, "NotoSansHebrew-Regular.ttf")
+    hebrew.save(out)
     report(out)
 
 

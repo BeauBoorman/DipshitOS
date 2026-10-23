@@ -131,6 +131,7 @@ func Parse(data []byte) (*Face, error) {
 	}
 
 	var head, hhea, hmtx, maxp, cmap, loca, glyf, gsub, gpos []byte
+	cmapOff := 0
 	for i := 0; i < numTables; i++ {
 		off := 12 + i*16
 		tag := be32(data[off : off+4])
@@ -151,6 +152,7 @@ func Parse(data []byte) (*Face, error) {
 			maxp = slice
 		case tagCmap:
 			cmap = slice
+			cmapOff = tOff
 		case tagLoca:
 			loca = slice
 		case tagGlyf:
@@ -208,7 +210,7 @@ func Parse(data []byte) (*Face, error) {
 		return nil, ErrMalformed
 	}
 
-	if err := f.parseCmap(cmap); err != nil {
+	if err := f.parseCmap(cmap, cmapOff); err != nil {
 		return nil, err
 	}
 	f.cache = newGlyphCache(defaultCacheEntries)
@@ -218,7 +220,12 @@ func Parse(data []byte) (*Face, error) {
 // parseCmap selects the best Unicode subtable and resolves it into one of the
 // internal representations. Preference order matches every other TrueType
 // consumer: a full format-12 Unicode map beats BMP-only format 4.
-func (f *Face) parseCmap(cmap []byte) error {
+// cmapOff is the table's byte offset inside the font file: format-4
+// idRangeOffset walks produce glyphOff values that must be file-absolute
+// because GlyphIndex reads them out of f.data. Every face that shipped
+// before NOTOHEB resolved through format 12, so the relative-offset bug
+// only surfaced when a fmt4-only face with glyphArray segments arrived.
+func (f *Face) parseCmap(cmap []byte, cmapOff int) error {
 	if len(cmap) < 4 {
 		return ErrMalformed
 	}
@@ -263,7 +270,7 @@ func (f *Face) parseCmap(cmap []byte) error {
 	case 12:
 		return f.parseCmap12(cmap, bestOff)
 	case 4:
-		return f.parseCmap4(cmap, bestOff)
+		return f.parseCmap4(cmap, bestOff, cmapOff)
 	case 6:
 		return f.parseCmap6(cmap, bestOff)
 	case 0:
@@ -307,7 +314,7 @@ func (f *Face) parseCmap12(cmap []byte, off int) error {
 	return nil
 }
 
-func (f *Face) parseCmap4(cmap []byte, off int) error {
+func (f *Face) parseCmap4(cmap []byte, off int, cmapOff int) error {
 	if off+14 > len(cmap) {
 		return ErrMalformed
 	}
@@ -333,7 +340,7 @@ func (f *Face) parseCmap4(cmap []byte, off int) error {
 		rOff := int(be16(cmap[rangeBase+2*i : rangeBase+2*i+2]))
 		s := cmapSeg{start: start, end: end, delta: delta}
 		if rOff != 0 {
-			s.glyphOff = rangeBase + 2*i + rOff
+			s.glyphOff = cmapOff + rangeBase + 2*i + rOff
 		}
 		segs = append(segs, s)
 	}
