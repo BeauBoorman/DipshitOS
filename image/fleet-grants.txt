@@ -73,3 +73,4 @@ GOEMOJI.ELF	file,window,memory,process,debug	file,window,memory,process,debug	-
 GOIRC.ELF	file,window,memory,process,debug,net	file,window,memory,process,debug,net	-
 GOVAULT.ELF	file,window,timer,memory,process,debug	file,window,timer,memory,process,debug	-
 GOPAINT.ELF	file,window,memory,process,debug	file,window,memory,process,debug	-
+GOMAIL.ELF	file,net	file,net	-

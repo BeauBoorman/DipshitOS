@@ -57,4 +57,5 @@ pub const rows = [_]grant.BaseRow{
     .{ .name = "GOIRC.ELF", .sha256 = null, .words = grant.word_file | grant.word_window | grant.word_memory | grant.word_process | grant.word_debug | grant.word_net },
     .{ .name = "GOVAULT.ELF", .sha256 = null, .words = grant.word_file | grant.word_window | grant.word_timer | grant.word_memory | grant.word_process | grant.word_debug },
     .{ .name = "GOPAINT.ELF", .sha256 = null, .words = grant.word_file | grant.word_window | grant.word_memory | grant.word_process | grant.word_debug },
+    .{ .name = "GOMAIL.ELF", .sha256 = null, .words = grant.word_file | grant.word_net },
 };
