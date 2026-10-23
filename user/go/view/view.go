@@ -109,6 +109,7 @@ const (
 	fmtPNG
 	fmtJPEG
 	fmtGIF
+	fmtMOV
 )
 
 func (f format) tag() string {
@@ -121,6 +122,8 @@ func (f format) tag() string {
 		return "JPEG"
 	case fmtGIF:
 		return "GIF"
+	case fmtMOV:
+		return "MOV"
 	}
 	return "???"
 }
@@ -140,6 +143,8 @@ func formatFromPath(path string) format {
 		return fmtJPEG
 	case "gif":
 		return fmtGIF
+	case "mov", "mp4", "m4v":
+		return fmtMOV
 	}
 	return fmtUnknown
 }
@@ -375,6 +380,9 @@ func headerDims(head []byte) (iw, ih uint32, ok bool) {
 			return w, h, true
 		}
 	}
+	if movSniff(head) {
+		return movHeaderDims(head)
+	}
 	return 0, 0, false
 }
 
@@ -462,7 +470,24 @@ func formatOfHeader(head []byte) format {
 	if len(head) >= 6 && (string(head[0:6]) == "GIF87a" || string(head[0:6]) == "GIF89a") {
 		return fmtGIF
 	}
+	if movSniff(head) {
+		return fmtMOV
+	}
 	return fmtUnknown
+}
+
+// movSniff reports whether head's first box declares the MOV/MP4
+// container: `ftyp` at offset 4, or — for old QuickTime files that carry
+// no ftyp — `moov`, `mdat` or `wide` there instead.
+func movSniff(head []byte) bool {
+	if len(head) < 8 {
+		return false
+	}
+	switch string(head[4:8]) {
+	case "ftyp", "moov", "mdat", "wide":
+		return true
+	}
+	return false
 }
 
 func be32(b []byte) uint32 {

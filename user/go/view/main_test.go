@@ -40,6 +40,7 @@ func TestMarkersAreAllGViewPrefixed(t *testing.T) {
 		"saved":       markerSaved,
 		"save-refuse": markerSaveRefuse,
 		"play":        markerPlay,
+		"video":       markerVideo,
 	}
 	for what, m := range markers {
 		if !strings.HasPrefix(m, "gview: ") {
@@ -154,17 +155,17 @@ func TestDecodeForViewRoutesGIF(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if anim == nil || len(anim.Frames) != 3 {
+	if anim == nil || len(anim.frames) != 3 {
 		t.Fatalf("anim = %v frames, want 3", anim)
 	}
-	if im.Width != anim.Width || im.Height != anim.Height || im.Frames != 3 {
-		t.Fatalf("shown = %dx%d frames=%d, want %dx%d x3", im.Width, im.Height, im.Frames, anim.Width, anim.Height)
+	if im.Width != anim.w || im.Height != anim.h || im.Frames != 3 {
+		t.Fatalf("shown = %dx%d frames=%d, want %dx%d x3", im.Width, im.Height, im.Frames, anim.w, anim.h)
 	}
 	sums := map[uint64]int{}
-	for i := range anim.Frames {
-		sums[frameSum(anim.Frames[i].Pix)] = i
-		if anim.Frames[i].Delay != 10 {
-			t.Fatalf("frame %d delay = %d cs, want 10", i+1, anim.Frames[i].Delay)
+	for i := range anim.frames {
+		sums[frameSum(anim.frames[i].pix)] = i
+		if anim.frames[i].delayNs != 100_000_000 {
+			t.Fatalf("frame %d delay = %d ns, want 100ms (10cs)", i+1, anim.frames[i].delayNs)
 		}
 	}
 	if len(sums) != 3 {
@@ -202,7 +203,7 @@ func TestStepFrameShowsTheCompositedFrame(t *testing.T) {
 	if !a.stepFrame(1) || a.frame != 1 || len(a.img.Pix) != 160*120 {
 		t.Fatal("'.' did not land on frame 2")
 	}
-	if &a.img.Pix[0] != &a.anim.Frames[1].Pix[0] {
+	if &a.img.Pix[0] != &a.anim.frames[1].pix[0] {
 		t.Fatal("the shown image must BE frame 2's composite")
 	}
 	if !a.stepFrame(1) || a.frame != 2 {
@@ -249,21 +250,21 @@ func TestPlayFixtureIsTenFramesAt50ms(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if anim == nil || len(anim.Frames) != 10 {
+	if anim == nil || len(anim.frames) != 10 {
 		t.Fatalf("play fixture = %v frames, want 10", anim)
 	}
 	sums := map[uint64]int{}
-	for i := range anim.Frames {
-		sums[frameSum(anim.Frames[i].Pix)] = i
-		if anim.Frames[i].Delay != 5 {
-			t.Fatalf("frame %d delay = %d cs, want 5", i+1, anim.Frames[i].Delay)
+	for i := range anim.frames {
+		sums[frameSum(anim.frames[i].pix)] = i
+		if anim.frames[i].delayNs != 50_000_000 {
+			t.Fatalf("frame %d delay = %d ns, want 50ms (5cs)", i+1, anim.frames[i].delayNs)
 		}
 	}
 	if len(sums) != 10 {
 		t.Fatal("play10_160x120 must composite to ten distinct frames")
 	}
-	if anim.Loops != 0 {
-		t.Fatalf("play fixture loops = %d, want 0 (loop forever)", anim.Loops)
+	if anim.loops != 0 {
+		t.Fatalf("play fixture loops = %d, want 0 (loop forever)", anim.loops)
 	}
 }
 
@@ -282,12 +283,12 @@ func TestPlayTicksDriveTheDelaySchedule(t *testing.T) {
 
 	fire := func() { clock += int64(arms[len(arms)-1]) }
 
-	mkAnim := func(delays ...int) *webrender.GIFAnimation {
+	mkAnim := func(delays ...int) *frameSrc {
 		a := &webrender.GIFAnimation{Width: 2, Height: 2}
 		for _, d := range delays {
 			a.Frames = append(a.Frames, webrender.GIFFrame{Pix: make([]uint32, 4), Delay: d})
 		}
-		return a
+		return gifSource(a)
 	}
 
 	a := &app{anim: mkAnim(10, 20, 30)} // 100/200/300 ms
@@ -361,8 +362,8 @@ func TestTogglePlayIsInertWithoutAnimation(t *testing.T) {
 	if a.togglePlay() {
 		t.Fatal("space on a still image must not toggle")
 	}
-	a.anim = &webrender.GIFAnimation{Width: 1, Height: 1,
-		Frames: []webrender.GIFFrame{{Pix: make([]uint32, 1), Delay: 5}}}
+	a.anim = gifSource(&webrender.GIFAnimation{Width: 1, Height: 1,
+		Frames: []webrender.GIFFrame{{Pix: make([]uint32, 1), Delay: 5}}})
 	if a.togglePlay() {
 		t.Fatal("space on a one-frame GIF must not toggle")
 	}
@@ -378,11 +379,11 @@ func TestRequestPlayHonoursReduceMotion(t *testing.T) {
 	playArm = func(ns uint64) int64 { arms = append(arms, ns); return 0 }
 	defer func() { playArm = oldArm }()
 
-	mkAnim := func() *webrender.GIFAnimation {
-		return &webrender.GIFAnimation{Width: 2, Height: 2, Frames: []webrender.GIFFrame{
+	mkAnim := func() *frameSrc {
+		return gifSource(&webrender.GIFAnimation{Width: 2, Height: 2, Frames: []webrender.GIFFrame{
 			{Pix: make([]uint32, 4), Delay: 5},
 			{Pix: make([]uint32, 4), Delay: 5},
-		}}
+		}})
 	}
 
 	// reduce_motion on + -play: parked, nothing armed.

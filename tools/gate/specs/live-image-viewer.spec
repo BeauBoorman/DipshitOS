@@ -41,6 +41,13 @@
 # for JPROG moved onto `--input-key` (keycode 12) because the chords
 # channel now carries the frame steps.
 #
+# Issue #3155 (M180a) adds run 02 — the MOV leg, one boot replayed the
+# same K=3 times: CLIP.MOV is stepped (the `.,.` chords anchored to its
+# own loaded receipt), `-play`'d (two dwells over several 1 s loops of
+# ten 100 ms samples, receipt `gview: video frames=10 elapsed_ms=
+# decode_us_max=`), and refused by name as AVC1.MOV (`unsupported MOV
+# codec=avc1` anchors the q that ends the boot on exit 43).
+#
 # Issue #3039 (M170e) adds a SEVENTH exec — the playback leg. Every
 # scripted input channel is spent above (chords on the frame steps, the
 # string on save-as, the key on JPROG's q), so play starts by argv:
@@ -55,10 +62,10 @@
 # HOST PREREQUISITE (fails the gate honestly when missing):
 #   bash tools/go/build-goview.sh   ->  .build/go/GOVIEW.ELF
 #
-# exec-order: assert-proven -- the run ends on `user-exec exited
-# status=43`, which only the last viewer's `q`-driven quit produces; the
-# `fg` dwells pace the sequence and every assert reads output only the
-# guest produces.
+# exec-order: assert-proven -- each run ends on `user-exec exited
+# status=43`, which only its last viewer's `q`-driven quit produces (run
+# 01's JPROG, run 02's AVC1); the `fg` dwells pace the sequence and every
+# assert reads output only the guest produces.
 
 vgate_name live-image-viewer "M136d (#2770): one boot decodes PNG+JPEG+GIF+SVG+QOI in GOVIEW in sequence — size markers, scanout pixel probes, JPROG named refusal — K=3"
 vgate_share seed
@@ -83,6 +90,18 @@ shutil.copy("tests/fixtures/svg/acceptance/rect.svg", os.path.join(share, "TEST.
 shutil.copy("tests/fixtures/qoi/viewer_160x120.qoi", os.path.join(share, "TEST.QOI"))
 shutil.copy("user/go/view/testdata/play10_160x120.gif",
             os.path.join(share, "PLAY.GIF"))
+# Run 02's MOV legs: the committed ten-frame clip as CLIP.MOV, and AVC1 —
+# the same file with its stsd sample-entry fourcc flipped jpeg->avc1,
+# built exactly like JPROG (our own fixture, no external MOV needed).
+shutil.copy("user/go/view/testdata/clip_160x120.mov",
+            os.path.join(share, "CLIP.MOV"))
+mov = open("user/go/view/testdata/clip_160x120.mov", "rb").read()
+pos = mov.find(b"stsd")
+assert pos > 0 and mov[pos + 16:pos + 20] == b"jpeg", \
+    "MOV fixture lost its stsd jpeg sample entry"
+avc = bytearray(mov)
+avc[pos + 16:pos + 20] = b"avc1"
+open(os.path.join(share, "AVC1.MOV"), "wb").write(bytes(avc))
 # JPROG: the same JPEG with the SOF0 marker byte flipped to SOF2 — a
 # progressive refusal built from our own fixture, no external JPEG needed.
 jpg = open("user/go/webrender/testdata/jpeg/viewer_160x120.jpg", "rb").read()
@@ -92,7 +111,8 @@ prog = bytearray(jpg)
 prog[pos + 1] = 0xc2
 open(os.path.join(share, "JPROG.JPG"), "wb").write(bytes(prog))
 print("staged GOVIEW.ELF + TEST.PNG/JPG/GIF/SVG/QOI + PLAY.GIF + JPROG.JPG "
-      "(GIF leg is the three-frame anim3; PLAY.GIF is ten frames at 50 ms)")
+      "+ CLIP.MOV + AVC1.MOV (GIF leg is the three-frame anim3; PLAY.GIF is "
+      "ten frames at 50 ms; CLIP.MOV is ten MJPEG frames at 100 ms)")
 PYEOF
 
 # The sequence per leg: `exec ... &`, a bounded ~5-tick `fg` dwell (the
@@ -140,6 +160,23 @@ exec GOVIEW.ELF -play /host/PLAY.GIF &
 fg 5
 fg 5
 exec GOVIEW.ELF /host/JPROG.JPG
+EOF
+
+# --- run 02's script (M180a #3155): step, play and refuse a MOV --------
+# One boot, three viewers: the stepper leg opens CLIP.MOV and rides the
+# `--input-chords '.,.'` presses anchored to ITS loaded receipt (they
+# land inside `fg 1`, while it is still the only viewer), the playback
+# leg opens the same file with -play and gets two `fg 2` dwells covering
+# several 1 s loops, and the refusal leg opens AVC1.MOV in the
+# foreground — `gview: unsupported MOV codec=avc1` anchors the
+# `--input-key 12` q that ends the boot on exit 43.
+vgate_file script-mov.txt <<'EOF'
+exec GOVIEW.ELF /host/CLIP.MOV &
+fg 1
+exec GOVIEW.ELF -play /host/CLIP.MOV &
+fg 2
+fg 2
+exec GOVIEW.ELF /host/AVC1.MOV
 EOF
 
 # --- The five-format journey, one boot -----------------------------------
@@ -664,4 +701,73 @@ sf = frac(ix + 6, ix + iw - 6, my + 4, iy + ih - 8, steel)
 if wf < 0.6 or sf < 0.6:
     sys.exit("QOI halves wrong: warm=%.2f steel=%.2f at img (%d,%d %dx%d)" % (wf, sf, ix, iy, iw, ih))
 print("QOI-PIXELS-OK img=(%d,%d) %dx%d warm=%.2f steel=%.2f" % (ix, iy, iw, ih, wf, sf))
+PY
+
+# --- run 02: step, play and refuse a MOV (M180a #3155) -------------------
+# Same one-boot shape, no snapshots: every scripted channel spends the
+# same way (chords on the stepper presses, the key on AVC1's q). The
+# clip's ten 100 ms samples decode through the same JPEG decoder the
+# host tests run, so the stepper receipts pin the sums mov_test.go
+# pins. The -play leg's loops print `gview: video frames=10
+# elapsed_ms=<t> decode_us_max=<u>` — ~1000 ms per loop, the 800-3000 ms
+# window admits D3's jitter like run 01's.
+vgate_run 02 -- \
+    --display --screen '$RUN_DIR/gpu-screen-mov' \
+    --via-virtio --cvc-snap \
+    --script '$RUN_DIR/script-wm.txt' --script-after "virelai> " \
+    --script2 '$RUN_DIR/script-mov.txt' --script2-after "wnd: registered" \
+    --input-chords ".,." --input-chords-after "gview: loaded CLIP.MOV" \
+    --input-key 12 --input-key-after "gview: unsupported MOV codec=avc1" \
+    --script-expect "user-exec exited status=43" --timeout 240
+
+vgate_assert 02 serial-contains "VirelaiOS kernel has seized control."
+vgate_assert 02 serial-contains "wnd: registered"
+vgate_assert 02 serial-contains "gview: not-tab-aware (shim or WND desktop)"
+vgate_assert 02 serial-count "exec: loaded GOVIEW.ELF" 3
+vgate_assert 02 serial-contains "gview: loaded CLIP.MOV 160x120 MOV bytes=51377 frames=10"
+# The stepper walked frame 1 -> 2 -> 3 on the pinned sums — the same
+# decoder renders the samples host-side and guest-side.
+vgate_assert 02 serial-contains "gview: frame 1/10 delay=100 sum=841b31cc2db2c534"
+vgate_assert 02 serial-contains "gview: frame 2/10 delay=100 sum=f535f76c11a59fbc"
+vgate_assert 02 serial-contains "gview: frame 3/10 delay=100 sum=ef521a8d3b1da9d4"
+# The playback leg's loop receipt carries the decode meter.
+vgate_assert 02 serial-contains "gview: video frames=10 elapsed_ms="
+vgate_assert 02 serial-contains "decode_us_max="
+vgate_assert 02 serial-contains "gview: unsupported MOV codec=avc1"
+vgate_assert 02 serial-contains "gview: quit"
+vgate_assert 02 serial-contains "user-exec exited status=43"
+vgate_assert 02 serial-absent "[EXC] parking:"
+vgate_assert 02 python <<'PY'
+import os, re, sys
+ser = open(os.environ["VG_SER"], errors="replace").read()
+# Both CLIP.MOV viewers load (step leg + play leg), AVC1 never does.
+if ser.count("gview: loaded CLIP.MOV 160x120 MOV") != 2:
+    sys.exit("CLIP.MOV loaded-receipt count != 2")
+if "gview: loaded AVC1" in ser or ser.count("gview: loaded ") != 2:
+    sys.exit("AVC1 must not load (or an unexpected file did)")
+# Exactly one codec refusal, and the frame-step receipts ran in order
+# with three distinct sums.
+if ser.count("gview: unsupported MOV codec=avc1") != 1:
+    sys.exit("codec=avc1 refusal count != 1")
+frames = re.findall(r"gview: frame (\d+)/10 delay=100 sum=([0-9a-f]{16})", ser)
+# Every receipt must carry the pinned sum for its index — a step that
+# decoded the wrong sample, or a tick that printed, breaks this. The
+# step leg's walk is the first three receipts (the play leg's load
+# announces its own frame 1 after them).
+want = {"1": "841b31cc2db2c534", "2": "f535f76c11a59fbc", "3": "ef521a8d3b1da9d4"}
+walk = []
+for i, s in frames:
+    if i not in want or s != want[i]:
+        sys.exit("frame receipt %s sum=%s is not the pinned decode" % (i, s))
+    walk.append(i)
+if walk[:3] != ["1", "2", "3"]:
+    sys.exit("step leg did not walk 1->2->3: %r" % (walk,))
+# One loop of ten 100 ms samples is ~1 s; the 800-3000 window admits a
+# busy core's D3 jitter like run 01's play window.
+plays = re.findall(r"gview: video frames=10 elapsed_ms=(\d+)", ser)
+if not plays or not (800 <= int(plays[0]) <= 3000):
+    sys.exit("video elapsed_ms out of the 800-3000 window: %r" % (plays,))
+if ser.count("gview: quit") != 1 or ser.count("user-exec exited status=43") != 1:
+    sys.exit("expected exactly one quit -> status=43 (the AVC1 viewer)")
+print("MOV: two loads, ordered distinct stepper sums, video loop window, one refusal, clean exit")
 PY

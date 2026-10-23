@@ -79,6 +79,12 @@ const (
 	// pause inside the loop does not count).
 	markerPlay = "gview: play "
 
+	// M180a (#3155): the MOV loop receipt — `video frames=<n>
+	// elapsed_ms=<t> decode_us_max=<u>` — the same playing-time measure
+	// plus the slowest per-sample decode the loop paid, in microseconds
+	// on the playNow clock (recorded, never budgeted).
+	markerVideo = "gview: video "
+
 	// M177a (#3142): `-play` under a11y.reduce_motion — the animation
 	// opens parked on frame 1 and this line says why; space still plays
 	// because pressing it is the user's own request.
@@ -124,9 +130,10 @@ type app struct {
 	img    *webrender.Image
 	iw, ih uint32
 
-	// The animation behind a decoded GIF (M162a): every composited frame
-	// and the index being shown. nil on every other format.
-	anim  *webrender.GIFAnimation
+	// The frame source behind a decoded animation (M162a GIF, M180a
+	// MOV): every composited — or lazily composited — frame and the
+	// index being shown. nil on every still format.
+	anim  *frameSrc
 	frame int
 
 	// M170e playback state: playing while the app timer is armed to post
@@ -373,6 +380,13 @@ func (a *app) load(path string) {
 		if errors.Is(err, webrender.ErrImageUnsupported) {
 			a.st = loadUnsupported
 			a.unsupportedTag = formatOfHeader(data).tag()
+			// A demuxed-but-unplayable MOV names its codec: "MOV
+			// codec=avc1" (or "MP4 codec=…" on an ISO-BMFF brand) —
+			// the refusal says what the file IS, not just that we
+			// cannot play it.
+			if mce, ok := err.(movCodecError); ok {
+				a.unsupportedTag = mce.tag + " codec=" + mce.fourcc
+			}
 			return
 		}
 		a.st = loadFailedDecode
@@ -393,30 +407,138 @@ func (a *app) load(path string) {
 		// the same receipt; a bound that stopped the GIF walk names itself.
 		line += " frames=" + vi.Itoa64(int64(im.Frames))
 	}
-	if anim != nil && anim.Truncated != "" {
-		line += " truncated=" + anim.Truncated
+	if anim != nil && anim.audioSkip {
+		// A MOV whose sound track the demux skipped says so in the
+		// receipt rather than pretending the file was video-only.
+		line += " audio=skipped"
+	}
+	if anim != nil && anim.truncated != "" {
+		line += " truncated=" + anim.truncated
 	}
 	vi.ConsoleLine(line)
 	a.announceFrame()
 }
 
 // decodeForView routes a GIF through webrender.DecodeGIFFrames — the
-// stepper's frame list — and everything else through DecodeImage. The
-// returned Image is the shown frame: the first composite for a GIF, the
-// whole decode otherwise. anim is nil on every non-GIF format.
-func decodeForView(data []byte) (im *webrender.Image, anim *webrender.GIFAnimation, err error) {
-	if formatOfHeader(data) == fmtGIF {
-		anim, err = webrender.DecodeGIFFrames(data, webrender.GIFLimits{})
+// stepper's frame list — a MOV through the demux in mov.go (each
+// `jpeg` sample decoding through webrender.DecodeImage on demand), and
+// everything else through DecodeImage. The returned Image is the shown
+// frame: the first composite/sample for an animation, the whole decode
+// otherwise. src is nil on every still format.
+func decodeForView(data []byte) (im *webrender.Image, src *frameSrc, err error) {
+	switch formatOfHeader(data) {
+	case fmtGIF:
+		anim, err := webrender.DecodeGIFFrames(data, webrender.GIFLimits{})
 		if err != nil {
 			return nil, nil, err
 		}
 		return &webrender.Image{
 			Width: anim.Width, Height: anim.Height,
 			Pix: anim.Frames[0].Pix, Frames: len(anim.Frames),
-		}, anim, nil
+		}, gifSource(anim), nil
+	case fmtMOV:
+		v, err := demuxMOV(data)
+		if err != nil {
+			return nil, nil, err
+		}
+		// The shown frame is sample 1's own decode: the load receipt's
+		// geometry is the decoded image's, not the track header's claim.
+		first, err := webrender.DecodeImage(v.sampleBytes(0))
+		if err != nil {
+			return nil, nil, err
+		}
+		src := movSource(v)
+		src.w, src.h = first.Width, first.Height
+		src.frames[0].pix = first.Pix
+		return &webrender.Image{
+			Width: first.Width, Height: first.Height,
+			Pix: first.Pix, Frames: len(v.samples),
+		}, src, nil
 	}
 	im, err = webrender.DecodeImage(data)
 	return im, nil, err
+}
+
+// frameSrc is what the stepper, the status line and playback walk: an
+// ordered list of frames, each with its own dwell — the M170e machinery
+// runs over the source instead of knowing the container. A GIF's frames
+// arrive composited, their GCE centisecond delay already resolved by
+// playDelayNs; a MOV's arrive as undecoded `jpeg` samples, their stts
+// delta resolved against the media timescale and decoded lazily through
+// webrender.DecodeImage (the video receipt's decode_us_max is the
+// slowest of those decodes, timed on the playNow seam).
+type frameSrc struct {
+	w, h      int
+	frames    []srcFrame
+	loops     int    // GIF's NETSCAPE2.0 count; -1 when absent
+	truncated string // GIF's walk-bound name; "" for MOV
+	audioSkip bool   // MOV: a sound track was skipped in the demux
+	video     *movVideo
+	decMaxUs  int64 // slowest per-sample decode this loop, µs
+}
+
+// srcFrame is one frame of a frameSrc: composited pixels (nil until a
+// MOV sample decodes) plus the display delay in ms and the timer arm in
+// ns — kept separately so the receipt prints the file's own delay while
+// the arm honours the minimum-dwell rule.
+type srcFrame struct {
+	pix     []uint32
+	delayMs int
+	delayNs uint64
+}
+
+// gifSource wraps a decoded GIF as a frameSrc: the composites carry
+// over, the centisecond GCE delays become nanosecond arms through
+// playDelayNs (its zero-delay and floor rules ride along), and the
+// animation's loop count and truncation name follow for the receipts.
+func gifSource(anim *webrender.GIFAnimation) *frameSrc {
+	s := &frameSrc{w: anim.Width, h: anim.Height,
+		loops: anim.Loops, truncated: anim.Truncated}
+	for _, f := range anim.Frames {
+		s.frames = append(s.frames, srcFrame{
+			pix:     f.Pix,
+			delayMs: f.Delay * 10,
+			delayNs: playDelayNs(f.Delay),
+		})
+	}
+	return s
+}
+
+// movSource wraps a demuxed video track as a frameSrc: one lazy frame
+// per sample, its arm the stts delta over the track timescale (at least
+// 1 ms, movDelayNs' floor).
+func movSource(v *movVideo) *frameSrc {
+	s := &frameSrc{w: v.w, h: v.h, loops: -1, video: v, audioSkip: v.audioSkip}
+	for _, smp := range v.samples {
+		s.frames = append(s.frames, srcFrame{
+			delayMs: int(movDelayNs(uint64(smp.dur), v.timescale) / 1_000_000),
+			delayNs: movDelayNs(uint64(smp.dur), v.timescale),
+		})
+	}
+	return s
+}
+
+// pix returns frame i's composited pixels. A GIF frame was composited at
+// load; a MOV sample decodes here through webrender.DecodeImage — the
+// same decoder the host tests run — with its own microseconds feeding
+// the video receipt's decode_us_max. A sample that refuses yields no
+// pixels rather than a panic (the demux already bounded it).
+func (s *frameSrc) pix(i int) []uint32 {
+	f := &s.frames[i]
+	if s.video == nil || f.pix != nil {
+		return f.pix
+	}
+	t0 := playNow()
+	im, err := webrender.DecodeImage(s.video.sampleBytes(i))
+	us := (playNow() - t0) / 1_000
+	if us > s.decMaxUs {
+		s.decMaxUs = us
+	}
+	if err != nil {
+		return nil
+	}
+	f.pix = im.Pix
+	return f.pix
 }
 
 // readImage reads at most fileMax bytes. The loop is ours rather than
@@ -538,23 +660,24 @@ func (a *app) reportLoad() {
 // stepFrame is the M162a frame stepper: `.` forward, `,` back, wrapping.
 // The shown image becomes the frame's own composite — every frame is the
 // logical screen, so pan and zoom keep meaning. A single-frame GIF (or no
-// GIF at all) makes the keys inert.
+// GIF at all) makes the keys inert; a MOV steps the same keys, decoding
+// the target sample as it lands (M180a).
 func (a *app) stepFrame(dir int) bool {
-	if a.anim == nil || len(a.anim.Frames) < 2 {
+	if a.anim == nil || len(a.anim.frames) < 2 {
 		return false
 	}
-	a.setFrame(stepFrameIdx(a.frame, dir, len(a.anim.Frames)))
+	a.setFrame(stepFrameIdx(a.frame, dir, len(a.anim.frames)))
 	a.announceFrame()
 	return true
 }
 
 // setFrame shows frame i's own composite without a receipt — the stepper
 // announces, playback does not (its evidence is the loop receipt; a line
-// per tick would only drown it).
+// per tick would only drown it). For a MOV frame this is where the
+// sample decodes: pix() runs the JPEG decode and times it.
 func (a *app) setFrame(i int) {
 	a.frame = i
-	f := &a.anim.Frames[i]
-	a.img = &webrender.Image{Width: a.anim.Width, Height: a.anim.Height, Pix: f.Pix}
+	a.img = &webrender.Image{Width: a.anim.w, Height: a.anim.h, Pix: a.anim.pix(i)}
 }
 
 // --- playback (M170e) -------------------------------------------------------
@@ -565,7 +688,7 @@ func (a *app) setFrame(i int) {
 // playable animation there is no motion to reduce and nothing prints.
 // Space is unaffected — togglePlay answers the user's own request.
 func (a *app) requestPlay() {
-	if a.reduceMotion && a.anim != nil && len(a.anim.Frames) >= 2 {
+	if a.reduceMotion && a.anim != nil && len(a.anim.frames) >= 2 {
 		vi.ConsoleLine(markerMotionReduced)
 		return
 	}
@@ -616,7 +739,7 @@ func (a *app) pollSettings() bool {
 // play. Resuming picks the current frame up with its own full delay; the
 // loop clock excludes the pause, so elapsed_ms stays a frame-time number.
 func (a *app) togglePlay() bool {
-	if a.anim == nil || len(a.anim.Frames) < 2 {
+	if a.anim == nil || len(a.anim.frames) < 2 {
 		return false
 	}
 	if a.playing {
@@ -629,11 +752,12 @@ func (a *app) togglePlay() bool {
 	return true
 }
 
-// armPlay points the one app timer at the current frame's delay. Re-arming
-// replaces any pending arm (the kernel's own contract), so exactly one
-// timer is ever in flight.
+// armPlay points the one app timer at the current frame's dwell — the
+// GIF's resolved GCE delay or the MOV sample's timescale duration.
+// Re-arming replaces any pending arm (the kernel's own contract), so
+// exactly one timer is ever in flight.
 func (a *app) armPlay() {
-	d := playDelayNs(a.anim.Frames[a.frame].Delay)
+	d := a.anim.frames[a.frame].delayNs
 	a.playFireAt = playNow() + int64(d)
 	_ = playArm(d)
 }
@@ -663,32 +787,41 @@ func (a *app) stopPlay() {
 // paused or animationless is consumed and ignored (the single app timer
 // can only be ours, and a queued event can outlive its own cancel).
 func (a *app) playTick() bool {
-	if !a.playing || a.anim == nil || len(a.anim.Frames) < 2 {
+	if !a.playing || a.anim == nil || len(a.anim.frames) < 2 {
 		return false
 	}
 	now := playNow()
-	a.setFrame(stepFrameIdx(a.frame, 1, len(a.anim.Frames)))
+	a.setFrame(stepFrameIdx(a.frame, 1, len(a.anim.frames)))
 	if a.frame == 0 {
 		a.playLastElapsed = a.playAccum + now - a.playStretch
 		a.playAccum, a.playStretch = 0, now
-		vi.ConsoleLine(markerPlay + "frames=" + vi.Itoa64(int64(len(a.anim.Frames))) +
-			" elapsed_ms=" + vi.Itoa64(a.playLastElapsed/1_000_000))
+		if a.anim.video != nil {
+			// The MOV loop receipt adds the slowest sample decode the
+			// loop paid — the number resets per loop, never budgets.
+			vi.ConsoleLine(markerVideo + "frames=" + vi.Itoa64(int64(len(a.anim.frames))) +
+				" elapsed_ms=" + vi.Itoa64(a.playLastElapsed/1_000_000) +
+				" decode_us_max=" + vi.Itoa64(a.anim.decMaxUs))
+			a.anim.decMaxUs = 0
+		} else {
+			vi.ConsoleLine(markerPlay + "frames=" + vi.Itoa64(int64(len(a.anim.frames))) +
+				" elapsed_ms=" + vi.Itoa64(a.playLastElapsed/1_000_000))
+		}
 	}
 	a.armPlay()
 	return true
 }
 
 // announceFrame prints the stepper's receipt: the 1-based index, the
-// frame's delay in milliseconds (the GCE carries centiseconds), and the
-// FNV-1a of the composited pixels.
+// frame's own delay in milliseconds, and the FNV-1a of the composited
+// pixels — for a MOV frame the decode happens on the step itself.
 func (a *app) announceFrame() {
 	if a.anim == nil {
 		return
 	}
-	f := &a.anim.Frames[a.frame]
+	f := &a.anim.frames[a.frame]
 	vi.ConsoleLine(markerFrame + vi.Itoa64(int64(a.frame+1)) + "/" +
-		vi.Itoa64(int64(len(a.anim.Frames))) + " delay=" +
-		vi.Itoa64(int64(f.Delay*10)) + " sum=" + hex64(frameSum(f.Pix)))
+		vi.Itoa64(int64(len(a.anim.frames))) + " delay=" +
+		vi.Itoa64(int64(f.delayMs)) + " sum=" + hex64(frameSum(a.anim.pix(a.frame))))
 }
 
 func (a *app) zoom() uint32 { return zoomTable[a.zoomIdx] }
@@ -1173,10 +1306,10 @@ func (a *app) drawStatus(s *canvasSurface, vp viewport) {
 	barY := int(vp.Y + vp.H)
 	s.Fill(0, barY, int(a.ta.W), statusH, theme.Current.Surface)
 	text := u32s(a.zoom()) + "%  +/- zoom  0 reset  arrows/drag pan  s save"
-	if a.anim != nil && len(a.anim.Frames) > 1 {
-		f := &a.anim.Frames[a.frame]
+	if a.anim != nil && len(a.anim.frames) > 1 {
+		f := &a.anim.frames[a.frame]
 		text += "  ./, frame " + u32s(uint32(a.frame+1)) + "/" +
-			u32s(uint32(len(a.anim.Frames))) + " - " + u32s(uint32(f.Delay*10)) + " ms"
+			u32s(uint32(len(a.anim.frames))) + " - " + u32s(uint32(f.delayMs)) + " ms"
 		if a.playing {
 			text += "  space pause"
 		} else {
