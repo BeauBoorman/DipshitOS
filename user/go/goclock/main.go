@@ -21,7 +21,9 @@
 // drive the stopwatch; on the Timer tab digits 1–5 arm presets, 'e'
 // opens the custom-seconds entry and 'x' cancels; on the Alarm tab four
 // digits + Return add a daily alarm ('o' a once), Up/Down pick a row,
-// Space toggles it and 'x' deletes it.
+// Space toggles it, 'e' edits its time in place (M193b) and 'x' deletes
+// it. Headless verbs: `import <path>` merges an .ics into the store,
+// `export <path>` writes it back as a VCALENDAR through WriteFileSafe.
 //
 // Every marker is printed only AFTER the call it reports returned, so the
 // go-clock VZ gate's asserts cannot pass on an app that did not do the
@@ -70,6 +72,7 @@ const (
 	markerTCancel  = "goclock: timer cancel"
 	markerTRefuse  = "goclock: timer refused"
 	markerAArm     = "goclock: alarm armed "
+	markerAEdit    = "goclock: alarm edited "
 	markerADel     = "goclock: alarm deleted "
 	markerAToggle  = "goclock: alarm toggled "
 	markerAFull    = "goclock: alarm full"
@@ -80,6 +83,7 @@ const (
 	markerAFileBad = "goclock: alarm file bad"
 	markerImport   = "goclock: import "
 	markerImpDrop  = "goclock: drop ics len="
+	markerExport   = "goclock: export "
 	markerStRest   = "goclock: state restored"
 	markerStRefuse = "goclock: state refused"
 	markerStPosted = "goclock: state posted"
@@ -105,6 +109,10 @@ const (
 	// rewritten on every list mutation while the blob is a snapshot
 	// capture.
 	alarmPath = "/host/GOCLOCK.ALARM"
+
+	// alarmFileCap bounds the read of the persisted record: seven rows
+	// with their gocal3 summary tokens stay well under a KiB.
+	alarmFileCap = 1024
 )
 
 // The tab ids are their own block: iota is the const-spec INDEX inside its
@@ -186,10 +194,13 @@ type app struct {
 	// alarms is the Alarm tab's row list (≤ MaxAlarms); alarmSel is the
 	// picked row (-1 while the list is empty). timerEdit selects the
 	// Timer tab's input surface: false is the preset row, true the
-	// custom-seconds entry.
+	// custom-seconds entry. alarmEdit (M193b) latches edit-in-place on
+	// the picked row — the entry is editing THAT row's HHMM, not
+	// staging a new one.
 	alarms    []Alarm
 	alarmSel  int
 	timerEdit bool
+	alarmEdit bool
 
 	buttons       [2]widgets.Button
 	presetButtons [5]widgets.Button
@@ -222,9 +233,16 @@ func main() {
 	// import <path>` or the opens=text/calendar exec line
 	// `exec GOCLOCK.ELF <path>.ics` merges the file into the alarm
 	// store and exits before any window exists (the GOFILES `vol`
-	// precedent: a serial face, not a tab).
-	if path, ok := importArg(); ok {
-		runImport(path)
+	// precedent: a serial face, not a tab). M193b (#3254): `export
+	// <path>` is the same headless shape the other way — the persisted
+	// list as a VCALENDAR through WriteFileSafe.
+	if verb, path, ok := verbArg(); ok {
+		switch verb {
+		case "import":
+			runImport(path)
+		case "export":
+			runExport(path)
+		}
 	}
 	a := &app{now: vi.Now, nano: vsys.Nanotime}
 	a.local = settings.Load().Timezone()
@@ -427,6 +445,11 @@ func (a *app) key(ev vi.Event) bool {
 			a.timerEdit = false
 			return true
 		}
+		if a.tab == tabAlarm && a.alarmEdit {
+			a.alarmEdit = false
+			a.entryFor(tabAlarm).Clear()
+			return true
+		}
 		return false
 	case keyBacksp:
 		if a.tab == tabAlarm || (a.tab == tabTimer && a.timerEdit) {
@@ -438,6 +461,9 @@ func (a *app) key(ev vi.Event) bool {
 		case tabTimer:
 			return a.armCountdown()
 		case tabAlarm:
+			if a.alarmEdit {
+				return a.commitAlarmEdit()
+			}
 			return a.addAlarm(true)
 		}
 		return false
@@ -488,7 +514,14 @@ func (a *app) key(ev vi.Event) bool {
 		if ch >= '0' && ch <= '9' {
 			return a.entryFor(tabAlarm).Digit(int(ch - '0'))
 		}
+		// An edit in flight owns the letter keys: Return commits and
+		// Escape abandons; the rest wait for one of those.
+		if a.alarmEdit {
+			return false
+		}
 		switch ch {
+		case 'e', 'E':
+			return a.editAlarm()
 		case 'o', 'O':
 			return a.addAlarm(false)
 		case 'x', 'X':
@@ -543,13 +576,14 @@ func (a *app) click(x, y int) bool {
 		for i := range a.alarms {
 			if alarmRowR(i).Contains(x, y) {
 				a.alarmSel = i
+				a.alarmEdit = false
 				return true
 			}
 		}
-		if a.buttons[0].HitTest(x, y) {
+		if !a.alarmEdit && a.buttons[0].HitTest(x, y) {
 			return a.addAlarm(true)
 		}
-		if a.buttons[1].HitTest(x, y) {
+		if !a.alarmEdit && a.buttons[1].HitTest(x, y) {
 			return a.addAlarm(false)
 		}
 	}
@@ -560,6 +594,8 @@ func (a *app) setTab(t int) bool {
 	if t == a.tab {
 		return false
 	}
+	// Leaving the tab abandons an edit in flight — the row is untouched.
+	a.alarmEdit = false
 	a.tab = t
 	vi.ConsoleLine(markerTab + tabNames[t])
 	return true
@@ -600,9 +636,13 @@ func (a *app) armTimerSecs(secs int64) bool {
 //
 // The Alarm tab is a bounded row list: four digits + Return adds a daily
 // alarm, 'o' adds a once, Up/Down (or a row click) picks a row, Space/'t'
-// toggles it between armed and off, 'x' deletes it. Deadline ids are the
-// row index ("alarm3"); every mutation re-syncs the scheduler from the
-// list so index shifts can never strand a deadline under the wrong id.
+// toggles it between armed and off, 'x' deletes it. 'e' edits the picked
+// row in place (M193b): the entry preloads its HHMM, a re-typed field
+// commits on Return and abandons on Escape — mode, enabled flag and
+// summary are the row's own; only the civil field (and its re-anchored
+// instant) changes. Deadline ids are the row index ("alarm3"); every
+// mutation re-syncs the scheduler from the list so index shifts can
+// never strand a deadline under the wrong id.
 
 // alarmMode renders the record's repeat field for the markers.
 func alarmMode(daily bool) string {
@@ -637,6 +677,49 @@ func (a *app) addAlarm(daily bool) bool {
 	a.alarmSel = len(a.alarms) - 1
 	e.Clear()
 	vi.ConsoleLine(markerAArm + two(int64(h)) + ":" + two(int64(m)) + " " + alarmMode(daily))
+	a.syncAlarms()
+	a.persistAlarms()
+	a.armTimer()
+	return true
+}
+
+// editAlarm arms edit-in-place on the picked row: the entry preloads
+// the row's typed HHMM so the edit is a tweak — backspace the minutes,
+// retype — rather than a fresh entry. commitAlarmEdit lands it.
+func (a *app) editAlarm() bool {
+	if a.alarmSel < 0 || a.alarmSel >= len(a.alarms) {
+		return false
+	}
+	a.alarmEdit = true
+	e := a.entryFor(tabAlarm)
+	e.Clear()
+	h, m, _ := parseHHMM(a.alarms[a.alarmSel].HHMM)
+	for i := 0; i < 4; i++ {
+		e.Digit(int(hhmmString(h, m)[i] - '0'))
+	}
+	return true
+}
+
+// commitAlarmEdit writes the re-typed HHMM back onto the picked row and
+// re-anchors its instant — the in-place half of the card's "events you
+// can edit". A field that is not a valid HHMM refuses, named like the
+// add path's refusal.
+func (a *app) commitAlarmEdit() bool {
+	e := a.entryFor(tabAlarm)
+	h, m, ok := parseHHMM(e.Value())
+	if a.alarmSel < 0 || a.alarmSel >= len(a.alarms) ||
+		e.Empty() || !ok || a.now() < 0 {
+		a.alarmEdit = false
+		e.Clear()
+		vi.ConsoleLine(markerARefuse)
+		return false
+	}
+	al := &a.alarms[a.alarmSel]
+	al.HHMM = e.Value()
+	al.At = alarmAt(a.now(), a.local, h, m)
+	a.alarmEdit = false
+	e.Clear()
+	vi.ConsoleLine(markerAEdit + two(int64(h)) + ":" + two(int64(m)) + " " + alarmMode(al.Daily))
 	a.syncAlarms()
 	a.persistAlarms()
 	a.armTimer()
@@ -795,7 +878,7 @@ func (a *app) applyPersistedAlarm() {
 	}
 	// The file is fresher-or-equal to any snapshot capture: it is rewritten
 	// on every mutation, so when both decode the file's list stands.
-	if raw, r := alarmFileRead(alarmPath, 256); r >= 0 {
+	if raw, r := alarmFileRead(alarmPath, alarmFileCap); r >= 0 {
 		if fl, fok := decodeAlarms(raw); fok {
 			list, found = fl, true
 		} else {
@@ -1002,8 +1085,14 @@ func (a *app) paintAlarm(cv widgets.Canvas) {
 		disp = s
 	}
 	drawText(cv, displayR, disp, th.Ink, th.Surface)
-	drawText(cv, entryR, "HHMM: "+e.String(), th.Ink, th.Surface)
-	drawText(cv, hintR, "4 digits - return daily - o once - up/dn pick - spc toggles - x del", th.InkMuted, th.Surface)
+	entryLab := "HHMM: " + e.String()
+	hint := "4 digits - return daily - o once - e edits - up/dn pick - spc toggles - x del"
+	if a.alarmEdit {
+		entryLab = "edit HHMM: " + e.String()
+		hint = "retype 4 digits - return commits - esc cancels"
+	}
+	drawText(cv, entryR, entryLab, th.Ink, th.Surface)
+	drawText(cv, hintR, hint, th.InkMuted, th.Surface)
 	a.buttons[0] = widgets.Button{R: btnR0, Label: "Daily"}
 	a.buttons[1] = widgets.Button{R: btnR1, Label: "Once"}
 	a.buttons[0].Draw(cv)
@@ -1017,6 +1106,9 @@ func (a *app) paintAlarm(cv widgets.Canvas) {
 			fg = th.InkMuted
 		}
 		label := two(int64(h)) + ":" + two(int64(m)) + "  " + alarmMode(al.Daily) + "  " + state
+		if al.Summary != "" {
+			label += "  " + al.Summary
+		}
 		bg := th.Surface
 		if i == a.alarmSel {
 			bg = th.Selection
@@ -1054,24 +1146,27 @@ func (a *app) shutdown(status int) {
 // icsFileRead is the verb's file seam (the alarmFileRead pattern).
 var icsFileRead = vi.ReadFileAll
 
-// importArg decodes the launch line: `import <path>` is the explicit
-// verb; a bare argv path ending .ics is the opens= route's exec line.
-// ("", true) is the bare `import` — the verb names that refusal itself.
-func importArg() (string, bool) {
+// verbArg decodes the launch line: `import <path>` and `export <path>`
+// (M193b) are the explicit verbs; a bare argv path ending .ics is the
+// opens= route's exec line — an import. A verb word takes the NEXT arg
+// as its path, so `export /host/OUT.ICS` never reads as an import of
+// that .ics. ("", true) is a bare verb — it names that refusal itself.
+func verbArg() (verb, path string, ok bool) {
 	args := vi.Args()
 	for i := 1; i < len(args); i++ {
 		a := args[i]
-		if a == "import" {
+		switch a {
+		case "import", "export":
 			if i+1 < len(args) {
-				return args[i+1], true
+				return a, args[i+1], true
 			}
-			return "", true
+			return a, "", true
 		}
 		if strings.HasSuffix(strings.ToLower(a), ".ics") {
-			return a, true
+			return "import", a, true
 		}
 	}
-	return "", false
+	return "", "", false
 }
 
 // runImport is the verb's whole life: read, merge, republish the file,
@@ -1086,7 +1181,7 @@ func runImport(path string) {
 		vi.ConsoleLine(markerImport + "refused read rc=" + vi.Itoa64(rc))
 		vi.Exit(2)
 	}
-	list := importLoad()
+	list := loadAlarmFile()
 	out := importInto(list, b, vi.Now(), settings.Load().Timezone())
 	if !out.ok {
 		vi.ConsoleLine(markerImport + "refused not-vcalendar")
@@ -1110,12 +1205,13 @@ func runImport(path string) {
 	vi.Exit(0)
 }
 
-// importLoad reads the persisted half of the store the verb merges
-// into. A missing file is an empty list; a foreign one is named bad and
-// still an empty list — the decode refused it, not the verb.
-func importLoad() []Alarm {
+// loadAlarmFile reads the persisted half of the store — the file the
+// verbs merge into (import) or serialize out of (export). A missing
+// file is an empty list; a foreign one is named bad and still an empty
+// list — the decode refused it, not the verb.
+func loadAlarmFile() []Alarm {
 	var list []Alarm
-	if raw, r := alarmFileRead(alarmPath, 256); r >= 0 {
+	if raw, r := alarmFileRead(alarmPath, alarmFileCap); r >= 0 {
 		if l, ok := decodeAlarms(raw); ok {
 			list = l
 		} else {
@@ -1168,6 +1264,9 @@ func importInto(list []Alarm, b []byte, now int64, local clockfmt.Zone) importOu
 				HHMM:    c.Hour*100 + c.Minute,
 				Daily:   ev.Daily,
 				Enabled: true,
+				// M193b: the event's SUMMARY rides the row to the
+				// export — cleaned to the bounded single-line field.
+				Summary: cleanSummary(ev.Summary),
 			})
 			seen[at] = true
 			out.added++
@@ -1233,4 +1332,67 @@ func (a *app) dropICS(offer tabapp.DragOffer) {
 		a.dirty = true
 	}
 	vi.ConsoleLine(importDoneLine(out.added, out.refused))
+}
+
+// --- .ics export (M193b #3254) ---------------------------------------------
+//
+// The write-back half of the import door: `exec GOCLOCK.ELF export
+// /host/<name>.ics` serializes the persisted list as a VCALENDAR through
+// ical.Emit and publishes it with WriteFileSafe — headless like the
+// import verb, the markers ARE the face. The emit covers exactly the
+// fields the parser honours, so the file re-parses through the same
+// reader the import verb runs — the round-trip the go-clock edit leg
+// closes by re-importing its own export.
+//
+// Every row exports — a switched-off row is still an event; the toggle
+// is the app's arm state, not the event's. MaxAlarms (7) sits under
+// ical.MaxEvents (8), so the whole list always fits the reader's
+// honoured prefix — the done line names that bound.
+
+// exportBytes is the verb's pure half: the alarm list as a VCALENDAR
+// document. ok=false refuses whole — an empty store has no events to
+// name, a list past ical.MaxEvents would truncate on re-read, and an
+// emit the bound cannot honour never becomes a partial file.
+func exportBytes(list []Alarm) ([]byte, bool) {
+	if len(list) == 0 || len(list) > ical.MaxEvents {
+		return nil, false
+	}
+	evs := make([]ical.Event, len(list))
+	for i, al := range list {
+		// The armed instant exports as the UTC stamp it IS — a
+		// re-import resolves the Z value to the same epoch, so the
+		// round-trip is exact whatever the reader's zone is.
+		evs[i] = ical.Event{
+			Summary: al.Summary,
+			Start:   ical.Stamp{Wall: al.At, UTC: true},
+			Daily:   al.Daily,
+		}
+	}
+	return ical.Emit(evs)
+}
+
+// runExport is the verb's whole life: read the store, emit, publish,
+// exit. It never opens a window — the markers ARE the face.
+func runExport(path string) {
+	if path == "" {
+		vi.ConsoleLine(markerExport + "refused path")
+		vi.Exit(2)
+	}
+	list := loadAlarmFile()
+	b, ok := exportBytes(list)
+	if !ok {
+		if len(list) == 0 {
+			vi.ConsoleLine(markerExport + "refused empty")
+		} else {
+			vi.ConsoleLine(markerExport + "refused emit")
+		}
+		vi.Exit(3)
+	}
+	if rc := alarmFileWrite(path, b); rc != 0 {
+		vi.ConsoleLine(markerExport + "refused write rc=" + vi.Itoa64(rc))
+		vi.Exit(3)
+	}
+	vi.ConsoleLine(markerExport + "done n=" + itoa(int64(len(list))) +
+		" bound=" + itoa(int64(ical.MaxEvents)))
+	vi.Exit(0)
 }

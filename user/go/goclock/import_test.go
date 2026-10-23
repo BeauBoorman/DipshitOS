@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"virelai/clockfmt"
+	"virelai/ical"
 )
 
 const testICS = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\n" +
@@ -27,11 +28,13 @@ func TestImportIntoLandsAndRefuses(t *testing.T) {
 	}
 	// 2027-06-15T14:30Z — UTC zone, so the row reads 14:30 once.
 	a0 := out.list[0]
-	if a0.At != 1813069800 || a0.HHMM != 1430 || a0.Daily || !a0.Enabled {
+	if a0.At != 1813069800 || a0.HHMM != 1430 || a0.Daily || !a0.Enabled ||
+		a0.Summary != "Quarterly sync" {
 		t.Fatalf("row0=%+v", a0)
 	}
 	a1 := out.list[1]
-	if a1.At != 1813136400 || a1.HHMM != 900 || !a1.Daily || !a1.Enabled {
+	if a1.At != 1813136400 || a1.HHMM != 900 || !a1.Daily || !a1.Enabled ||
+		a1.Summary != "Daily standup" {
 		t.Fatalf("row1=%+v", a1)
 	}
 	joined := strings.Join(out.lines, "\n")
@@ -91,9 +94,71 @@ func TestImportIntoTruncationCounts(t *testing.T) {
 }
 
 func TestImportArgShapes(t *testing.T) {
-	// importArg reads vi.Args, which is nil on the host — the shape is
+	// verbArg reads vi.Args, which is nil on the host — the shape is
 	// pinned through isICS-style calls instead.
-	if _, ok := importArg(); ok {
-		t.Fatal("host argv claimed an import")
+	if _, _, ok := verbArg(); ok {
+		t.Fatal("host argv claimed a verb")
+	}
+}
+
+// --- M193b (#3254): the export half — list -> VCALENDAR -> re-parse ----
+
+// exportBytes emits the store as a VCALENDAR that re-parses through the
+// independent ical reader to the same events — the round-trip is the
+// card's own test. A daily row emits RRULE:FREQ=DAILY; the UTC instant
+// is the stamp the re-import resolves back to the same epoch.
+func TestExportBytesRoundTrips(t *testing.T) {
+	list := []Alarm{
+		{At: 1813069800, HHMM: 1430, Enabled: true, Summary: "Quarterly sync"},
+		{At: 1813136400, HHMM: 900, Daily: true, Enabled: false, Summary: "Wake up"},
+	}
+	b, ok := exportBytes(list)
+	if !ok {
+		t.Fatal("exportBytes refused the store")
+	}
+	r, ok := ical.Parse(b)
+	if !ok || len(r.Events) != len(list) || len(r.Refusals) != 0 {
+		t.Fatalf("re-parse r=%+v ok=%v", r, ok)
+	}
+	for i, al := range list {
+		ev := r.Events[i]
+		if !ev.Start.UTC || ev.Start.Wall != al.At || ev.Daily != al.Daily ||
+			ev.Summary != al.Summary {
+			t.Fatalf("event %d = %+v, want at=%d daily=%v summary=%q",
+				i, ev, al.At, al.Daily, al.Summary)
+		}
+	}
+	// And the emitted file carries the reader's own property spellings.
+	s := string(b)
+	for _, want := range []string{
+		"DTSTART:20270615T143000Z", "SUMMARY:Quarterly sync",
+		"RRULE:FREQ=DAILY", "SUMMARY:Wake up",
+	} {
+		if !strings.Contains(s, want) {
+			t.Fatalf("emitted file missing %q:\n%s", want, s)
+		}
+	}
+}
+
+// exportBytes refuses whole: an empty store has no events to name, and
+// a list past the reader's MaxEvents prefix would truncate on re-read —
+// the export's "never a truncated file" half.
+func TestExportBytesRefusals(t *testing.T) {
+	if b, ok := exportBytes(nil); ok {
+		t.Fatalf("empty store emitted %q", b)
+	}
+	full := make([]Alarm, ical.MaxEvents+1)
+	for i := range full {
+		full[i] = Alarm{At: int64(i + 1), HHMM: 1}
+	}
+	if b, ok := exportBytes(full); ok {
+		t.Fatalf("over-bound list emitted %d bytes", len(b))
+	}
+	// A row the emit cannot honour (negative instant, control-byte
+	// summary) fails the whole document, not just its own VEVENT.
+	if _, ok := exportBytes([]Alarm{
+		{At: 1, HHMM: 1}, {At: -1, HHMM: 1},
+	}); ok {
+		t.Fatal("a bad row must fail the whole export")
 	}
 }

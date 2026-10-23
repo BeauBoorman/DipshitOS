@@ -1,5 +1,7 @@
-// Package ical is M187d (#3185): the smallest honest VCALENDAR reader —
-// the half of an .ics file that can become a GOCLOCK row.
+// Package ical is M187d (#3185) + M193b (#3254): the smallest honest
+// VCALENDAR reader AND the matching writer — the half of an .ics file
+// that can become a GOCLOCK row, and the emit that writes exactly the
+// fields the reader round-trips.
 //
 // The bound is the card's: BEGIN:VCALENDAR wrapping BEGIN:VEVENT blocks,
 // and inside each VEVENT only DTSTART, DTEND, SUMMARY and a TRIVIAL RRULE
@@ -133,6 +135,131 @@ func Parse(b []byte) (Result, bool) {
 		}
 	}
 	return r, r.Total > 0
+}
+
+// Emit encodes events as one VCALENDAR document — M193b (#3254), the
+// write half of the reader's bound. Each VEVENT carries exactly the
+// fields Parse honours: DTSTART always, DTEND when HasEnd, SUMMARY when
+// non-empty, RRULE:FREQ=DAILY for a daily row. The file the writer
+// produces re-parses through this same reader — the round-trip is the
+// contract, so an event the bound cannot express fails the WHOLE emit
+// (ok=false), never a partial or silently-dropped document:
+//
+//	events   more than MaxEvents — the reader's honoured prefix would
+//	         quietly lose the tail.
+//	stamp    a negative Wall or one whose year escapes the four-digit
+//	         field the stamp format fixes (0000..9999).
+//	summary  a control byte (CR, LF, TAB, DEL) — the text escape the
+//	         reader resolves cannot carry it: \n unescapes to a space,
+//	         not the byte.
+func Emit(evs []Event) ([]byte, bool) {
+	if len(evs) > MaxEvents {
+		return nil, false
+	}
+	var b strings.Builder
+	b.WriteString("BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//VirelaiOS//ical//EN\r\n")
+	for _, ev := range evs {
+		start, ok := stampString(ev.Start)
+		if !ok {
+			return nil, false
+		}
+		sum, ok := escapeText(ev.Summary)
+		if !ok {
+			return nil, false
+		}
+		b.WriteString("BEGIN:VEVENT\r\nDTSTART:")
+		b.WriteString(start)
+		b.WriteString("\r\n")
+		if ev.HasEnd {
+			end, ok := stampString(ev.End)
+			if !ok {
+				return nil, false
+			}
+			b.WriteString("DTEND:")
+			b.WriteString(end)
+			b.WriteString("\r\n")
+		}
+		if ev.Summary != "" {
+			b.WriteString("SUMMARY:")
+			b.WriteString(sum)
+			b.WriteString("\r\n")
+		}
+		if ev.Daily {
+			b.WriteString("RRULE:FREQ=DAILY\r\n")
+		}
+		b.WriteString("END:VEVENT\r\n")
+	}
+	b.WriteString("END:VCALENDAR\r\n")
+	return []byte(b.String()), true
+}
+
+// stampString renders a Stamp as the fixed DTSTART/DTEND value —
+// YYYYMMDDTHHMMSS plus Z for a UTC stamp. The civil inverse bounds the
+// year at four digits: a Wall whose year escapes 0..9999 cannot be
+// stamped honestly, so the emit refuses it.
+func stampString(st Stamp) (string, bool) {
+	if st.Wall < 0 {
+		return "", false
+	}
+	y, mo, d := civilFromDays(st.Wall / 86400)
+	if y < 0 || y > 9999 {
+		return "", false
+	}
+	secs := st.Wall % 86400
+	var b [16]byte
+	i := 0
+	put := func(v, w int) {
+		for k := w - 1; k >= 0; k-- {
+			b[i+k] = byte('0' + v%10)
+			v /= 10
+		}
+		i += w
+	}
+	put(y, 4)
+	put(mo, 2)
+	put(d, 2)
+	b[i] = 'T'
+	i++
+	put(int(secs/3600), 2)
+	put(int(secs/60%60), 2)
+	put(int(secs%60), 2)
+	if st.UTC {
+		b[i] = 'Z'
+		i++
+	}
+	return string(b[:i]), true
+}
+
+// escapeText renders a SUMMARY value's RFC 5545 TEXT escapes — the set
+// the reader's unescape resolves: \ → \\, , → \,, ; → \;. A control
+// byte cannot round-trip (the reader turns \n into a space, not a
+// newline), so it fails the emit rather than lying in the file.
+func escapeText(s string) (string, bool) {
+	if !strings.ContainsAny(s, "\\,;") {
+		for i := 0; i < len(s); i++ {
+			if s[i] < 0x20 || s[i] == 0x7f {
+				return "", false
+			}
+		}
+		return s, true
+	}
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c < 0x20 || c == 0x7f:
+			return "", false
+		case c == '\\':
+			b.WriteString("\\\\")
+		case c == ',':
+			b.WriteString("\\,")
+		case c == ';':
+			b.WriteString("\\;")
+		default:
+			b.WriteByte(c)
+		}
+	}
+	return b.String(), true
 }
 
 // parseProp folds one VEVENT property into ev; false when the property
@@ -322,6 +449,26 @@ func daysFromCivil(y, m, d int) int64 {
 	doy := (153*int64(mp)+2)/5 + int64(d-1)
 	doe := yoe*365 + yoe/4 - yoe/100 + doy
 	return era*146097 + doe - 719468
+}
+
+// civilFromDays is Hinnant's inverse of daysFromCivil: days since
+// 1970-01-01 back to the proleptic-Gregorian y/m/d — the emit half's
+// stamp math, kept local with the forward solve.
+func civilFromDays(z int64) (y, m, d int) {
+	z += 719468
+	era := floorDiv(z, 146097)
+	doe := z - era*146097
+	yoe := (doe - doe/1460 + doe/36524 - doe/146096) / 365
+	y = int(yoe + era*400)
+	doy := doe - (365*yoe + yoe/4 - yoe/100)
+	mp := (5*doy + 2) / 153
+	d = int(doy - (153*mp+2)/5 + 1)
+	m = int(mp) + 3
+	if m > 12 {
+		m -= 12
+		y++
+	}
+	return y, m, d
 }
 
 func floorDiv(a, b int64) int64 {

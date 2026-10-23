@@ -4,6 +4,7 @@ package main
 // list, the monotonic stopwatch, the bounded digit field, and the alarm's
 // next-occurrence math in the settings zone's own civil day.
 import (
+	"strings"
 	"testing"
 
 	"virelai/clockfmt"
@@ -156,17 +157,18 @@ func TestAlarmAt(t *testing.T) {
 	}
 }
 
-// The gocal2 list record: `gocal2 <n>` plus n `<at> <hhmm> <flags>`
-// triples (d|o for daily/once, +|- for enabled/off). Round-trips
-// byte-exact.
+// The gocal3 list record (M193b): `gocal3 <n>` plus n `<at> <hhmm>
+// <flags> <sum>` quadruples — flags as before (d|o, +|-), <sum> the
+// escaped summary token (`\_` for none, `\s` for space, `\\` for
+// backslash). Round-trips byte-exact, summaries included.
 func TestAlarmListRoundTrip(t *testing.T) {
 	list := []Alarm{
 		{At: 1792497600, HHMM: 2359, Daily: true, Enabled: true},
-		{At: 1792500000, HHMM: 645, Daily: false, Enabled: true},
-		{At: 1792510000, HHMM: 1920, Daily: true, Enabled: false},
+		{At: 1792500000, HHMM: 645, Daily: false, Enabled: true, Summary: "Wake up"},
+		{At: 1792510000, HHMM: 1920, Daily: true, Enabled: false, Summary: `a\b c`},
 	}
 	b := encodeAlarms(list)
-	want := "gocal2 3 1792497600 2359 d+ 1792500000 0645 o+ 1792510000 1920 d-"
+	want := "gocal3 3 1792497600 2359 d+ \\_ 1792500000 0645 o+ Wake\\sup 1792510000 1920 d- a\\\\b\\sc"
 	if string(b) != want {
 		t.Fatalf("encodeAlarms = %q, want %q", b, want)
 	}
@@ -182,6 +184,24 @@ func TestAlarmListRoundTrip(t *testing.T) {
 	// A trailing newline (a hand-staged or edited file) still decodes.
 	if got, ok = decodeAlarms([]byte(want + "\n")); !ok || len(got) != 3 {
 		t.Fatalf("decodeAlarms trailing-newline = %v,%v", got, ok)
+	}
+}
+
+// gocal2 still reads: the M152b list framing decodes as the same rows
+// with empty summaries — the file an older app last wrote.
+func TestGocal2StillReads(t *testing.T) {
+	got, ok := decodeAlarms([]byte("gocal2 2 1792497600 2359 d+ 1792500000 0645 o-"))
+	if !ok || len(got) != 2 {
+		t.Fatalf("decodeAlarms gocal2 = %v,%v", got, ok)
+	}
+	want := []Alarm{
+		{At: 1792497600, HHMM: 2359, Daily: true, Enabled: true},
+		{At: 1792500000, HHMM: 645, Daily: false, Enabled: false},
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("row %d = %+v, want %+v", i, got[i], want[i])
+		}
 	}
 }
 
@@ -212,6 +232,10 @@ func TestAlarmRecordRefusals(t *testing.T) {
 		"gocal2 1 x 2359 d+", "gocal2 1 1 2460 d+", "gocal2 1 -1 2359 d+",
 		"gocal2 1 1 2359 dd", "gocal2 1 1 2359 dx", "gocal2 1 1 2359 x+",
 		"gocal2  1 1 2359 d+", "gocal2 1  1 2359 d+",
+		"gocal3", "gocal3 x", "gocal3 1", "gocal3 1 1 2359 d+",
+		"gocal3 1 1 2359 d+ \\_ extra", "gocal3 2 1 2359 d+ \\_",
+		"gocal3 1 1 2359 d+ a\\", "gocal3 1 1 2359 d+ a\\xb",
+		"gocal3 1 1 2359 d+ \\_ \\_",
 	} {
 		if _, ok := decodeAlarms([]byte(s)); ok {
 			t.Fatalf("decodeAlarms(%q) = ok, want refused", s)
@@ -223,6 +247,26 @@ func TestAlarmRecordRefusals(t *testing.T) {
 	if encodeAlarms([]Alarm{{At: -1, HHMM: 2359}}) != nil ||
 		encodeAlarms([]Alarm{{At: 1, HHMM: 2460}}) != nil {
 		t.Fatal("encodeAlarms must refuse a negative at or a bad HHMM")
+	}
+	// A summary the record cannot carry fails the whole encode.
+	if encodeAlarms([]Alarm{{At: 1, HHMM: 1, Summary: "a\nb"}}) != nil {
+		t.Fatal("encodeAlarms must refuse a control-byte summary")
+	}
+	if encodeAlarms([]Alarm{{At: 1, HHMM: 1,
+		Summary: strings.Repeat("x", MaxSummary+1)}}) != nil {
+		t.Fatal("encodeAlarms must refuse a summary past MaxSummary")
+	}
+}
+
+// cleanSummary: control bytes drop, the tail truncates at the bound —
+// the field is one bounded line wherever it is set.
+func TestCleanSummary(t *testing.T) {
+	if got := cleanSummary("a\nb\rc\td"); got != "abcd" {
+		t.Fatalf("cleanSummary ctl = %q", got)
+	}
+	long := strings.Repeat("x", MaxSummary+20)
+	if got := cleanSummary(long); len(got) != MaxSummary {
+		t.Fatalf("cleanSummary bound = %d, want %d", len(got), MaxSummary)
 	}
 }
 

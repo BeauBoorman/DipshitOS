@@ -9,6 +9,8 @@ package main
 // deadlines are wall-clock seconds (vi.Now's epoch) because they name
 // civil times the user can see.
 import (
+	"strings"
+
 	"virelai/clockfmt"
 )
 
@@ -238,11 +240,37 @@ const dailyRepeat = 86400
 //	         speak it.
 //	Daily    re-arms every 86400 s; false is one-shot.
 //	Enabled  false keeps the row but drops the deadline (the toggle).
+//	Summary  the row's free text (M193b) — an import's SUMMARY, carried
+//	         through the record to the export's SUMMARY. Single-line,
+//	         bounded at MaxSummary.
 type Alarm struct {
 	At      int64
 	HHMM    int
 	Daily   bool
 	Enabled bool
+	Summary string
+}
+
+// MaxSummary bounds the free-text field a row carries — the persisted
+// record stays a short line and the face row fits its plate.
+const MaxSummary = 48
+
+// cleanSummary prepares a string for the field: control bytes drop (the
+// record is one line and a face row is one line), then the tail
+// truncates at the bound — the cut is the bound's answer, not a guess
+// at the intent.
+func cleanSummary(s string) string {
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		if c := s[i]; c >= 0x20 && c != 0x7f {
+			b.WriteByte(c)
+		}
+	}
+	out := b.String()
+	if len(out) > MaxSummary {
+		out = out[:MaxSummary]
+	}
+	return out
 }
 
 // alarmIndex parses the deadline id of list row i ("alarm<i>") back into
@@ -268,14 +296,18 @@ func alarmIndex(id string) (int, bool) {
 // seat's save_state blob. M152b (#2916) extends the record to the whole
 // list: `gocal2 <n>` followed by n triples of `<at> <hhmm> <flags>`,
 // where flags is `d` (daily) or `o` (once) plus `+` (enabled) or `-`
-// (switched off):
+// (switched off). M193b (#3254) adds the per-row summary: `gocal3 <n>`
+// keeps the same space-separated shape with a fourth token per row —
+// the escaped summary, `\_` for none, space as `\s` and backslash as
+// `\\` so the record stays one line:
 //
-//	gocal2 2 1792502700 0645 d+ 1792522800 1920 o-
+//	gocal3 2 1792523400 0700 d+ Wake\sup 1792502700 0645 o- \_
 //
 // `at` is the armed instant as a wall-clock epoch so a start after the
 // deadline can tell "still ahead" from "came due while we were off";
-// `hhmm` is the civil field the user typed. A `gocal1` record still
-// reads — it decodes as the single daily enabled alarm it always was.
+// `hhmm` is the civil field the user typed. `gocal1` and `gocal2`
+// records still read — they decode as the summary-less rows they always
+// were; `gocal3` is the only spelling written.
 
 // alarmMagic versions the record: a blob or file whose framing does not
 // match is refused whole, never guessed at.
@@ -283,21 +315,26 @@ const alarmMagic = "gocal1 "
 
 const alarmListMagic = "gocal2 "
 
+const alarmList3Magic = "gocal3 "
+
 // hhmmString renders h:m as the typed four-digit field.
 func hhmmString(h, m int) string {
 	return two(int64(h)) + two(int64(m))
 }
 
-// encodeAlarms renders the gocal2 list. A list past MaxAlarms is refused
-// — the bound is the contract, never truncated silently.
+// encodeAlarms renders the gocal3 list. A list past MaxAlarms is refused
+// — the bound is the contract, never truncated silently — and so is a
+// row the record cannot carry (a bad field, an over-long or control-
+// byte summary).
 func encodeAlarms(list []Alarm) []byte {
 	if len(list) > MaxAlarms {
 		return nil
 	}
-	s := alarmListMagic + itoa(int64(len(list)))
+	s := alarmList3Magic + itoa(int64(len(list)))
 	for _, al := range list {
 		h, m, ok := parseHHMM(al.HHMM)
-		if !ok || al.At < 0 {
+		tok, tokOK := sumToken(al.Summary)
+		if !ok || al.At < 0 || !tokOK {
 			return nil
 		}
 		f := "o"
@@ -309,19 +346,84 @@ func encodeAlarms(list []Alarm) []byte {
 		} else {
 			f += "-"
 		}
-		s += " " + itoa(al.At) + " " + hhmmString(h, m) + " " + f
+		s += " " + itoa(al.At) + " " + hhmmString(h, m) + " " + f + " " + tok
 	}
 	return []byte(s)
 }
 
-// decodeAlarms reads either framing: the gocal2 list, or the gocal1
-// single-record it supersedes (which decodes as one daily enabled
-// alarm). Anything else refuses whole — torn writes and foreign blobs
-// are "no state", never a guess.
+// sumToken renders the record's summary token: `\_` for empty, else the
+// printable bytes with space as `\s` and backslash as `\\`. A control
+// byte — or a field past MaxSummary — fails the whole encode rather
+// than writing a row the format cannot carry.
+func sumToken(sum string) (string, bool) {
+	if sum == "" {
+		return `\_`, true
+	}
+	if len(sum) > MaxSummary {
+		return "", false
+	}
+	var b strings.Builder
+	for i := 0; i < len(sum); i++ {
+		c := sum[i]
+		switch {
+		case c < 0x20 || c == 0x7f:
+			return "", false
+		case c == ' ':
+			b.WriteString(`\s`)
+		case c == '\\':
+			b.WriteString(`\\`)
+		default:
+			b.WriteByte(c)
+		}
+	}
+	return b.String(), true
+}
+
+// sumFromToken decodes the escaped token: `\_` is empty; `\\` and `\s`
+// resolve to their bytes; any other escape or a control byte is a
+// foreign record and refuses.
+func sumFromToken(tok string) (string, bool) {
+	if tok == `\_` {
+		return "", true
+	}
+	var b strings.Builder
+	for i := 0; i < len(tok); i++ {
+		c := tok[i]
+		if c == '\\' {
+			i++
+			if i >= len(tok) {
+				return "", false
+			}
+			switch tok[i] {
+			case 's':
+				b.WriteByte(' ')
+			case '\\':
+				b.WriteByte('\\')
+			default:
+				return "", false
+			}
+			continue
+		}
+		if c < 0x20 || c == 0x7f {
+			return "", false
+		}
+		b.WriteByte(c)
+	}
+	return b.String(), true
+}
+
+// decodeAlarms reads every framing the app ever wrote: the gocal3 list
+// (with summaries), the gocal2 list it supersedes, and the gocal1
+// single-record (which decodes as the one daily enabled alarm it always
+// was). Anything else refuses whole — torn writes and foreign blobs are
+// "no state", never a guess.
 func decodeAlarms(b []byte) ([]Alarm, bool) {
 	s := string(b)
 	if len(b) > 0 && b[len(b)-1] == '\n' {
 		s = s[:len(s)-1]
+	}
+	if len(s) > len(alarmList3Magic) && s[:len(alarmList3Magic)] == alarmList3Magic {
+		return decodeGocal3(s[len(alarmList3Magic):])
 	}
 	if len(s) > len(alarmListMagic) && s[:len(alarmListMagic)] == alarmListMagic {
 		return decodeGocal2(s[len(alarmListMagic):])
@@ -332,11 +434,8 @@ func decodeAlarms(b []byte) ([]Alarm, bool) {
 	return nil, false
 }
 
-// decodeGocal2 parses `<n> <at> <hhmm> <flags>…`: n decimal triples,
-// each a non-negative epoch, a valid HHMM field and the two-letter
-// flag pair. A count that does not match the token count — or n past
-// MaxAlarms — is a foreign record and refuses.
-func decodeGocal2(rest string) ([]Alarm, bool) {
+// splitTokens breaks the record body at its single-space separators.
+func splitTokens(rest string) []string {
 	var toks []string
 	start := 0
 	for i := 0; i <= len(rest); i++ {
@@ -345,37 +444,81 @@ func decodeGocal2(rest string) ([]Alarm, bool) {
 			start = i + 1
 		}
 	}
+	return toks
+}
+
+// alarmFromFields decodes one row's `<at> <hhmm> <flags>` triple: a
+// non-negative epoch, a valid HHMM field and the two-letter flag pair.
+func alarmFromFields(atS, hmS, f string) (Alarm, bool) {
+	at, ok1 := atoiField(atS)
+	hhmm, ok2 := atoiField(hmS)
+	if !ok1 || !ok2 || len(f) != 2 {
+		return Alarm{}, false
+	}
+	if _, _, ok3 := parseHHMM(int(hhmm)); !ok3 {
+		return Alarm{}, false
+	}
+	var al Alarm
+	switch f[0] {
+	case 'd':
+		al.Daily = true
+	case 'o':
+	default:
+		return Alarm{}, false
+	}
+	switch f[1] {
+	case '+':
+		al.Enabled = true
+	case '-':
+	default:
+		return Alarm{}, false
+	}
+	al.At, al.HHMM = at, int(hhmm)
+	return al, true
+}
+
+// decodeGocal3 parses `<n>` plus n row quadruples `<at> <hhmm> <flags>
+// <sum>` — the gocal2 row plus its escaped summary token. A count that
+// does not match the token count — or n past MaxAlarms — is a foreign
+// record and refuses.
+func decodeGocal3(rest string) ([]Alarm, bool) {
+	toks := splitTokens(rest)
+	n, ok := atoiField(toks[0])
+	if !ok || n > int64(MaxAlarms) || len(toks) != 1+4*int(n) {
+		return nil, false
+	}
+	list := make([]Alarm, 0, n)
+	for i := 0; i < int(n); i++ {
+		al, ok := alarmFromFields(toks[1+4*i], toks[2+4*i], toks[3+4*i])
+		if !ok {
+			return nil, false
+		}
+		sum, ok := sumFromToken(toks[4+4*i])
+		if !ok || len(sum) > MaxSummary {
+			return nil, false
+		}
+		al.Summary = sum
+		list = append(list, al)
+	}
+	return list, true
+}
+
+// decodeGocal2 parses `<n> <at> <hhmm> <flags>…`: n decimal triples,
+// each a non-negative epoch, a valid HHMM field and the two-letter
+// flag pair. A count that does not match the token count — or n past
+// MaxAlarms — is a foreign record and refuses.
+func decodeGocal2(rest string) ([]Alarm, bool) {
+	toks := splitTokens(rest)
 	n, ok := atoiField(toks[0])
 	if !ok || n > int64(MaxAlarms) || len(toks) != 1+3*int(n) {
 		return nil, false
 	}
 	list := make([]Alarm, 0, n)
 	for i := 0; i < int(n); i++ {
-		at, ok1 := atoiField(toks[1+3*i])
-		hhmm, ok2 := atoiField(toks[2+3*i])
-		f := toks[3+3*i]
-		if !ok1 || !ok2 || len(f) != 2 {
+		al, ok := alarmFromFields(toks[1+3*i], toks[2+3*i], toks[3+3*i])
+		if !ok {
 			return nil, false
 		}
-		if _, _, ok3 := parseHHMM(int(hhmm)); !ok3 {
-			return nil, false
-		}
-		var al Alarm
-		switch f[0] {
-		case 'd':
-			al.Daily = true
-		case 'o':
-		default:
-			return nil, false
-		}
-		switch f[1] {
-		case '+':
-			al.Enabled = true
-		case '-':
-		default:
-			return nil, false
-		}
-		al.At, al.HHMM = at, int(hhmm)
 		list = append(list, al)
 	}
 	return list, true

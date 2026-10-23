@@ -157,3 +157,87 @@ func TestNotVCalendar(t *testing.T) {
 		t.Fatal("empty vcalendar parsed")
 	}
 }
+
+// --- M193b (#3254): Emit — the write half, round-tripped through Parse ---
+
+func TestEmitRoundTrips(t *testing.T) {
+	evs := []Event{
+		{Summary: "Quarterly sync",
+			Start: Stamp{Wall: 1813069800, UTC: true},
+			End:   Stamp{Wall: 1813073400, UTC: true}, HasEnd: true},
+		{Summary: "Daily standup",
+			Start: Stamp{Wall: 1813136400, UTC: true}, Daily: true},
+		{Summary: "Floating thing",
+			Start: Stamp{Wall: 1813136400}},
+		{Start: Stamp{Wall: 0, UTC: true}}, // epoch 0 is a real stamp
+	}
+	b, ok := Emit(evs)
+	if !ok {
+		t.Fatal("Emit refused the honoured set")
+	}
+	r, ok := Parse(b)
+	if !ok || r.Total != len(evs) || len(r.Events) != len(evs) || len(r.Refusals) != 0 {
+		t.Fatalf("re-parse r=%+v ok=%v", r, ok)
+	}
+	for i, want := range evs {
+		if r.Events[i] != want {
+			t.Fatalf("event %d = %+v, want %+v", i, r.Events[i], want)
+		}
+	}
+}
+
+// The emitted document's shape: the reader's own lines, in order, and
+// nothing else — a foreign reader sees the same minimal calendar.
+func TestEmitShape(t *testing.T) {
+	b, ok := Emit([]Event{{
+		Summary: "Wake up",
+		Start:   Stamp{Wall: 1813136400, UTC: true},
+		Daily:   true,
+	}})
+	if !ok {
+		t.Fatal("Emit refused a daily event")
+	}
+	want := "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//VirelaiOS//ical//EN\r\n" +
+		"BEGIN:VEVENT\r\nDTSTART:20270616T090000Z\r\nSUMMARY:Wake up\r\n" +
+		"RRULE:FREQ=DAILY\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+	if string(b) != want {
+		t.Fatalf("Emit = %q, want %q", b, want)
+	}
+}
+
+// The TEXT escapes the writer emits are exactly the ones unescape
+// resolves — a summary carrying , ; and \ comes back byte-exact.
+func TestEmitEscapesRoundTrip(t *testing.T) {
+	sum := "Dentist, 3rd floor; bring \\ card"
+	b, ok := Emit([]Event{{Summary: sum, Start: Stamp{Wall: 1, UTC: true}}})
+	if !ok {
+		t.Fatal("Emit refused an escapable summary")
+	}
+	if !strings.Contains(string(b), `SUMMARY:Dentist\, 3rd floor\; bring \\ card`) {
+		t.Fatalf("emitted value = %q", b)
+	}
+	r, ok := Parse(b)
+	if !ok || len(r.Events) != 1 || r.Events[0].Summary != sum {
+		t.Fatalf("round-trip summary = %q", r.Events[0].Summary)
+	}
+}
+
+// What the bound cannot express, Emit refuses whole — past the reader's
+// honoured prefix, outside the stamp's year field, or carrying a control
+// byte the text escape cannot round-trip.
+func TestEmitRefusals(t *testing.T) {
+	if _, ok := Emit(make([]Event, MaxEvents+1)); ok {
+		t.Fatal("Emit accepted a document past MaxEvents")
+	}
+	for name, ev := range map[string]Event{
+		"negative-wall": {Start: Stamp{Wall: -1, UTC: true}},
+		"far-year":      {Start: Stamp{Wall: 253402300800, UTC: true}}, // 10000-01-01
+		"newline":       {Summary: "a\nb", Start: Stamp{Wall: 1}},
+		"tab":           {Summary: "a\tb", Start: Stamp{Wall: 1}},
+		"bad-end":       {Start: Stamp{Wall: 1}, End: Stamp{Wall: -1}, HasEnd: true},
+	} {
+		if b, ok := Emit([]Event{ev}); ok {
+			t.Fatalf("%s: Emit produced %q", name, b)
+		}
+	}
+}
