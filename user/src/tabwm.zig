@@ -1,3 +1,4 @@
+//! census (M188e, #3190): TABWM.BIN — gate-referenced: 13 specs incl. live-tabwm, go-wm-hid; also the APPS.TXT Zig fallback WM (ADR 0034).
 //! VirelaiOS M39 TWM2 — TABWM.BIN, the browser-style tabbed window manager server (issue #929).
 //!
 //! Replaces the 1990s floating overlapping window model with a sleek, browser-like

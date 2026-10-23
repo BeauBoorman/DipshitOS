@@ -1,3 +1,4 @@
+//! census (M188e, #3190): WINCLOSE.BIN — gate-referenced: live-win-close.
 //! VirelaiOS seventh ESP user program — WINCLOSE.BIN (milestone six, card
 //! G6 teardown follow-on, claim 0487 — the draw/window syscall seam's
 //! release half).

@@ -1,3 +1,4 @@
+//! census (M188e, #3190): SCHEDHOG.BIN — gate-referenced: live-sched-ring, live-vm-depth.
 //! VirelaiOS scheduler-aging hog — SCHEDHOG.BIN (M133b, issue #2756).
 //!
 //! The CPU hog half of the live-sched-ring aging leg: exec'd pinned to

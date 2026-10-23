@@ -1,3 +1,4 @@
+//! census (M188e, #3190): TIMER.BIN — gate-referenced: live-timers, live-bench (tools/gate/bench/corpus.tsv).
 //! VirelaiOS twenty-third ESP user program — TIMER.BIN (Milestone 14, Card
 //! S2, claim 7323).
 //!

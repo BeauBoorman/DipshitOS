@@ -1,3 +1,4 @@
+//! census (M188e, #3190): SMP1.BIN — gate-referenced: live-smp1.
 //! VirelaiOS SMP user task — SMP1.BIN (claim 2369: locked console TX +
 //! user tasks on secondary cores).
 //!

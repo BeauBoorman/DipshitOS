@@ -1,3 +1,4 @@
+//! census (M188e, #3190): WIN.BIN — gate-referenced: live-win-syscall.
 //! VirelaiOS sixth ESP user program — WIN.BIN (milestone six, card G6,
 //! claim 0487 — the draw/window syscall seam).
 //!

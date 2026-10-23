@@ -1,3 +1,4 @@
+//! census (M188e, #3190): RESMON.BIN — gate-referenced: live-resmon, live-wm1.
 //! VirelaiOS ESP user program — RESMON.BIN (M22 D10, issue #333, claim 9815).
 //!
 //! Lightweight resource monitor window: shows process count, scheduler state,

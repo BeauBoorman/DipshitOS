@@ -1,3 +1,4 @@
+//! census (M188e, #3190): M21DEMO.BIN — gate-referenced: 6 M21 tiling/WM specs incl. live-m21-tile-master, live-m21-minimize-ws.
 //! VirelaiOS M21 ESP user program — M21DEMO.BIN (milestone twenty-one,
 //! claim 8777: the W1/W2 tiling + master-detail gate payload).
 //!

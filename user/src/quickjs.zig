@@ -1,3 +1,4 @@
+//! census (M188e, #3190): QJS.BIN — gate-referenced: live-quickjs; built by tools/js-client/build.py, not build.zig.
 //! ADR 0039's sole product adapter. JS owns no native handles.
 const std = @import("std");
 const sdk = @import("sdk").runtime;

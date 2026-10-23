@@ -1,3 +1,4 @@
+//! census (M188e, #3190): SB3OWN.BIN — gate-referenced: live-sb3-surface-handoff.
 //! VirelaiOS M33 SB3 (claim 3633) live-gate test app — SB3OWN.BIN: the
 //! migrated-app half of the window surface handoff proof.
 //!

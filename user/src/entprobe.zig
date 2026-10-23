@@ -1,3 +1,4 @@
+//! census (M188e, #3190): ENTPROBE.BIN — gate-referenced: live-entropy-refusal.
 //! VirelaiOS M97g entropy probe — ENTPROBE.BIN (issue #2084, the live
 //! slot-72 fail-closed gate payload).
 //!

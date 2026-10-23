@@ -1,3 +1,4 @@
+//! census (M188e, #3190): WND.BIN — gate-referenced: live-wnd-server, live-wallpaper; also launched by the monitor `wnd start` builtin.
 //! VirelaiOS M32 WMS3+WMS5 — WND.BIN, the long-lived EL0 window-manager SERVER
 //! (issues #623/#625).
 //!

@@ -1,3 +1,4 @@
+//! census (M188e, #3190): SMPEV.BIN — gate-referenced: live-smp-stress.
 //! VirelaiOS four-core stress EV hammer — SMPEV.BIN (claim 907,
 //! issue #858). Pinned to CORE 0 by the gate (`exec -c0 SMPEV.BIN` — the
 //! explicit core-0 pin, secondary_ok off so no secondary core can steal

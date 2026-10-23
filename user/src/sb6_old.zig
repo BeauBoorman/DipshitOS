@@ -1,3 +1,4 @@
+//! census (M188e, #3190): SB6OLD.BIN — gate-referenced: live-sb6-perf-payoff.
 //! VirelaiOS M33 SB6 (claim 6864) live-gate test app — SB6OLD.BIN: the
 //! PRE-seam-B control half of the perf-payoff measurement.
 //!

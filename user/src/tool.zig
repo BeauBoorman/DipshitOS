@@ -1,3 +1,4 @@
+//! census (M188e, #3190): TOOL.BIN — gate-referenced: live-sh-tools, live-trust-grants.
 //! TOOL.BIN — the M49 SD3 (#1130) standalone busybox-style multicall.
 //!
 //! One freestanding EL0 binary, many tools: the first argument selects from

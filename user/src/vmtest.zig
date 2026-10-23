@@ -1,3 +1,4 @@
+//! census (M188e, #3190): VMTEST.BIN — gate-referenced: live-vm-depth.
 //! VirelaiOS VM Depth Test Binary — VMTEST.BIN (Milestone 29, Issue #598).
 //!
 //! Verifies userland anonymous mmap, lazy demand-zero fault resolution,

@@ -1,3 +1,4 @@
+//! census (M188e, #3190): CRYPTOD.BIN — gate-referenced: live-crypto.
 //! VirelaiOS M47 CP5 EL0 demo — CRYPTOD.BIN (#1119, ADR 0023).
 //!
 //! Reads a file through the M10/M34 file channel (slots 23/24/26), streams

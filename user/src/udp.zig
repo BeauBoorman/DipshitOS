@@ -1,3 +1,4 @@
+//! census (M188e, #3190): UDP.BIN — gate-referenced: live-net-udp-syscall.
 //! VirelaiOS fifth ESP user program — UDP.BIN (milestone five, card N6,
 //! claim 1384 — the UDP syscall seam).
 //!

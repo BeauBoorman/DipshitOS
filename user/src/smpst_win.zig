@@ -1,3 +1,4 @@
+//! census (M188e, #3190): SMPWIN.BIN — gate-referenced: live-smp-stress.
 //! VirelaiOS four-core stress WIN hammer — SMPWIN.BIN (claim 907,
 //! issue #858). Pinned to CORE 3 by the gate (`exec -c3 SMPWIN.BIN`);
 //! it hammers the WIN service domain (slots 12-15 — kernel-owned window

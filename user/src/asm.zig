@@ -1,3 +1,4 @@
+//! census (M188e, #3190): ASM.BIN — gate-referenced: live-asm, live-disas, live-trust-grants.
 //! VirelaiOS ESP user program — ASM.BIN (M22 D2, issue #325, claim 9815).
 //!
 //! A tiny two-pass AArch64 assembler running ON the machine: reads a

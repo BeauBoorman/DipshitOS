@@ -1,3 +1,4 @@
+//! census (M188e, #3190): LD.SO — gate-referenced: gate-exercised as the PT_INTERP interpreter exec loads for DYNAPP.ELF (live-dynamic-linking, live-dynamic-ecosystem).
 //! VirelaiOS Freestanding Runtime Linker (LD.SO, Milestone 30 Dynamic Linking).
 //!
 //! Zero libc/POSIX, zero external runtime. Maps and relocates ELF dynamic

@@ -1,3 +1,4 @@
+//! census (M188e, #3190): DISAS.BIN — gate-referenced: live-disas.
 //! VirelaiOS ESP user program — DISAS.BIN (M22 D4, issue #327, claim 9815).
 //!
 //! Reads up to 4 KiB of raw bytes from the mounted filesystems and prints

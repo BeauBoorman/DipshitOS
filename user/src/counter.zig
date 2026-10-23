@@ -1,3 +1,4 @@
+//! census (M188e, #3190): COUNTER.BIN — gate-referenced: the never-exiting fixture — 19 specs incl. live-long-lived, live-ipc, go-top.
 //! VirelaiOS second ESP user program — COUNTER.BIN (milestone-four
 //! follow-on 2, claim 4613; extended by follow-on 3 card 3f, claim 5965 —
 //! the IPC sender; extended by follow-on 4 card 4b, claim 3179 — the

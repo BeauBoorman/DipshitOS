@@ -1,3 +1,4 @@
+//! census (M188e, #3190): GUARD.BIN — gate-referenced: live-m16-composition, live-m16-guards.
 //! VirelaiOS twenty-ninth ESP user program — GUARD.BIN (Milestone 16, Card
 //! C2, claim 8403).
 //!

@@ -1,3 +1,4 @@
+//! census (M188e, #3190): SB2WM.BIN — gate-referenced: live-sb2-shared-anon.
 //! VirelaiOS M33 SB2 (claim 8878) live-gate test app — SB2WM.BIN: the WM
 //! (peer) half of the shared-anon proof.
 //!

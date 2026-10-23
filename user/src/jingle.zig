@@ -1,3 +1,4 @@
+//! census (M188e, #3190): JINGLE.BIN — gate-referenced: live-sound-app.
 //! VirelaiOS twenty-sixth ESP user program — JINGLE.BIN (Milestone 15,
 //! Card A3, claim 7636).
 //!

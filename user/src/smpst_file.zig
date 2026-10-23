@@ -1,3 +1,4 @@
+//! census (M188e, #3190): SMPFILE.BIN — gate-referenced: live-smp-stress.
 //! VirelaiOS four-core stress FILE hammer — SMPFILE.BIN (claim 907,
 //! issue #858). Pinned to CORE 1 by the gate (`exec -c1 SMPFILE.BIN`);
 //! it hammers the FILE service domain (slots 23-26 — the host file

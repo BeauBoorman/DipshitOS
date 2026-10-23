@@ -1,3 +1,4 @@
+//! census (M188e, #3190): WASM.BIN — gate-referenced: live-wasm, live-wasm-abi, live-wasm-trap; also a build.zig host-test root.
 //! The in-guest WASM core interpreter (M35 W1b, issue #762).
 //!
 //! Parses + validates + executes a bounded wasm-core subset:

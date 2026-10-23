@@ -1,3 +1,4 @@
+//! census (M188e, #3190): SB4DAM.BIN — gate-referenced: live-sb4-damage-tracking, live-wm1.
 //! VirelaiOS M33 SB4 (claim 2382) live-gate test app — SB4DAM.BIN: the
 //! rect-granular damage proof.
 //!

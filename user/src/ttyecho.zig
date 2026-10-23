@@ -1,3 +1,4 @@
+//! census (M188e, #3190): TTYECHO.BIN — gate-referenced: live-ttyecho.
 //! VirelaiOS terminal-seam pilot — TTYECHO.BIN (#1072, ADR 0020).
 //!
 //! Proves an EL0 process can OWN a terminal through the seam:

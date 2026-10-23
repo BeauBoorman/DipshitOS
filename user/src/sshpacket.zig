@@ -1,3 +1,4 @@
+//! census (M188e, #3190): SSHPACKET.BIN — gate-referenced: live-ssh-packet.
 //! SSHPACKET.BIN — M51 SSH1 (#1168) class-B proof program.
 //!
 //! The guest half of the `live-ssh-packet` gate. It dials the deterministic

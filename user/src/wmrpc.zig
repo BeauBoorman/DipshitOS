@@ -1,3 +1,4 @@
+//! census (M188e, #3190): WMRPC.BIN — gate-referenced: live-wm-ipc, live-wm7-gateb.
 //! VirelaiOS WMS7 Gate A test app — WMRPC.BIN (issue #627).
 //!
 //! The app-facing half of the app↔WM mailbox protocol. It discovers the

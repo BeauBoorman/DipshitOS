@@ -1,3 +1,4 @@
+//! census (M188e, #3190): SB5WM.BIN — gate-referenced: live-sb5-wm-compose-n.
 //! VirelaiOS M33 SB5 (claim 7397) live-gate test app — SB5WM.BIN: the
 //! registered-WM half of the WM compose-N + one final present proof.
 //!

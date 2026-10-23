@@ -1,3 +1,4 @@
+//! census (M188e, #3190): KEYTEST.BIN — gate-referenced: live-events.
 //! VirelaiOS tenth ESP user program — KEYTEST.BIN (milestone nine, card E6,
 //! claim 9328 — interactive EL0 event processing capstone).
 //!

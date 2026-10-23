@@ -1,3 +1,4 @@
+//! census (M188e, #3190): TABHOLD.BIN — gate-referenced: live-tabclick, live-tabstrip.
 //! VirelaiOS M37 DQ2 tab-strip live-gate holder (TABHOLD.BIN, issue #840).
 //!
 //! Opens a user window, attaches it as a tab of the OTHER window in the

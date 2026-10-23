@@ -1,3 +1,4 @@
+//! census (M188e, #3190): CHIME.BIN — gate-referenced: live-m15-composition, live-sound-control.
 //! VirelaiOS twenty-seventh ESP user program — CHIME.BIN (Milestone 15,
 //! Card A4, claim 3206).
 //!

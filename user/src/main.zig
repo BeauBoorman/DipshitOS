@@ -1,3 +1,4 @@
+//! census (M188e, #3190): USER.BIN — gate-referenced: the canonical exec fixture — 13 specs incl. live-exec, live-args, live-fuzz.
 //! VirelaiOS user program loaded from the ESP (milestone-three card 6,
 //! claim 6783; extended by card 7, claim 0635 — blocking syscalls; card
 //! 3e, claim 4636 — exec args).

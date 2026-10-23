@@ -1,3 +1,4 @@
+//! census (M188e, #3190): SB6WM.BIN — gate-referenced: live-sb6-perf-payoff.
 //! VirelaiOS M33 SB6 (claim 6864) live-gate test app — SB6WM.BIN: the
 //! registered-WM half of the perf-payoff measurement.
 //!

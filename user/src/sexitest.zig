@@ -1,3 +1,4 @@
+//! census (M188e, #3190): SEXITEST.BIN — gate-referenced: live-sexiburger-actions, live-wm1.
 //! VirelaiOS Milestone 19 Sexiburger Action Registry & Tab Test App (SEXITEST.BIN).
 //!
 //! Tests the end-to-end action registration seam (issue #701, #705) and the

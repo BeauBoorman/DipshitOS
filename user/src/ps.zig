@@ -1,3 +1,4 @@
+//! census (M188e, #3190): PS.BIN — gate-referenced: live-ps, live-wm1.
 //! VirelaiOS ESP user program — PS.BIN (M22 D6, issue #329, claim 9815).
 //!
 //! Windowed process viewer: polls `sys_procs` (slot 7) once per second via

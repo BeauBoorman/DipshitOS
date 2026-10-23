@@ -1,3 +1,4 @@
+//! census (M188e, #3190): NETPROF.BIN — gate-referenced: live-n12-netprof.
 //! VirelaiOS Network Profile Manager — NETPROF.BIN (M26 N12, Issue #439).
 //!
 //! Manages persistent network configuration profiles stored in `/data/NET.TXT`.

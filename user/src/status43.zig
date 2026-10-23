@@ -1,3 +1,4 @@
+//! census (M188e, #3190): STATUS43.BIN — gate-referenced: live-exec, live-jobs, live-wait.
 //! VirelaiOS fourth ESP user program — STATUS43.BIN (milestone-four
 //! follow-on 4, card 4c — claim 9946).
 //!

@@ -1,3 +1,4 @@
+//! census (M188e, #3190): SMPNET.BIN — gate-referenced: live-smp-stress.
 //! VirelaiOS four-core stress NET hammer — SMPNET.BIN (claim 907,
 //! issue #858). Pinned to CORE 2 by the gate (`exec -c2 SMPNET.BIN`);
 //! it hammers the NET service domain (slots 9-11 — UDP listen/send/recv)

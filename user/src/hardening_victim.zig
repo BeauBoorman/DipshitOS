@@ -1,3 +1,4 @@
+//! census (M188e, #3190): VICTIM.BIN — gate-referenced: live-hardening.
 //! VirelaiOS twenty-fourth ESP user program — VICTIM.BIN (Milestone 14,
 //! Card S4, claim 4482).
 //!

@@ -1,3 +1,4 @@
+//! census (M188e, #3190): SCHEDINT.BIN — gate-referenced: live-sched-ring, live-vm-depth.
 //! VirelaiOS scheduler-aging interactive — SCHEDINT.BIN (M133b,
 //! issue #2756).
 //!

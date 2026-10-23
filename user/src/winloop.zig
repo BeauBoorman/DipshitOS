@@ -1,3 +1,4 @@
+//! census (M188e, #3190): WINLOOP.BIN — gate-referenced: 7 specs incl. live-win-syscall, live-wm1, live-pointer-cg.
 //! VirelaiOS eighth ESP user program — WINLOOP.BIN (milestone six, card G6
 //! per-process-window-ownership follow-on, claim 0487).
 //!

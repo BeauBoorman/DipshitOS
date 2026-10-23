@@ -1,3 +1,4 @@
+//! census (M188e, #3190): ZC.BIN — gate-referenced: live-zc, live-snake; also a build.zig host-test root.
 //! The in-guest compiler (zc): compiles a Zig subset to AArch64 ELF32.
 //! Bounded: <=32 functions, <=512 lines, zero heap.
 //!

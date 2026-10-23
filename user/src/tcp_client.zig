@@ -1,3 +1,4 @@
+//! census (M188e, #3190): TCP.BIN — gate-referenced: live-net-tcp-syscall, live-trust-grants, go-top.
 //! VirelaiOS TCP proof program — TCP.BIN (milestone twelve, card N1, Issue #148).
 //!
 //! Exercises the userland TCP syscall seam end-to-end:

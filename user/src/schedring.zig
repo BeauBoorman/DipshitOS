@@ -1,3 +1,4 @@
+//! census (M188e, #3190): SCHEDRING.BIN — gate-referenced: live-sched-ring.
 //! VirelaiOS sched-ring stress task — SCHEDRING.BIN (claim 881, #856
 //! slice 4 — the live proof for the per-core ready rings).
 //!

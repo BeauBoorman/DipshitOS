@@ -1384,6 +1384,15 @@ pub fn build(b: *std.Build) void {
 
     // ------------------------------------------------------------------
     // Guest: Dynamic Linker & Shared Libraries (Milestone 30, claim 7921)
+    //
+    // M188e (#3190) census: the LIBUI.SO / LIBFONT.SO / DYNAPP.ELF payloads
+    // the dynamic-linking specs exec are synthesized by tools/mkdyn-elf.py
+    // into the host share — they are NOT compiled from Zig. Their M30-era
+    // Zig reference sources (user/src/libui_so.zig, user/src/libfont_so.zig,
+    // user/src/dynapp.zig) and linker scripts (user/so.ld, user/dyn.ld) had
+    // no build step, no spec reference, and no consumer; they are deleted.
+    // LD.SO below is the only Zig-built piece of the M30 set: exec loads it
+    // as the PT_INTERP interpreter for DYNAPP.ELF.
     // ------------------------------------------------------------------
     const ld_prog = b.addExecutable(.{
         .name = "ld.so",

@@ -1,3 +1,4 @@
+//! census (M188e, #3190): TTYED.BIN — gate-referenced: live-ttyed.
 //! TTYED.BIN — the M45 card SH1 (`user/src/lib/tty.zig`) live smoke demo
 //! (issue #1077, ADR 0021 D6).
 //!

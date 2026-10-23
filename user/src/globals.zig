@@ -1,3 +1,4 @@
+//! census (M188e, #3190): GLOBALS.BIN — gate-referenced: live-m16-composition, live-m16-image.
 //! VirelaiOS GLOBALS.BIN — milestone sixteen card C1 (claim 3805) proof
 //! program: the first SEGMENTED DSK3 user image. Its `.data` global is real
 //! writable memory and its `.bss` global is zero-filled — reversing the M15

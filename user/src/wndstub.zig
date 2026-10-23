@@ -1,3 +1,4 @@
+//! census (M188e, #3190): WNDSTUB.BIN — gate-referenced: live-wm-seat-gate, live-wmctl-register.
 //! VirelaiOS M32 WMS2 registrant stub — WNDSTUB.BIN (issue #622, the live
 //! `verify-live-wmctl-register.sh` gate payload).
 //!

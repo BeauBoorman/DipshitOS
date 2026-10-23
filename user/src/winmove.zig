@@ -1,3 +1,4 @@
+//! census (M188e, #3190): WINMOVE.BIN — gate-referenced: live-win-move.
 //! VirelaiOS ninth ESP user program — WINMOVE.BIN (milestone six, card G6
 //! move/raise follow-on, claim 0487).
 //!

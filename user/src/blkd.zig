@@ -1,3 +1,4 @@
+//! census (M188e, #3190): BLKD.BIN — gate-referenced: live-usb-block.
 //! VirelaiOS M43 U3 / M70f F1 EL0 consumer — BLKD.BIN (issue #1034, claim
 //! #1048; M70f F1 added 2026-09-18, issue #1458).
 //!

@@ -1,3 +1,4 @@
+//! census (M188e, #3190): DEVCONS.BIN — gate-referenced: live-devcons, live-tabclick, live-tokens, live-typography, live-wm1.
 //! VirelaiOS ESP user program — DEVCONS.BIN (M22 D14, issue #337, claim 9815).
 //!
 //! Developer console window: split-screen layout with a log pane (top) and

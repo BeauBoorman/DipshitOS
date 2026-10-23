@@ -70,8 +70,8 @@ net, snd, blk, console, file, fs, custom, vsock, entropy) plus
 - `user/zig/` — the bounded **native Zig portfolio** (ADR 0038): a small
   approved set of in-guest Zig compile targets and libraries, not blanket
   authorization for new apps.
-- plus the linker scripts (`linker.ld`, `linker-segmented.ld`, `dyn.ld`,
-  `ld.ld`, `so.ld`) and `user/tests/`.
+- plus the linker scripts (`linker.ld`, `linker-segmented.ld`, `ld.ld`)
+  and `user/tests/`.
 
 ## The host
 

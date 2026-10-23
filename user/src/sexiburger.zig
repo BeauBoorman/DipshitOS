@@ -1,3 +1,4 @@
+//! census (M188e, #3190): SEXIBURG.BIN — gate-referenced: live-sexiburger.
 //! VirelaiOS Standalone Sexiburger Component & Demo Application (Milestone 19, #677).
 //!
 //! A standalone userland program and harness hosting the Sexiburger God Menu component:

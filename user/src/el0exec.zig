@@ -1,3 +1,4 @@
+//! census (M188e, #3190): EL0EXEC.BIN — gate-referenced: live-el0-exec, live-exec, live-vm-depth; also a build.zig host-test root.
 //! VirelaiOS EL0EXEC.BIN — issue #1333 class-B fixture, plus M70a-live (#1466)
 //! fuzz mode.
 //!

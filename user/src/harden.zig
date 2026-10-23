@@ -1,3 +1,4 @@
+//! census (M188e, #3190): HARDEN.BIN — gate-referenced: live-hardening.
 //! VirelaiOS twenty-fifth ESP user program — HARDEN.BIN (Milestone 14,
 //! Card S4, claim 4482).
 //!
