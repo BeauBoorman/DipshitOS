@@ -33,6 +33,21 @@
 #           draw-engine composite end-to-end, discriminated from the v1
 #           flat-rect path by the corner probe.
 #
+# M192c (#3248) legs — the appver-1 envelope, the bounded tape, the copy verb:
+#   run 06  state leg (GOTABWM): 'p' + 'f,f,-,1,return' puts the app in
+#           programmer mode with one tape entry ('HEX FF-1=FE'); 't' runs
+#           the copy verb — refused under a seat-launched uid_user (the
+#           kernel buffer is CAP_CLIPBOARD/seat-only; the marker names the
+#           rc). ctrl-shift-w closes the tab so the seat collects the
+#           envelope, ctrl-shift-t re-execs: 'gocalc: state restored
+#           mode=prog tape=1 last=HEX FF-1=FE' is the byte-for-byte proof
+#           that mode AND tape came back.
+#   run 07  the copy verb lands: `exec -u0` is the capable path (the
+#           go-sheet clipboard-leg convention — a seat-launched app runs
+#           uid_user without caps). 't' publishes the tape as text/plain
+#           on the kernel buffer and the monitor's `clip` reads the exact
+#           bytes back — 'clip: HEX FF-1=FE'.
+#
 # The load-bearing evidence is NOT only the app's own markers: each run's
 # last assert reads the share file back ON THE HOST and requires it to
 # equal the typed expression plus the result, so a stub that printed
@@ -40,6 +55,7 @@
 #
 # HOST PREREQUISITE (fails the gate honestly when missing):
 #   bash tools/go/build-gocalc.sh   ->  .build/go/GOCALC.ELF
+#   bash tools/go/build-gotabwm.sh  ->  .build/go/GOTABWM.ELF  (run 06)
 #
 # exec-order: assert-proven -- every run ends on an rx- marker only its
 # script prints, and the stage gate that forwards the close/echo waits on
@@ -95,6 +111,16 @@ if not os.path.exists(src):
     sys.exit("GOCALC.ELF missing (expected " + src + ") - build it first: "
              "bash tools/go/build-gocalc.sh")
 shutil.copy(src, os.path.join(share, "GOCALC.ELF"))
+seat = os.path.join(".build", "go", "GOTABWM.ELF")
+if not os.path.exists(seat):
+    sys.exit("GOTABWM.ELF missing (expected " + seat + ") - build it first: "
+             "bash tools/go/build-gotabwm.sh (run 06's seat)")
+shutil.copy(seat, os.path.join(share, "GOTABWM.ELF"))
+# wm=none (the go-drag convention): the seat is exec'd explicitly in run 06.
+# Without it, a staged GOTABWM.ELF makes the boot autostart register the
+# seat and runs 04/05 lose their bare-shim world — the pad leg's MOUSE_*
+# delivery and the pixel leg's native window both require 'declare refused'.
+open(os.path.join(share, "SETTINGS.TXT"), "w").write("#v2\nwm=none\n")
 calc = os.path.join(share, "CALC")
 os.makedirs(calc, exist_ok=True)
 print("staged GOCALC.ELF into share (%d bytes) and %s" %
@@ -399,3 +425,96 @@ if out in (BG, SURFACE, BORDER, BTNIDLE, TEXT, INK, TITLE):
 print("calc chrome: corner=Bg, border+BtnIdle plates, '7' label %d px, "
       "display %d Ink px, title band ok" % (glyph, digits))
 PY
+
+# --- run 06 (M192c / #3248): the state leg under GOTABWM ---------------------
+# go-sheet run-06's boot shape: a clean session (no stale SESSION.TABS, no
+# leftover demo countdown), the Go seat, `dui focus 0` then the app. The
+# chord run puts the calc in programmer mode, evaluates one entry so the
+# tape holds 'HEX FF-1=FE', runs the copy verb — refused under uid_user
+# (CAP_CLIPBOARD/seat-only; the honest refusal rides the marker — then
+# closes the tab and reopens it. The seat collects the envelope on close
+# and hands it back to the re-exec'd process.
+vgate_file script-06.txt <<'EOF'
+set GOMAXPROCS=1
+vf rm GOTABWM.DEMO
+vf rm SESSION.TABS
+wm
+exec GOTABWM.ELF
+EOF
+
+vgate_file script2-06.txt <<'EOF'
+dui focus 0
+exec GOCALC.ELF
+EOF
+
+vgate_file script3-06.txt <<'EOF'
+echo rx-gocalc-state-ok
+EOF
+
+vgate_run 06 -- \
+    --screen '$RUN_DIR/screen-06' \
+    --via-virtio \
+    --script '$RUN_DIR/script-06.txt' \
+    --script2 '$RUN_DIR/script2-06.txt' \
+    --script2-after 'gotabwm: win focus' \
+    --input-chords 'p,f,f,-,1,return,t,ctrl-shift-w,ctrl-shift-t' \
+    --input-chords-after 'gocalc: present' \
+    --script3 '$RUN_DIR/script3-06.txt' \
+    --script3-after 'gocalc: state restored ' \
+    --script-expect 'rx-gocalc-state-ok' --timeout 300
+
+vgate_assert 06 serial-contains 'exec: loaded GOTABWM.ELF'
+vgate_assert 06 serial-contains 'exec: loaded GOCALC.ELF'
+vgate_assert 06 serial-contains 'gocalc: declare accepted'
+vgate_assert 06 serial-contains 'gocalc: present'
+vgate_assert 06 serial-contains 'gocalc: result FF-1=FE'
+# The copy verb under a plain seat launch: the named refusal, not silence.
+vgate_assert 06 serial-contains 'gocalc: tape copy refused rc='
+# The seat's ask, the app's appver-1 answer, the close, the reopen.
+vgate_assert 06 serial-contains 'gotabwm: state ask id='
+vgate_assert 06 serial-contains 'gocalc: state saved n='
+vgate_assert 06 serial-contains 'gotabwm: state save id='
+vgate_assert 06 serial-contains 'gotabwm: tab close id='
+vgate_assert 06 serial-contains 'gotabwm: reopen GOCALC.ELF'
+vgate_assert 06 serial-contains 'gotabwm: state restore id='
+# Byte-for-byte: the marker names mode AND the tape's surviving entry.
+vgate_assert 06 serial-contains 'gocalc: state restored mode=prog tape=1 last=HEX FF-1=FE'
+vgate_assert 06 serial-contains 'rx-gocalc-state-ok'
+vgate_assert 06 serial-absent 'gocalc: state refused'
+vgate_assert 06 serial-absent '[EXC] parking:'
+vgate_assert 06 serial-absent 'exited status=139'
+
+# --- run 07 (M192c / #3248): the copy verb lands on the typed clipboard ------
+# `exec -u0` is the capable path (the go-sheet clipboard-leg convention):
+# a uid_user app gets EACCES from slot 38 by design, so run 06 pins the
+# refusal and this run pins the landing. 't' publishes the tape as
+# text/plain; the monitor's `clip` reads the kernel buffer back verbatim.
+vgate_file script-07.txt <<'EOF'
+exec -u0 GOCALC.ELF
+EOF
+
+vgate_file script3-07.txt <<'EOF'
+clip
+echo rx-gocalc-copy-ok
+EOF
+
+vgate_run 07 -- \
+    --screen '$RUN_DIR/screen-07' \
+    --via-virtio \
+    --script '$RUN_DIR/script-07.txt' \
+    --input-chords 'p,f,f,-,1,return,t' \
+    --input-chords-after 'gocalc: present' \
+    --script3 '$RUN_DIR/script3-07.txt' \
+    --script3-after 'gocalc: tape copy n=' \
+    --script-expect 'rx-gocalc-copy-ok' --timeout 240
+
+vgate_assert 07 serial-contains 'exec: loaded GOCALC.ELF'
+vgate_assert 07 serial-contains 'gocalc: present'
+vgate_assert 07 serial-contains 'gocalc: result FF-1=FE'
+vgate_assert 07 serial-contains 'gocalc: tape copy n=11'
+# The load-bearing assert: the kernel buffer reads back the tape bytes.
+vgate_assert 07 serial-contains 'clip: HEX FF-1=FE'
+vgate_assert 07 serial-contains 'rx-gocalc-copy-ok'
+vgate_assert 07 serial-absent 'gocalc: tape copy refused'
+vgate_assert 07 serial-absent '[EXC] parking:'
+vgate_assert 07 serial-absent 'exited status=139'

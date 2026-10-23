@@ -1,6 +1,7 @@
 package main
 
 import (
+	"strings"
 	"testing"
 
 	"virelai/vi"
@@ -245,5 +246,172 @@ func TestCtrlIsIgnored(t *testing.T) {
 	ev := vi.Event{Kind: vi.EvKeyDown, Flags: vi.ModCtrl, Arg1: '1'}
 	if a.key(ev) {
 		t.Fatal("ctrl chords must not type digits")
+	}
+}
+
+// --- M192c (#3248): the bounded tape, the copy verb, the appver-1 envelope ---
+
+func TestTapeBound(t *testing.T) {
+	a := &app{}
+	for i := 0; i < tapeMax+4; i++ {
+		a.tapePush("line")
+	}
+	if len(a.tape) != tapeMax {
+		t.Fatalf("tape len = %d want bound %d", len(a.tape), tapeMax)
+	}
+	// The oldest entries dropped: after 20 pushes of distinct lines the
+	// tape keeps only the newest tapeMax.
+	a.tape = nil
+	for i := 0; i < tapeMax+2; i++ {
+		a.tapePush(vi.Itoa64(int64(i)))
+	}
+	if a.tape[0] != "2" || a.tape[len(a.tape)-1] != "17" {
+		t.Fatalf("tape kept %v..%v want 2..17", a.tape[0], a.tape[len(a.tape)-1])
+	}
+}
+
+func TestTapeIsWrittenPerEval(t *testing.T) {
+	a := &app{}
+	feedKeys(t, a, "12-3=")
+	if len(a.tape) != 1 || a.tape[0] != "12-3=9" {
+		t.Fatalf("tape = %v want [12-3=9]", a.tape)
+	}
+	// A programmer entry stores its frozen base tag.
+	feedKeys(t, a, "pff-1=")
+	want := "HEX FF-1=FE"
+	if a.tape[len(a.tape)-1] != want {
+		t.Fatalf("prog tape entry = %q want %q", a.tape[len(a.tape)-1], want)
+	}
+}
+
+func TestHistLines(t *testing.T) {
+	a := &app{}
+	// Fresh: one line, the golden's fixed point.
+	if top, _ := a.histLines(); top != "" {
+		t.Fatalf("empty tape top = %q want \"\"", top)
+	}
+	feedKeys(t, a, "12-3=")
+	// One entry: still one line — the strip shows the live line only.
+	if top, bottom := a.histLines(); top != "" || bottom != "12-3=9" {
+		t.Fatalf("one-entry histLines = (%q,%q)", top, bottom)
+	}
+	feedKeys(t, a, "2+2=")
+	// Two entries: the previous row rides above the newest.
+	if top, bottom := a.histLines(); top != "12-3=9" || bottom != "2+2=4" {
+		t.Fatalf("two-entry histLines = (%q,%q)", top, bottom)
+	}
+	// Typing a fresh expression: the newest entry stays on top.
+	feedKeys(t, a, "5")
+	if top, bottom := a.histLines(); top != "2+2=4" || bottom != "5" {
+		t.Fatalf("typing histLines = (%q,%q)", top, bottom)
+	}
+}
+
+func TestStateCodecRoundTrip(t *testing.T) {
+	a := &app{}
+	feedKeys(t, a, "12-3=")
+	feedKeys(t, a, "pff-1=")
+	b := a.saveState()
+	st, ok := decodeState(b)
+	if !ok {
+		t.Fatalf("own blob refused: %x", b)
+	}
+	if !st.prog || st.base != 16 {
+		t.Fatalf("mode = (prog=%v base=%d) want (true,16)", st.prog, st.base)
+	}
+	want := []string{"12-3=9", "HEX FF-1=FE"}
+	if len(st.tape) != len(want) {
+		t.Fatalf("tape = %v want %v", st.tape, want)
+	}
+	for i := range want {
+		if st.tape[i] != want[i] {
+			t.Fatalf("tape[%d] = %q want %q", i, st.tape[i], want[i])
+		}
+	}
+	// The restore seats the same mode + tape — the envelope does not
+	// carry the live value, so the display is a fresh '0' in the
+	// restored base and the tape's tail is what the strip shows.
+	b2 := &app{}
+	b2.eng.RestoreMode(st.prog, st.base)
+	b2.tape = st.tape
+	b2.lastLine = stripTag(st.tape[len(st.tape)-1])
+	if d := b2.eng.Display(); d != "0" {
+		t.Fatalf("restored display = %q want fresh 0", d)
+	}
+	if !b2.eng.prog || b2.eng.dispBase() != 16 {
+		t.Fatalf("restored mode = (prog=%v base=%d) want (true,16)",
+			b2.eng.prog, b2.eng.dispBase())
+	}
+	if top, bt := b2.histLines(); top != "12-3=9" || bt != "HEX FF-1=FE" {
+		t.Fatalf("restored histLines = (%q,%q) want (12-3=9,HEX FF-1=FE)", top, bt)
+	}
+}
+
+func TestStateCodecRefuses(t *testing.T) {
+	a := &app{}
+	feedKeys(t, a, "12-3=")
+	good := a.saveState()
+	if _, ok := decodeState(good); !ok {
+		t.Fatal("own blob refused")
+	}
+	cases := map[string][]byte{
+		"empty":         {},
+		"short":         good[:4],
+		"bad fmtVer":    append([]byte{9}, good[1:]...),
+		"bad flags":     append([]byte{good[0], 7}, good[2:]...),
+		"bad mode":      append(good[:2:2], 9, 0, 1),
+		"dec+base":      append(good[:3:3], 8, 1),
+		"bad base":      append(good[:2:2], 1, 9, 0),
+		"tape over max": append(good[:4:4], byte(tapeMax+1)),
+		"trailing":      append(append([]byte{}, good...), 0),
+	}
+	for name, b := range cases {
+		if _, ok := decodeState(b); ok {
+			t.Fatalf("decode accepted %s: %x", name, b)
+		}
+	}
+	// A truncated entry length refuses whole, not half-applied.
+	trunc := good[:len(good)-1]
+	if _, ok := decodeState(trunc); ok {
+		t.Fatal("truncated blob accepted")
+	}
+	// A non-printable entry byte refuses whole.
+	bad := append([]byte{}, good...)
+	bad[len(bad)-1] = 0x01
+	if _, ok := decodeState(bad); ok {
+		t.Fatal("blob with control byte accepted")
+	}
+}
+
+func TestTapeTextBound(t *testing.T) {
+	a := &app{}
+	if a.tapeText() != nil {
+		t.Fatal("empty tape publishes nil, not an empty body")
+	}
+	line := strings.Repeat("9*9=81 x ", 8)[:tapeLineMax]
+	for i := 0; i < tapeMax; i++ {
+		a.tape = append(a.tape, vi.Itoa64(int64(i))+":"+line[:tapeLineMax-3])
+	}
+	text := a.tapeText()
+	if len(text) > 512 {
+		t.Fatalf("tapeText = %d bytes, over the kernel's 512", len(text))
+	}
+	// The newest entries survive: the tail is the last pushed line.
+	last := a.tape[len(a.tape)-1]
+	if !strings.HasSuffix(string(text), last) {
+		t.Fatalf("tapeText tail = %q want suffix %q",
+			string(text[len(text)-len(last):]), last)
+	}
+}
+
+func TestCopyVerbKeyPath(t *testing.T) {
+	a := &app{}
+	// 't' drives the copy verb in both modes — on the host the typed
+	// publish is refused (-ENOSYS) and the marker names it, never a
+	// silent no-op.
+	a.key(downASCII('t'))
+	feedKeys(t, a, "1+1=")
+	if !a.key(downASCII('t')) {
+		t.Fatal("'t' with a tape must be handled")
 	}
 }

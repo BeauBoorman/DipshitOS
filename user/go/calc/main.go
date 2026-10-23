@@ -8,21 +8,32 @@
 // programmer mode is a 6×6 grid (bases HEX/DEC/OCT/BIN + STD, hex digits,
 // AND/OR/XOR/NOT/<</>>, the four ops). The keyboard drives the SAME
 // engine calls as the pad — digits, '.', '%', 'n' (±), 'p' (mode),
-// a–f + '&' '|' '^' '~' '<' '>' in programmer mode, Enter = equals,
-// Escape = clear, Backspace edits the entry — there is no second input
-// path. Above the entry, the history line keeps the last evaluated
-// expression (expr→result) until a new one starts.
+// a–f + '&' '|' '^' '~' '<' '>' in programmer mode, 't' copies the tape,
+// Enter = equals, Escape = clear, Backspace edits the entry — there is
+// no second input path. Above the entry, the history strip keeps the
+// live line plus the previous tape row once one exists.
+//
+// M192c (#3248): the calc remembers. Each '=' appends its rendered line
+// to a bounded tape (tapeMax entries, newest last); 't' publishes the
+// tape on the M124c typed clipboard as text/plain (the kernel buffer is
+// CAP_CLIPBOARD/seat-only, so a seat-launched calc records the refusal —
+// the same posture GOFILES' clip-sys keeps); and an appver-1 envelope
+// rides the seat's save/restore carrying mode + the tape.
 //
 // Every marker below is printed only AFTER its syscall returned, so the
 // go-calc VZ gate's asserts can only pass if the app actually ran.
 package main
 
 import (
+	"strings"
+
 	"virelai/appkit"
 	"virelai/draw"
 	"virelai/tabapp"
 	"virelai/theme"
 	"virelai/vi"
+	"virelai/vsys"
+	"virelai/webrender/font"
 	"virelai/widgets"
 )
 
@@ -43,6 +54,8 @@ const (
 	markerClose             = "gocalc: close"
 	markerOK                = "gocalc OK"
 	markerOpenErr           = "gocalc: error open "
+	markerState             = "gocalc: state "
+	markerTape              = "gocalc: tape "
 
 	defaultPath = "/host/CALC/RESULT.TXT"
 
@@ -55,6 +68,25 @@ const (
 	progRows = 6
 	progCols = 6
 	maxCells = progRows * progCols
+
+	// stateFmtVer is the blob's own serialization tag (byte 0); stateAppVer
+	// is the envelope version the seat stores and hands back verbatim — a
+	// blob under a foreign appver is refused by name, never misread.
+	stateFmtVer = 1
+	stateAppVer = 1
+
+	// tapeMax is the tape bound the card names: the newest tapeMax
+	// rendered lines survive, the oldest drop off. tapeLineMax bounds one
+	// entry — both bounds are also the blob's decode caps, so a blob
+	// declaring more is foreign.
+	tapeMax     = 16
+	tapeLineMax = 64
+
+	// histRowA/histRowB are the two bitmap-row tops inside the 20px
+	// history plate when a second line rides it (single-line keeps the
+	// widget's centred geometry — the golden's fixed point).
+	histRowA = 2
+	histRowB = 11
 )
 
 var decPad = [decRows][decCols]string{
@@ -96,6 +128,8 @@ type app struct {
 	expr       string
 	lastLine   string
 	justEvaled bool
+	tape       []string
+	pend       []byte
 	disp       widgets.Text
 	hist       widgets.Text
 	keys       [maxCells]widgets.Button
@@ -116,11 +150,19 @@ func main() {
 		path = args[1]
 	}
 
-	ta := tabapp.Init(tabapp.Config{Name: appName, Title: appTitle, X: 32, Y: 32, W: natW, H: natH})
+	// a exists before Init so the state hooks bind to it; the restore
+	// lands inside Init (RequestStateRestore), so it parks in a.pend
+	// until applyRestored runs after a.ta is set.
+	a := &app{path: path}
+	ta := tabapp.Init(tabapp.Config{
+		Name: appName, Title: appTitle, X: 32, Y: 32, W: natW, H: natH,
+		SaveState: a.saveState, RestoreState: a.noteState, StateVersion: stateAppVer,
+	})
 	if ta == nil {
 		vi.ConsoleLine(markerOpenErr + "-1")
 		vi.Exit(1)
 	}
+	a.ta = ta
 	vi.ConsoleLine(markerOpen + vi.Itoa64(int64(ta.Win)))
 	if ta.TabAware {
 		vi.ConsoleLine(markerDeclare)
@@ -130,8 +172,8 @@ func main() {
 	} else {
 		vi.ConsoleLine("gocalc: declare refused")
 	}
+	a.applyRestored()
 
-	a := &app{ta: ta, path: path}
 	loop := appkit.NewLoop(a.ta, a.draw, a.handle)
 	if loop.SubscribeSetting("theme", func(value string) bool {
 		return theme.Set(value)
@@ -147,7 +189,13 @@ func main() {
 		vi.ConsoleLine(markerOK)
 		a.ta.CloseAndExit(status)
 	}
-	loop.Run()
+	// The seat's save ask is mailbox traffic, not an input event: answer
+	// it once per pass before polling, the same discipline the other
+	// hooked apps keep.
+	loop.RunWith(func() (vi.Event, int64, bool) {
+		a.ta.PollStateAsk()
+		return vi.PollEventRaw()
+	}, vi.Sleep)
 }
 
 func (a *app) handle(ev vi.Event) bool {
@@ -231,6 +279,8 @@ func (a *app) key(ev vi.Event) bool {
 		return a.doNegate()
 	case 'p', 'P':
 		return a.doMode(!a.eng.prog)
+	case 't', 'T':
+		return a.doCopyTape()
 	case '=', '\r', '\n':
 		return a.doEval()
 	case 'c', 'C':
@@ -384,6 +434,7 @@ func (a *app) doEval() bool {
 	a.eng.Evaluate()
 	disp := a.eng.Display()
 	a.lastLine = a.expr + "=" + disp
+	a.tapePush(a.tapeRender(a.lastLine))
 	a.justEvaled = true
 	if !a.writeResult(a.lastLine) {
 		vi.ConsoleLine(markerSaveErr + a.path)
@@ -477,6 +528,52 @@ func (a *app) histText() string {
 	return t
 }
 
+// tapeRender is a line as the tape stores it: a programmer-mode entry
+// carries its base tag so a tape that crosses a mode toggle still reads
+// in the base it was evaluated under (histText re-derives the live
+// line's tag from the CURRENT mode — the tape's are frozen).
+func (a *app) tapeRender(line string) string {
+	if a.eng.prog && line != "" {
+		return baseName(a.eng.dispBase()) + " " + line
+	}
+	return line
+}
+
+// tapePush appends one rendered line (newest last), dropping the oldest
+// over tapeMax — the bound the envelope serializes.
+func (a *app) tapePush(line string) {
+	if len(line) > tapeLineMax {
+		line = line[:tapeLineMax]
+	}
+	a.tape = append(a.tape, line)
+	if len(a.tape) > tapeMax {
+		copy(a.tape, a.tape[1:])
+		a.tape = a.tape[:tapeMax]
+	}
+}
+
+// histLines lays out the history strip: bottom is the live line (the
+// expression being typed, or the last evaluation), top is the tape entry
+// just below it. The second row exists only once the tape holds an older
+// entry, so a fresh calc paints the exact single-line strip it always
+// has — the golden and the run-05 pixel leg keep their fixed point.
+func (a *app) histLines() (top, bottom string) {
+	bottom = a.histText()
+	n := len(a.tape)
+	switch {
+	case a.expr != "" && !a.justEvaled:
+		// typing over a tape: the newest entry is the row above
+		if n > 0 {
+			top = a.tape[n-1]
+		}
+	case a.lastLine != "" && n > 1:
+		top = a.tape[n-2]
+	case a.lastLine == "" && n > 0:
+		top = a.tape[n-1]
+	}
+	return top, bottom
+}
+
 func baseName(base uint8) string {
 	switch base {
 	case 16:
@@ -487,6 +584,275 @@ func baseName(base uint8) string {
 		return "BIN"
 	}
 	return "DEC"
+}
+
+// --- the appver-1 state envelope (M192c) -------------------------------------
+//
+// Wire (little-endian, browser/state.go's appendU16 discipline):
+//
+//	u8  fmtVer (=stateFmtVer) | u8 flags (0)
+//	u8  mode  — 0 decimal, 1 programmer
+//	u8  base  — the programmer display base (2/8/10/16), 0 in decimal mode
+//	u8  nTape — then nTape entries of u16 len | len entry bytes
+//
+// The app owns the format; the seat stores the bytes verbatim. Decode is
+// total: every length is checked against what remains, counts are capped
+// by the write-side bounds, entry bytes must be printable ASCII (the tape
+// is rendered text), and a foreign fmtVer, an overrun or trailing garbage
+// refuses the WHOLE blob — never half-applied, never a panic.
+
+// calcState is a decoded envelope.
+type calcState struct {
+	prog bool
+	base uint8
+	tape []string
+}
+
+// saveState is Config.SaveState: the envelope the seat's ask collects.
+// The bound is structural — tapeMax x tapeLineMax can never approach the
+// 64 KiB envelope ceiling, so there is no oversize path to refuse.
+func (a *app) saveState() []byte {
+	prog, base := a.eng.Mode()
+	var mode byte
+	if prog {
+		mode = 1
+	}
+	out := make([]byte, 0, 8+len(a.tape)*16)
+	out = append(out, stateFmtVer, 0, mode, base, byte(len(a.tape)))
+	for _, line := range a.tape {
+		out = append(out, byte(len(line)), byte(len(line)>>8))
+		out = append(out, line...)
+	}
+	vi.ConsoleLine(markerState + "saved n=" + vi.Itoa64(int64(len(out))))
+	return out
+}
+
+// decodeState is saveState's strict inverse — nil means refuse whole.
+func decodeState(b []byte) (*calcState, bool) {
+	if len(b) < 5 || b[0] != stateFmtVer || b[1] != 0 {
+		return nil, false
+	}
+	st := &calcState{}
+	switch b[2] {
+	case 0:
+		if b[3] != 0 {
+			return nil, false
+		}
+	case 1:
+		switch b[3] {
+		case 2, 8, 10, 16:
+			st.prog, st.base = true, b[3]
+		default:
+			return nil, false
+		}
+	default:
+		return nil, false
+	}
+	n := int(b[4])
+	if n > tapeMax {
+		return nil, false
+	}
+	o := 5
+	for i := 0; i < n; i++ {
+		if len(b)-o < 2 {
+			return nil, false
+		}
+		ln := int(b[o]) | int(b[o+1])<<8
+		o += 2
+		if ln == 0 || ln > tapeLineMax || len(b)-o < ln {
+			return nil, false
+		}
+		line := string(b[o : o+ln])
+		o += ln
+		for j := 0; j < len(line); j++ {
+			if line[j] < 0x20 || line[j] > 0x7e {
+				return nil, false
+			}
+		}
+		st.tape = append(st.tape, line)
+	}
+	if o != len(b) {
+		return nil, false // trailing garbage: not this codec's product
+	}
+	return st, true
+}
+
+// noteState is Config.RestoreState: the blob parks raw until applyRestored
+// can read the appver off a.ta (the hook runs inside tabapp.Init, before
+// a.ta exists — gosheet's pend discipline).
+func (a *app) noteState(blob []byte) {
+	a.pend = blob
+}
+
+// applyRestored seats a parked blob: the appver is refused by name before
+// decode, the decode is total, and a good blob re-arms mode + tape and
+// reports what came back. lastLine re-derives the newest entry's raw
+// line, so the strip shows the tape's tail exactly as the live session
+// left it (a programmer entry re-earns its tag through histText).
+func (a *app) applyRestored() {
+	if a.pend == nil {
+		return
+	}
+	blob := a.pend
+	a.pend = nil
+	if a.ta.RestoredVersion != stateAppVer {
+		vi.ConsoleLine(markerState + "refused ver=" + vi.Itoa64(int64(a.ta.RestoredVersion)))
+		return
+	}
+	st, ok := decodeState(blob)
+	if !ok {
+		vi.ConsoleLine(markerState + "refused bad")
+		return
+	}
+	a.eng.RestoreMode(st.prog, st.base)
+	a.tape = st.tape
+	last := "-"
+	if n := len(st.tape); n > 0 {
+		last = st.tape[n-1]
+		a.lastLine = stripTag(last)
+	}
+	vi.ConsoleLine(markerState + "restored mode=" + modeName(st.prog) +
+		" tape=" + vi.Itoa64(int64(len(st.tape))) + " last=" + last)
+}
+
+func modeName(prog bool) string {
+	if prog {
+		return "prog"
+	}
+	return "dec"
+}
+
+// stripTag peels a tape entry's frozen base tag back off — lastLine
+// keeps the raw expr=result and histText re-adds the live mode's tag.
+func stripTag(line string) string {
+	if len(line) > 4 && line[3] == ' ' {
+		switch line[:3] {
+		case "HEX", "OCT", "BIN", "DEC":
+			return line[4:]
+		}
+	}
+	return line
+}
+
+// --- the copy verb ------------------------------------------------------------
+
+// doCopyTape publishes the tape on the M124c typed clipboard declaring
+// text/plain — the tape IS plain text. The kernel buffer admits
+// CAP_CLIPBOARD and the registered seat only (M97g), so a seat-launched
+// calc gets the refusal's raw rc named on the marker instead of claiming
+// a copy that never landed — the same posture GOFILES' clip-sys keeps.
+func (a *app) doCopyTape() bool {
+	text := a.tapeText()
+	if text == nil {
+		vi.ConsoleLine(markerTape + "copy empty")
+		return true
+	}
+	n, rc := vsys.ClipboardSetTyped(vsys.ClipText, text)
+	if rc < 0 {
+		vi.ConsoleLine(markerTape + "copy refused rc=" + vi.Itoa64(rc))
+		return true
+	}
+	vi.ConsoleLine(markerTape + "copy n=" + vi.Itoa64(int64(n)))
+	return true
+}
+
+// tapeText joins the tape for the clipboard — one rendered line per row,
+// newest entries winning the kernel's 512 bound: the oldest drop until
+// the text fits rather than truncating a line mid-glyph. nil on an
+// empty tape.
+func (a *app) tapeText() []byte {
+	if len(a.tape) == 0 {
+		return nil
+	}
+	start := 0
+	for {
+		n := -1 // the separators are one fewer than the lines
+		for _, l := range a.tape[start:] {
+			n += len(l) + 1
+		}
+		if n <= vsys.ClipKernelMax {
+			break
+		}
+		start++
+	}
+	var b strings.Builder
+	for i := start; i < len(a.tape); i++ {
+		if i > start {
+			b.WriteByte('\n')
+		}
+		b.WriteString(a.tape[i])
+	}
+	return []byte(b.String())
+}
+
+// --- painting -----------------------------------------------------------------
+
+// drawHist paints the history plate. With no older tape entry the plate
+// is exactly the single Text line the golden pins; a second row rides
+// the same plate once the tape holds one — bitmap rows at histRowA and
+// histRowB, the two offsets the one-line widget cannot express.
+func (a *app) drawHist(cv widgets.Canvas) {
+	top, bottom := a.histLines()
+	if top == "" {
+		a.hist.Draw(cv)
+		return
+	}
+	r := a.hist.R
+	tok := theme.Current
+	cv.FillRoundedRect(r, 4 /* widgets' radiusControl */, draw.Opaque(tok.Surface))
+	tapeRow(cv, r, top, r.Y+histRowA, tok.InkMuted)
+	tapeRow(cv, r, bottom, r.Y+histRowB, tok.InkMuted)
+}
+
+// tapeRow paints one 8x8 bitmap line at a caller-chosen top inside the
+// plate's inset inner — drawGlyphRun's exact run-fill geometry, split
+// out so the strip can seat a second row (the widget draws one,
+// centred).
+func tapeRow(c widgets.Canvas, plate widgets.Rect, s string, y int, rgb uint32) {
+	inner := plate.Inset(2)
+	if inner.Empty() {
+		return
+	}
+	cw := font.Advance(1)
+	i := 0
+	for _, ch := range s {
+		x := inner.X + i*cw
+		if x >= inner.Right() {
+			break
+		}
+		g := font.Glyph8(ch)
+		for row := 0; row < 8; row++ {
+			py := y + row
+			if py < inner.Y || py >= inner.Bottom() {
+				continue
+			}
+			bits := g[row]
+			col := 0
+			for col < 8 {
+				if bits&(1<<uint(col)) == 0 {
+					col++
+					continue
+				}
+				run := 1
+				for col+run < 8 && bits&(1<<uint(col+run)) != 0 {
+					run++
+				}
+				px, w := x+col, run
+				if px < inner.X {
+					w -= inner.X - px
+					px = inner.X
+				}
+				if px+w > inner.Right() {
+					w = inner.Right() - px
+				}
+				if w > 0 {
+					c.FillRect(widgets.Rect{X: px, Y: py, W: w, H: 1}, rgb)
+				}
+				col += run
+			}
+		}
+		i++
+	}
 }
 
 func (a *app) layout() {
@@ -541,7 +907,7 @@ func (a *app) paintCanvas(cv widgets.Canvas) {
 	}
 	a.layout()
 	cv.FillRect(widgets.Rect{W: int(a.ta.W), H: int(a.ta.H)}, draw.Opaque(tabapp.FillRGB()))
-	a.hist.Draw(cv)
+	a.drawHist(cv)
 	a.disp.Draw(cv)
 	for i := range a.keys {
 		a.keys[i].Draw(cv)

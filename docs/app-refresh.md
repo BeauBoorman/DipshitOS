@@ -45,7 +45,7 @@ rows first.
 
 | app | binary | last refresh | date | notes |
 |-----|--------|--------------|------|-------|
-| 64-bit Calc | GOCALC.ELF | M104h #2275 | 2026-10-15 | seat-rail + flagship composite goldens incl. go-calc chrome |
+| 64-bit Calc | GOCALC.ELF | #3248 | 2026-10-23 | appver 1 envelope — mode + bounded tape + copy-tape verb |
 | Text Editor | NOTE.ELF | M170c #3129 | 2026-10-22 | free-file sleep sites → ns durations / event wait (tree-wide) |
 | Code Editor | GOEDIT.ELF | M166c #2991 | 2026-10-22 | per-function heat gutter from `--prof=` .folded |
 | Files | GOFILES.ELF | M187d #3185 | 2026-10-23 | .ics/.vcf file types; GOFILES contact card |

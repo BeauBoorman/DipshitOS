@@ -545,6 +545,24 @@ func (e *Engine) Clear() {
 	*e = Engine{prog: prog, base: base}
 }
 
+// Mode is the state envelope's mode pair: prog and the live display base,
+// or (false, 0) in decimal mode where the base field is meaningless.
+func (e *Engine) Mode() (bool, uint8) {
+	if !e.prog {
+		return false, 0
+	}
+	return true, e.dispBase()
+}
+
+// RestoreMode re-seats prog+base from a decoded envelope — SetProg's
+// carry-the-display contract is a user toggle's, and a restore arrives
+// before any value exists. The decoder already proved base is one of the
+// four spellings (or 0 on a decimal blob).
+func (e *Engine) RestoreMode(prog bool, base uint8) {
+	e.prog = prog
+	e.base = base
+}
+
 // Display is the screen string: "ERROR", the base-format value in
 // programmer mode, or the decimal text (live entries keep their typed
 // point and trailing zeros).
