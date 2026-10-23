@@ -4,7 +4,7 @@ Status: **FROZEN · v2 additive 2026-09-18** · Date: 2026-09-01 · **Amended 20
 **Amended 2026-09-18 (M70e #1457):** **§9 added** — contract v2: the `virelai.abi` custom section, the capability names, and the host-share delivery manifest. §9 is strictly ADDITIVE to §1–§8: nothing above changes, and a module with no §9 section behaves exactly as it did in M35. \
 Source of truth for: W3 (#764, import breadth), W5 (#766, `wc` capstone) \
 Normative syscall ABI: `docs/decisions/0007-syscall-abi.md` (ADR 0007) \
-Scoping doc: `docs/archive/wasm-core-scoping.md` (W1a–W5 gated split)
+Scoping doc: `wasm-core-scoping.md` (W1a–W5 gated split) — condensed into `docs/archive/era-m0-m51.md`, verbatim at its pinned SHA
 
 > A **fresh host author** can implement any listed `env.*` import from this
 > document alone, without reading `kernel/src/syscall.zig`. Parameter shapes,
@@ -350,7 +350,7 @@ only — wrote [tests/wc.c](virelai.h) this way:
 * ADR 0009 — `TIMER` event kind 9 pumped by `timer_set`.
 * ADR 0010 — file pathname canon and `DirEntry` wire shape (§5.1).
 * ADR 0011 — window registry and compositor (§5.2).
-* `docs/archive/wasm-core-scoping.md` — M35 gated card split (W1a/W1b/W2–W5) and proposal survey.
+* `wasm-core-scoping.md` — M35 gated card split (W1a/W1b/W2–W5) and proposal survey; condensed into `docs/archive/era-m0-m51.md` (verbatim at its pinned SHA).
 
 W3 implementors: implement imports exactly as §5; W5 (`wc`) authors: only §5 + this recipe were used — and nothing else was needed.
 

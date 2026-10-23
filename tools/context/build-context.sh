@@ -80,8 +80,8 @@ section() { printf '\n## %s\n\n' "$1"; }
     section "docs/status.md"
     fence docs/status.md
 
-    section "docs/archive/march-m3.md (milestone-three per-step tracker)"
-    fence docs/archive/march-m3.md
+    section "docs/archive/era-m0-m51.md (M0–M51 era digest)"
+    fence docs/archive/era-m0-m51.md
 
     # Claims and per-branch logs are GitHub issues/comments since 2026-09-03
     # (label `claim`) — there are no docs/claims or docs/logs files to fence.

@@ -13,7 +13,8 @@ Implementation cards **#1135** (TS1), **#1136** (TS2), **#1137** (TS3),
 > ADR 0007 (syscall ABI), ADR 0010 (userland file ABI), ADR 0016
 > (shared-anon owner checks), ADR 0020 Amendment B (net front-end), ADR
 > 0022 (M46 remote), and ADR 0023 (M47 crypto). No code lands here; the
-> binding build order is `docs/archive/trust-scoping.md`.
+> binding build order was `trust-scoping.md` — condensed into
+> `docs/archive/era-m0-m51.md` (verbatim at its pinned SHA).
 
 ## Context
 
@@ -34,7 +35,8 @@ Observed on `origin/main` at the M46/M47 merges (`f74dc3d` / `f0795dd`),
    (`kernel/src/virtio_file.zig`, `host/vm-runner/Sources/VFWire/VFWire.swift`)
    carries no caller identity and no metadata; the host's only policy is
    `resolveSubpath` (`VFWire.swift:198-220`). The host already treats the
-   guest as untrusted (`docs/archive/host-file-channel-scoping.md:396-398`), so
+   guest as untrusted (`host-file-channel-scoping.md` lines 396–398 —
+   condensed into `docs/archive/era-m0-m51.md`, verbatim at its pinned SHA), so
    ownership metadata cannot live host-side without inverting that posture.
 4. **The monitor and kernel consumers bypass `file_table`.** `cmd_vf` calls
    `virtio_file` directly (`kernel/src/monitor.zig:1308-1330`); exec loads

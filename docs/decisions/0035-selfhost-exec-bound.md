@@ -55,7 +55,7 @@ re-measure commands are at the end.
 | host `cmd/link` | 6,878,850 B — `__TEXT` 5,423,104 B; `strip -x` → 6,503,808 B | same |
 | host `cmd/asm` | 5,341,682 B | same |
 | largest in-guest Go program today | `GOBIG.ELF` at **9,502,880 B** (the K1 fixture — 8,416,224 B of it one initialized `.data` payload); before K1 the largest was `GOSH.ELF` at 1,376,416 B, 66% of the old file bound | `.build/go/` |
-| file-channel transfer | 32 KiB reply cap, **stateless offset-carrying READ**, paths ≤255 B | `docs/archive/host-file-channel-scoping.md` |
+| file-channel transfer | 32 KiB reply cap, **stateless offset-carrying READ**, paths ≤255 B | `host-file-channel-scoping.md` (condensed into `docs/archive/era-m0-m51.md`) |
 
 ### What is observed and what is inferred
 

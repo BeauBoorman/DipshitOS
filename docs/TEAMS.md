@@ -156,7 +156,7 @@ the file descriptor table.
 | `docs/gate-inventory.md` | gate classification |
 | `docs/gate-fleet-inventory.md` | generated fleet snapshot |
 | `docs/decisions/` | ADRs |
-| `docs/archive/agent-concurrency-plan.md` | lane assignments (closed-arc plan, archived by #1671) |
+| `docs/archive/era-m0-m51.md` | era digest (the M19–M27 lane-assignment plan agent-concurrency-plan.md is condensed into it, verbatim at its pinned SHA) |
 | `docs/TEAMS.md` | this file |
 | GitHub issues (label `claim`) | active-work claims |
 

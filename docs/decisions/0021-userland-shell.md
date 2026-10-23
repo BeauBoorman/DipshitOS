@@ -105,7 +105,8 @@ between the serial, window, and remote presentations.
 
 ## Open issues (left to the M45 cards)
 
-- The exact command-family migration order (march doc `march-m45-*`).
+- The exact command-family migration order (march doc `march-m45-*`,
+  condensed into `docs/archive/era-m0-m51.md`).
 - Whether `procs`/`dui`/`wm`-style introspection becomes structured syscalls
   for the shell or stays monitor-only (card-by-card decision).
 - Windows/remote front-end rendering (selector 2/3) — `TERM.BIN` + a TCP

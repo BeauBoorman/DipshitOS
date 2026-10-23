@@ -3,89 +3,80 @@
 > Live gate-by-gate status is tracked in [`docs/status.md`](status.md). This
 > roadmap is the milestone plan; it does not track day-to-day gate progress.
 >
-> **Completed-milestone plans live in [`docs/archive/`](archive/README.md)** —
-> each milestone below points at its verbatim archived plan
-> (`roadmap-m{N}.md`, moved from this file by issue #264 / claim 2860). The
-> per-card trackers are `docs/archive/march-m*.md`; this file holds pointers, the
-> current position, and the wishlist.
+> **Completed-milestone plans live in git history** — the verbatim
+> `roadmap-m{N}.md` plans (moved from this file by issue #264 / claim
+> 2860), the per-card `march-m*.md` trackers, and the `status-m*-detail.md`
+> notes are condensed into [`docs/archive/era-m0-m51.md`](archive/era-m0-m51.md)
+> (issue #3228); the digest names each file and pins the commit where it
+> last lived. This file holds pointers, the current position, and the
+> wishlist.
 
 ## Completed milestones (M0–M16) — archived plans
 
 - **M0 — boot pipeline proof** — done; a Zig AArch64 UEFI app boots from
-  `EFI/BOOT/BOOTAA64.EFI` on a FAT image under real firmware →
-  [roadmap-m0.md](archive/roadmap-m0.md).
+  `EFI/BOOT/BOOTAA64.EFI` on a FAT image under real firmware.
 - **M1 — separate kernel image handoff** — done (ADR 0002); loader places
-  `\KERNEL.BIN` at `base+0`, jumps to its entry →
-  [roadmap-m1.md](archive/roadmap-m1.md).
+  `\KERNEL.BIN` at `base+0`, jumps to its entry.
 - **M2 — the kernel proper** — done; ExitBootServices, identity-map MMU,
   polled virtio TX console (ADR 0004); VZ serial gate passed 2026-08-08
-  (claim 1517) → [roadmap-m2.md](archive/roadmap-m2.md).
+  (claim 1517).
 - **M1.5 — interactive kernel monitor ("Virelai Monitor")** — closed
-  2026-08-09, tag `m1.5-interactive-monitor`, 7/7 gates →
-  [roadmap-m1.5.md](archive/roadmap-m1.5.md).
+  2026-08-09, tag `m1.5-interactive-monitor`, 7/7 gates.
 - **M3 — allocator, interrupts, tasks, EL0/SVC, syscalls, uaccess,
-  userspace** — closed 2026-08-10, tag `m3-userspace` (claim 0707) →
-  [roadmap-m3.md](archive/roadmap-m3.md).
+  userspace** — closed 2026-08-10, tag `m3-userspace` (claim 0707).
 - **M4 — real randomness, general filesystem, processes & follow-ons**
   (entropy + ChaCha20 CSPRNG, DATA partition, process abstraction,
   concurrent/long-lived/kill, IPC mailbox, argv, wait) — closed
-  2026-08-11, tag `m4-processes` (claim 2839) →
-  [roadmap-m4.md](archive/roadmap-m4.md).
+  2026-08-11, tag `m4-processes` (claim 2839).
 - **M5 — networking** (virtio-net TX/RX, ARP, IPv4/ICMP, UDP, NAT, DHCP
   lifecycle, TCP + retransmission, UDP syscall seam N1–N11) — done
-  2026-08-12 (claims 1373…5357) → [roadmap-m5.md](archive/roadmap-m5.md).
+  2026-08-12 (claims 1373…5357).
 - **M6 — graphics: Driving Award + Road Pops** (virtio-gpu G1–G6 plus the
-  window-syscall follow-on slots) — done 2026-08-13 (claim 0487) →
-  [roadmap-m6.md](archive/roadmap-m6.md).
+  window-syscall follow-on slots) — done 2026-08-13 (claim 0487).
 - **M7 — input: USB XHCI + HID** (I1 transport, I2 enumeration + HID,
-  I3 event FIFO → Road Pops) — done 2026-08-13 (claim 6050) →
-  [roadmap-m7.md](archive/roadmap-m7.md) *(the historical cross-milestone
-  virtio device surface table is archived there too)*.
+  I3 event FIFO → Road Pops) — done 2026-08-13 (claim 6050) *(the historical cross-milestone
+  virtio device surface table is in the era record too — `roadmap-m7.md`
+  via the [era digest](archive/era-m0-m51.md))*.
 - **M8 — usability: human interface** (ADR 0008; grouped help, line
   editor/history, error contract, window HIG; U4 pointer focus remains a
-  known class-C-only thread, issue #151) — done 2026-08-15 (claim 2649) →
-  [roadmap-m8.md](archive/roadmap-m8.md).
+  known class-C-only thread, issue #151) — done 2026-08-15 (claim 2649).
 - **M9 — app events** (per-process event queues, `sys_poll_event` 21 /
-  `sys_wait_event` 22, E0–E6) — done 2026-08-15 (claim 9328) →
-  [roadmap-m9.md](archive/roadmap-m9.md).
+  `sys_wait_event` 22, E0–E6) — done 2026-08-15 (claim 9328).
 - **M10 — userland filesystem & storage ABI** (ADR 0010; per-process file
   table, path canon, slots 23–27, the original SAVETEXT/TYPE/DIR demos, F0–F4;
-  live storage coverage now uses GOSH/GOFILES) — done 2026-08-15 (claim 0510)
-  → [roadmap-m10.md](archive/roadmap-m10.md).
+  live storage coverage now uses GOSH/GOFILES) — done 2026-08-15 (claim 0510).
 - **M11 — desktop platform** (ADR 0011; ui.zig toolkit, the original
   CALC/NOTEPAD/TOP/DESKTOP programs, `sys_exec` 28 / `sys_kill` 29, A0–A5;
   launcher and client coverage now uses GOTABWM plus Go clients) — done
-  2026-08-16 (claim 2427) → [roadmap-m11.md](archive/roadmap-m11.md).
+  2026-08-16 (claim 2427).
 - **M12 — userland network applications** (ADR 0012; TCP slots 30–33 and the
   original DNS/FETCH/CHAT programs, N0–N3; product clients are now Go) — done
-  2026-08-16, PR #160 (claim 5416) → [roadmap-m12.md](archive/roadmap-m12.md).
+  2026-08-16, PR #160 (claim 5416).
 - **M13 — files & applications** (mutating FS slots 34–37, APPS.TXT
   manifest, FILE.BIN browser, manifest desktop; B1–B4) — done 2026-08-16
-  (claims 5801/8877/4742/4046) → [roadmap-m13.md](archive/roadmap-m13.md).
+  (claims 5801/8877/4742/4046).
 - **M14 — shared user services** (clipboard 38–39, app timers 40–41,
   NOTEPAD composition capstone, hardening audit; S1–S4) — done 2026-08-18
-  (claims 0169/7323/3289/4482) → [roadmap-m14.md](archive/roadmap-m14.md).
+  (claims 0169/7323/3289/4482).
 - **M15 — audio** (virtio-snd DID 0x1059, PCM playback, sys_audio 42–45,
-  JINGLE/CHIME.BIN, boot chime; A1–A4) — done 2026-08-18 (claim 3206) →
-  [roadmap-m15.md](archive/roadmap-m15.md).
+  JINGLE/CHIME.BIN, boot chime; A1–A4) — done 2026-08-18 (claim 3206).
 - **M16 — the kernel grows up** (DSK3 segmented images + writable data/BSS,
   guard pages, grown pools, page-table budget 512; C1–C4) — done
-  2026-08-19 (claims 3805/8403/0339/2714) →
-  [roadmap-m16.md](archive/roadmap-m16.md).
+  2026-08-19 (claims 3805/8403/0339/2714).
 
 ## Current position & next work (M17+)
 
 > The canonical, always-current answer to "where are we" is
-> [`docs/status.md`](status.md); active per-card detail lives in the march
-> trackers and in open `claim` issues on the GitHub tracker (label
+> [`docs/status.md`](status.md); active per-card detail lives in open
+> `claim` issues on the GitHub tracker (label
 > `claim`). This section stays pointer-level so it cannot go stale.
 
 - **M17 — desktop completeness** (issues #212–#228; arcs 1/2 of the M14-era
   grooming): completable widgets (Checkbox/Toggle, ProgressBar,
   ScrollView…), NOTEPAD depth, FILE.BIN preview/breadcrumbs, TOP sort/
   filter, CALC keyboard/history, SETTINGS theme preview. Shipped
-  2026-08-21 — full card detail:
-  [`docs/archive/m17-desktop-completeness.md`](archive/m17-desktop-completeness.md).
+  2026-08-21 — full card detail condensed into the
+  [era digest](archive/era-m0-m51.md).
 - **Post-M17 arcs** — ALL DONE 2026-08-21:
   - **Arc1 — widget depth**: ScrollView, Checkbox/Toggle, ProgressBar,
     Dialog, HScrollBar, DropDown. PRs #259–#261.
@@ -102,8 +93,8 @@
 - **M18–M27 — the experience layer**: the forward roadmap covering
   terminal depth, shell programming, Unicode, window management polish,
   developer tools, a text editor, CALC depth, file manager, network
-  apps, and desktop polish. Full card detail:
-  [`docs/archive/roadmap-post-arc5.md`](archive/roadmap-post-arc5.md).
+  apps, and desktop polish. Full card detail condensed into the
+  [era digest](archive/era-m0-m51.md).
 - Known open threads carried across milestones: M8 U4 pointer focus is
   class-C-only for its live proof (issue #151, claim 4769), and the
   synthesized keyboard seam reports `events=0` (issue #179).

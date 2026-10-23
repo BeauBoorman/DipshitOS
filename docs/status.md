@@ -7,15 +7,17 @@
 > Living status tracker. **Claims are GitHub issues labeled `claim`** (see
 > [Multiagent coordination](#multiagent-coordination)), not repo files. Keep
 > this file a compact table: closed-milestone detail lives on the issue and
-> in its `docs/archive/march-*.md` tracker, not here. Gates are the evidence — **observed**
+> in `docs/archive/era-m0-m51.md` (the era digest), not here. Gates are the evidence — **observed**
 > (saved gate output / CI) versus **inferred** (reasoning only). The
 > pre-compaction text (the M17–M51 gate-by-gate narrative, 2026-09-12,
 > 687 lines) is preserved in git history at `e5480c9`.
 
 ## Milestones
 
-All milestones through M52 are complete. Closed-milestone detail is under `docs/archive/` (the per-arc `march-*.md`
-trackers and the `status-m*-detail.md` files); open cards, if any, are on the
+All milestones through M52 are complete. Closed-milestone detail for the
+M0–M51 era is condensed into [`docs/archive/era-m0-m51.md`](archive/era-m0-m51.md)
+(the digest names each retired tracker/detail file and pins the commit
+where it last lived); open cards, if any, are on the
 GitHub tracker.
 
 | # | Milestone | What it proved | Status |
@@ -303,6 +305,5 @@ The old file-based tracker (`docs/claims/` + `docs/logs/`) was deleted
 - [`hardware-contract.md`](hardware-contract.md) — hardware `[observed]`/`[inferred]`.
 - [`architecture.md`](architecture.md) — components & data flow.
 - [`gate-inventory.md`](gate-inventory.md) · [`gate-fleet-inventory.md`](gate-fleet-inventory.md) — gate classes; generated fleet inventory.
-- [`archive/`](archive/) — closed-milestone detail (`status-m*-detail.md`), frozen designs, one-shots.
-- Per-milestone trackers: `docs/archive/march-m*.md`.
+- [`archive/`](archive/) — era digest (`era-m0-m51.md`), evidence bundles, frozen designs, lore.
 - Claims: `gh issue list --label claim --state open`.

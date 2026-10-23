@@ -58,7 +58,8 @@ threads where the issue is loose.
 
 **Reserved (post-M14) implementation order:** slots do not need to land
 in numerical order; each lands with its claim. Order recommendations
-versus dependency appear in `docs/archive/m17-desktop-completeness.md` (M15) and the post-M15
+versus dependency appeared in `m17-desktop-completeness.md` (condensed into
+`docs/archive/era-m0-m51.md`, verbatim at its pinned SHA) and the post-M15
 issue threads.
 
 ### D2. Event-kind reservation
@@ -328,9 +329,10 @@ chord amends ADR 0013 D8 first.
 - The layering rule (D7) and modifier matrix (D8) become first-class
   contracts. A card that paints a new layer or claims a new chord
   must amend D7/D8 first.
-- `docs/archive/m17-desktop-completeness.md` is free to plan 8–10 cards of pure userland work (no
-  kernel ABI touches) while this ADR sits in the background; the
-  post-M15 plan is the work this ADR unblocks.
+- `m17-desktop-completeness.md` was free to plan 8–10 cards of pure userland work (no
+  kernel ABI touches) while this ADR sat in the background; the
+  post-M15 plan is the work this ADR unblocked (the tracker is condensed
+  into `docs/archive/era-m0-m51.md`).
 
 ## Amendment log
 
