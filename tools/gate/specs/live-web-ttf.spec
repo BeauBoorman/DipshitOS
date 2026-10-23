@@ -12,9 +12,12 @@
 # M99o (#2192): INTERBI.TTF stages beside the other faces, the manifest pins
 # faces=9, and run 03's COVER.HTML carries a font-weight:700;font-style:italic
 # line so the gate watches it resolve to the dedicated face (bi-resolve).
-# M178a (#3144): NOTOHEB.TTF joins the manifest (faces=10) and run 10 proves
+# M178a (#3144): NOTOHEB.TTF joins the manifest (faces=11) and run 10 proves
 # the bidi path on hardware. Runs 04/05 delete fonts through vf rm, so run 10
 # restores what it needs by vf clone of the BAK-* copies staged at setup.
+# M186b (#3179): NOTOARAB.TTF joins the manifest (faces=11); run 10 also
+# proves the presentation-form shaper — shaped Arabic must paint the same
+# pixels as the literal FExx code points it shapes to.
 
 vgate_name live-web-ttf "WEB: native font metrics and exact M93 typography/table/image/fallback presentation"
 vgate_share seed
@@ -71,7 +74,8 @@ for src, dst in (("image/fonts/fonts.txt", "FONTS.TXT"),
                  ("image/fonts/VirelaiChrome-Regular.ttf", "CHROME.TTF"),
                  ("image/fonts/NotoSerif-Regular.ttf", "NOTOSERF.TTF"),
                  ("image/fonts/NotoSansJP-Regular.ttf", "NOTOCJK.TTF"),
-                 ("image/fonts/NotoSansHebrew-Regular.ttf", "NOTOHEB.TTF")):
+                 ("image/fonts/NotoSansHebrew-Regular.ttf", "NOTOHEB.TTF"),
+                 ("image/fonts/NotoNaskhArabic-Regular.ttf", "NOTOARAB.TTF")):
     if not os.path.exists(src):
         sys.exit("missing font payload: " + src)
     shutil.copy(src, os.path.join(share, dst))
@@ -80,11 +84,16 @@ for src, dst in (("image/fonts/fonts.txt", "FONTS.TXT"),
 # into place before exec'ing BIDI.HTML.
 for src, dst in (("image/fonts/fonts.txt", "BAK-FONTS.TXT"),
                  ("image/fonts/Inter-Regular.ttf", "BAK-INTER.TTF"),
-                 ("image/fonts/NotoSansHebrew-Regular.ttf", "BAK-NOTOHEB.TTF")):
+                 ("image/fonts/NotoSansHebrew-Regular.ttf", "BAK-NOTOHEB.TTF"),
+                 ("image/fonts/NotoNaskhArabic-Regular.ttf", "BAK-NOTOARAB.TTF")):
     shutil.copy(src, os.path.join(share, dst))
 # The bidi page: an RTL-paragraph word, single-letter references for the
 # probe's column signatures, a bracket-mirror check, and the card's mixed
-# line. Numeric entities keep the fixture ASCII.
+# line. M186b appends the Arabic legs: the shaped word vs its literal
+# presentation forms (identical ink iff the shaper picked the forms), the
+# forms in visual order (the mirror image iff the run painted RTL), and
+# lam-alef vs its ligature vs a ZWNJ-broken pair (one glyph iff it ligated).
+# Numeric entities keep the fixture ASCII.
 open(os.path.join(share, "BIDI.HTML"), "wb").write(
     b"<h4>bidi</h4>"
     b"<p>&#x5D0;&#x5D1;&#x5D2;&#x5D3;&#x5D4;</p>"
@@ -93,7 +102,13 @@ open(os.path.join(share, "BIDI.HTML"), "wb").write(
     b"<p>abc &#x5D0;&#x5D1;&#x5D2; (1) def</p>"
     b"<p>abc &#x5D2;&#x5D1;&#x5D0; (1) def</p>"
     b"<p>(&#x5D0;)</p>"
-    b"<p>(x)</p>")
+    b"<p>(x)</p>"
+    b"<p>&#x628;&#x62D;&#x631;</p>"
+    b"<p>&#xFE91;&#xFEA4;&#xFEAE;</p>"
+    b"<p>&#xFEAE;&#xFEA4;&#xFE91;</p>"
+    b"<p>&#x644;&#x627;</p>"
+    b"<p>&#xFEFB;</p>"
+    b"<p>&#x644;&#x200C;&#x627;</p>")
 colors = [(0x11, 0x7f, 0x33), (0xd0, 0x33, 0x99),
           (0x22, 0x66, 0xdd), (0xee, 0xcc, 0x00)]
 qoi = bytearray(b"qoif") + struct.pack(">II", 32, 32) + bytes([4, 0])
@@ -205,7 +220,7 @@ subprocess.check_call([sys.executable, 'user/go/browser/pixel_probe.py', sys.arg
 PY
 
 # 03: M99m coverage faces, and M99o's bold-italic. The manifest is honored
-# (faces=10), the CJK line reaches NOTOCJK, the serif-only runes in the
+# (faces=11), the CJK line reaches NOTOCJK, the serif-only runes in the
 # font-family:serif block reach NOTOSERF through the ui cascade, and the
 # font-weight:700;font-style:italic line resolves the dedicated face — the
 # engine's own bi-resolve marker says so. No rune exhausts its chain, so
@@ -225,7 +240,7 @@ vgate_assert 03 serial-contains 'web: layout blocks='
 vgate_assert 03 serial-contains 'web: settled'
 vgate_assert 03 serial-contains 'web: repaint items='
 vgate_assert 03 serial-contains 'web: ready'
-vgate_assert 03 serial-contains 'fonts: manifest=ok faces=10'
+vgate_assert 03 serial-contains 'fonts: manifest=ok faces=11'
 # M99z (#2194): the probe's serif fields pin the M99p end-to-end — the serif
 # role is loaded (serif=truetype), the face resolved (serif-face=yes), and a
 # {serif} style resolves by name to the serif face, not Inter
@@ -290,7 +305,7 @@ vgate_run 04 -- \
 
 vgate_assert 04 serial-absent 'web: budget over'
 vgate_assert 04 serial-contains 'web: url /host/COVER.HTML'
-vgate_assert 04 serial-contains 'fonts: manifest=ok faces=10'
+vgate_assert 04 serial-contains 'fonts: manifest=ok faces=11'
 vgate_assert 04 serial-contains 'fonts: notdef='
 vgate_assert 04 serial-contains 'web: ready'
 vgate_assert 04 serial-absent 'web: error'
@@ -489,7 +504,7 @@ vgate_assert 09 serial-absent '[EXC] parking:'
 # --- M178a (#3144) run 10: Hebrew + bidi after the deletion runs ----------
 # The share is fontless after runs 04/05, so the script vf-clones the BAK-*
 # copies back into place first: the manifest plus just the faces the page
-# needs (INTER for Latin, NOTOHEB for Hebrew). `fonts: manifest=ok faces=10`
+# needs (INTER for Latin, NOTOHEB for Hebrew). `fonts: manifest=ok faces=11`
 # counts manifest ROWS not loads — the four absent faces simply stay
 # unloaded. `fonts: notdef` staying silent proves every painted rune —
 # Hebrew included — resolved to real coverage, and the python probe pins the
@@ -502,6 +517,8 @@ vf clone BAK-FONTS.TXT FONTS.TXT
 vf clone BAK-INTER.TTF INTER.TTF
 vf rm NOTOHEB.TTF
 vf clone BAK-NOTOHEB.TTF NOTOHEB.TTF
+vf rm NOTOARAB.TTF
+vf clone BAK-NOTOARAB.TTF NOTOARAB.TTF
 exec WEB.ELF /host/BIDI.HTML
 EOS
 
@@ -513,7 +530,7 @@ vgate_run 10 -- \
 
 vgate_assert 10 serial-absent 'web: budget over'
 vgate_assert 10 serial-contains 'web: url /host/BIDI.HTML'
-vgate_assert 10 serial-contains 'fonts: manifest=ok faces=10'
+vgate_assert 10 serial-contains 'fonts: manifest=ok faces=11'
 vgate_assert 10 serial-contains 'web: fonts truetype(inter) ui=truetype mono=missing serif=missing'
 vgate_assert 10 serial-contains 'web: text face=truetype(inter) proportional=yes'
 vgate_assert 10 serial-absent 'fonts: notdef='
@@ -564,9 +581,9 @@ for b in bands[1:]:
     else:
         merged.append(list(b))
 bands = [b for b in merged if b[1] - b[0] >= 3]
-# h4 + seven <p> lines
-if len(bands) != 8:
-    sys.exit("want 8 text bands, found %d: %s" % (len(bands), bands))
+# h4 + seven <p> lines + six M186b Arabic <p> lines
+if len(bands) != 14:
+    sys.exit("want 14 text bands, found %d: %s" % (len(bands), bands))
 
 def mask(b):
     t, bb = b
@@ -619,6 +636,26 @@ lF = submask(bands[7], clusters(bands[7])[0])
 H = min(len(lE), len(lF))
 if lE[-H:] != lF[-H:]:
     sys.exit("RTL paren line does not open with '(' columns")
+
+# M186b Arabic legs (bands 8..13).
+# bands[8] "بحر" shaped vs bands[9] the literal presentation forms
+# U+FE91 U+FEA4 U+FEAE: identical ink iff the shaper substituted exactly
+# those forms — an unshaped pipeline paints different glyphs.
+if mask(bands[8]) != mask(bands[9]):
+    sys.exit("shaped Arabic did not paint the literal presentation forms")
+# bands[10] is the same three form code points in VISUAL order: its mask
+# must be the horizontal mirror of band 8 iff the run painted RTL.
+if flip(mask(bands[8])) != mask(bands[10]):
+    sys.exit("Arabic run did not paint right-to-left")
+# bands[11] "لا" vs bands[12] the lamalef ligature code point U+FEFB:
+# identical ink iff lam+alef ligated and the alef painted nothing.
+if mask(bands[11]) != mask(bands[12]):
+    sys.exit("lam-alef did not paint the lamalef ligature")
+# bands[13] "ل‌ا" carries a ZWNJ: the ligature is refused, so the band
+# must differ — two isolated glyphs, not one ligature.
+if mask(bands[11]) == mask(bands[13]):
+    sys.exit("ZWNJ did not refuse the lam-alef ligature")
 print("bidi run 10: RTL words mirror their logical reverse, mixed-line "
-      "Hebrew mirrors too, parens mirrored")
+      "Hebrew mirrors too, parens mirrored; Arabic painted its literal "
+      "presentation forms right-to-left, lam-alef ligated, ZWNJ refused")
 PY

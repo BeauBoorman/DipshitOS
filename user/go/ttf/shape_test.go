@@ -7,6 +7,8 @@ import (
 
 const shapeFixturePath = "testdata/ShapeTest-Regular.ttf"
 
+const naskhPath = "../../../image/fonts/NotoNaskhArabic-Regular.ttf"
+
 // fixtureString is the committed shaping fixture: two ligatures and one
 // kerned pair in nine UTF-8 bytes.
 const fixtureString = "fi fl AV"
@@ -187,5 +189,164 @@ func TestShapeMalformedNeverPanics(t *testing.T) {
 	empty := &Face{}
 	if empty.ShapeLatin("fi") == nil {
 		t.Error("ShapeLatin on an empty face should return an empty (non-nil) result")
+	}
+}
+
+// ——— M186b Arabic contextual shaping (#3179) ———
+
+// formedRunes is the test shorthand for the shaped view: the rune every
+// logical index paints, plus the lam-alef absorption flags.
+func formedRunes(t *testing.T, text string) ([]rune, []bool) {
+	t.Helper()
+	a := ShapeArabic(text)
+	if len(a.Form) != len([]rune(text)) || len(a.Skip) != len([]rune(text)) {
+		t.Fatalf("the view must be index-aligned with the input")
+	}
+	return a.Runes([]rune(text)), a.Skip
+}
+
+// TestArabicJoinTableFacts pins a few generated-table facts so the data
+// cannot silently drift: every joining type the pass understands, the
+// tatweel/ZWJ join-causing pair, the ZWNJ breaker, a transparent mark, and
+// a non-Arabic default.
+func TestArabicJoinTableFacts(t *testing.T) {
+	for _, tc := range []struct {
+		r    rune
+		want joinType
+	}{
+		{'\u0628', jtD}, {'\u0647', jtD}, {'\u064A', jtD}, // dual-joining letters
+		{'\u0627', jtR}, {'\u0631', jtR}, {'\u0648', jtR}, // alef, reh, waw join back only
+		{'\u0621', jtU},                  // hamza joins nothing
+		{'\u0640', jtC}, {'\u200D', jtC}, // tatweel, ZWJ
+		{'\u200C', jtU},                  // ZWNJ breaks the run
+		{'\u064B', jtT}, {'\u0650', jtT}, // fathatan, kasra: transparent marks
+		{'a', jtU}, {' ', jtU}, {'\u05D0', jtU}, // non-Arabic defaults
+	} {
+		if got := joinTypeOf(tc.r); got != tc.want {
+			t.Errorf("joinTypeOf(%U) = %d, want %d", tc.r, got, tc.want)
+		}
+	}
+}
+
+// TestShapeArabicForms is the shaped-string golden the card asks for: each
+// case's painted-rune sequence (a base rune where no form applies). The
+// values are the UCD's own code points — beh's four forms are
+// U+FE8F..U+FE92 in isolated/final/initial/medial order.
+func TestShapeArabicForms(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		text string
+		want []rune
+	}{
+		{"isolated", "ب", []rune{0xFE8F}},
+		{"initial+final", "به", []rune{0xFE91, 0xFEEA}},
+		{"full word", "بحر", []rune{0xFE91, 0xFEA4, 0xFEAE}},
+		{"alef final", "با", []rune{0xFE91, 0xFE8E}},
+		{"alef cannot join forward", "اب", []rune{0xFE8D, 0xFE8F}},
+		{"reh cannot join forward", "برج", []rune{0xFE91, 0xFEAE, 0xFE9D}},
+		{"space breaks", "ب ب", []rune{0xFE8F, ' ', 0xFE8F}},
+		{"digit breaks", "ب١ب", []rune{0xFE8F, '١', 0xFE8F}},
+		{"mark is transparent", "بَب", []rune{0xFE91, 0x064E, 0xFE90}},
+		{"ZWNJ breaks", "ب‌ب", []rune{0xFE8F, 0x200C, 0xFE8F}},
+		{"ZWJ joins", "ب‍", []rune{0xFE91, 0x200D}},
+		{"tatweel joins", "بـب", []rune{0xFE91, 0x0640, 0xFE90}},
+		{"latin untouched", "abc", []rune{'a', 'b', 'c'}},
+		{"mixed run", "aبحb", []rune{'a', 0xFE91, 0xFEA2, 'b'}},
+	} {
+		got, _ := formedRunes(t, tc.text)
+		if len(got) != len(tc.want) {
+			t.Fatalf("%s: %d runes, want %d", tc.name, len(got), len(tc.want))
+		}
+		for i := range tc.want {
+			if got[i] != tc.want[i] {
+				t.Errorf("%s: formed[%d] = %U, want %U", tc.name, i, got[i], tc.want[i])
+			}
+		}
+	}
+}
+
+// TestShapeArabicLamAlef pins the mandatory ligature: lam + an alef-family
+// letter collapses to the lamalef code point, final when lam itself joins
+// to a previous letter and isolated otherwise; the alef is absorbed. A
+// combining mark BETWEEN the pair refuses the ligature — the named
+// limitation — and the run still joins as initial+final.
+func TestShapeArabicLamAlef(t *testing.T) {
+	got, skip := formedRunes(t, "لا")
+	if got[0] != 0xFEFB || !skip[1] {
+		t.Fatalf("لا formed %U skip %v, want lamalef-isolated + absorbed alef", got, skip)
+	}
+	got, skip = formedRunes(t, "بلا")
+	if got[0] != 0xFE91 || got[1] != 0xFEFC || !skip[2] {
+		t.Fatalf("بلا formed %U %U %U skip %v, want initial + lamalef-final", got[0], got[1], got[2], skip)
+	}
+	got, skip = formedRunes(t, "لآ")
+	if got[0] != 0xFEF5 || !skip[1] {
+		t.Fatalf("لآ formed %U skip %v, want lamalef-madda + absorbed", got, skip)
+	}
+	// The mark between lam and alef is transparent to joining but refuses
+	// the ligature: lam initial, mark unchanged, alef final.
+	got, skip = formedRunes(t, "لَا")
+	if got[0] != 0xFEDF || got[2] != 0xFE8E || skip[1] || skip[2] {
+		t.Fatalf("لَا formed %U %U %U skip %v, want initial+mark+final",
+			got[0], got[1], got[2], skip)
+	}
+	// The ligature terminates the run: a meem after lam-alef is isolated.
+	got, skip = formedRunes(t, "لام")
+	if got[0] != 0xFEFB || !skip[1] || got[2] != 0xFEE1 {
+		t.Fatalf("لام formed %U %U %U skip %v", got[0], got[1], got[2], skip)
+	}
+}
+
+// TestShapeArabicGoldenGlyphs is the glyph-level golden through the real
+// face: "بحر" shapes to beh-initial + hah-medial + reh-final — gids 1028,
+// 17, 22 in the pinned build of NotoNaskhArabic-Regular.ttf — none of
+// which is the cmap gid of a base letter. A no-op shaper would read the
+// base glyphs instead.
+func TestShapeArabicGoldenGlyphs(t *testing.T) {
+	f := loadFace(t, naskhPath)
+	got, skip := formedRunes(t, "بحر")
+	wantGids := []uint16{1028, 17, 22}
+	for i, want := range wantGids {
+		if skip[i] {
+			t.Fatalf("rune %d unexpectedly absorbed", i)
+		}
+		if g := f.GlyphIndex(got[i]); g != want {
+			t.Errorf("shaped rune %d (%U) -> gid %d, want %d", i, got[i], g, want)
+		}
+	}
+	// The ligature's own golden: لا paints gid 1026 (uniFEFB), not the two
+	// letters' gids.
+	got, skip = formedRunes(t, "لا")
+	if g := f.GlyphIndex(got[0]); g != 1026 || !skip[1] {
+		t.Fatalf("لا -> gid %d skip %v, want gid 1026 + absorbed", g, skip)
+	}
+	// The face carries every form the generated table can emit — a form
+	// that resolved to .notdef would paint tofu mid-word.
+	for _, e := range arabFormTable {
+		for _, r := range e.forms {
+			if r != 0 && f.GlyphIndex(r) == 0 {
+				t.Errorf("base %U form %U has no glyph in the face", e.base, r)
+			}
+		}
+	}
+	for _, l := range arabLamAlef {
+		if f.GlyphIndex(l.iso) == 0 || f.GlyphIndex(l.fin) == 0 {
+			t.Errorf("lamalef for %U not covered by the face", l.alef)
+		}
+	}
+}
+
+// TestShapeArabicEdgeCases: empty text and Arabic-free text produce an
+// index-aligned no-op view.
+func TestShapeArabicEdgeCases(t *testing.T) {
+	a := ShapeArabic("")
+	if a == nil || len(a.Form) != 0 || len(a.Skip) != 0 {
+		t.Fatalf("empty text produced %+v", a)
+	}
+	got, skip := formedRunes(t, "hello שלום")
+	for i, r := range got {
+		if r != []rune("hello שלום")[i] || skip[i] {
+			t.Fatalf("non-Arabic text changed at index %d: %U skip=%v", i, r, skip[i])
+		}
 	}
 }

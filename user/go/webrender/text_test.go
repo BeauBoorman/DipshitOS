@@ -1054,6 +1054,99 @@ func TestRegistryNotdefCountsAndKeepsThePrimary(t *testing.T) {
 	}
 }
 
+// ——— M186b Arabic presentation forms (#3179) ———
+
+const naskhFixture = "../../../image/fonts/NotoNaskhArabic-Regular.ttf"
+
+// arabicFonts builds the engine over INTER + NOTOARAB, the manifest shape
+// that routes an Arabic run to the Naskh face while Latin stays on Inter.
+func arabicFonts(t *testing.T) Fonts {
+	t.Helper()
+	paths := map[string]string{
+		"INTER.TTF":    interFixture,
+		"NOTOARAB.TTF": naskhFixture,
+	}
+	specs, err := ttf.ParseManifest([]byte(
+		"INTER.TTF | role=ui | order=1\n" +
+			"NOTOARAB.TTF | role=ui | order=7\n"))
+	if err != nil {
+		t.Fatalf("manifest refused: %v", err)
+	}
+	reg := ttf.NewRegistry(specs, func(file string) (*ttf.Face, error) {
+		data, err := os.ReadFile(paths[file])
+		if err != nil {
+			return nil, err
+		}
+		return ttf.Parse(data)
+	})
+	f := RegistryFonts(reg)
+	if f.UI == nil {
+		t.Fatal("no ui primary")
+	}
+	return f
+}
+
+// paintString paints text into a framebuffer through the engine's own
+// path — the same surface walk Measure's advance claims.
+func paintString(f Fonts, text string, st Style) *fb {
+	out := newFB(160, 60, 0)
+	f.Paint(out, 4, 20, text, st, ColorText, Clip{W: 160, H: 60})
+	return out
+}
+
+func fbEqual(a, b *fb) bool {
+	if len(a.px) != len(b.px) {
+		return false
+	}
+	for i := range a.px {
+		if a.px[i] != b.px[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// TestArabicPaintsTheShapedForms is the card's end-to-end engine check:
+// "بح" must paint EXACTLY the pixels the literal shaped sequence
+// U+FE91 U+FEA2 (beh-initial, hah-final) paints — the same forms resolved
+// to the Naskh face through the cascade, reordered by the same bidi pass —
+// and must NOT paint the unshaped isolated forms. lam-alef likewise
+// collapses to its ligature code point. Measure rides the same runes.
+func TestArabicPaintsTheShapedForms(t *testing.T) {
+	f := arabicFonts(t)
+	st := Style{Size: 1}
+
+	text := "abبحde"
+	shaped := paintString(f, text, st)
+	literal := paintString(f, "abﺑﺢde", st)
+	if !fbEqual(shaped, literal) {
+		t.Fatal("shaped بح did not paint the literal beh-initial/hah-final forms")
+	}
+	if got, want := f.Measure(text, st), f.Measure("abﺑﺢde", st); got != want {
+		t.Fatalf("measure %d != literal %d", got, want)
+	}
+	unshaped := paintString(f, "abﺏﺡde", st)
+	if fbEqual(shaped, unshaped) {
+		t.Fatal("shaped بح equals the isolated forms — shaping did nothing")
+	}
+
+	// lam-alef: the pair paints its ligature, with the absorbed alef
+	// consuming no advance.
+	lig := paintString(f, "لا", st)
+	litLig := paintString(f, "ﻻ", st)
+	if !fbEqual(lig, litLig) {
+		t.Fatal("لا did not paint the lamalef ligature")
+	}
+	if got, want := f.Measure("لا", st), f.Measure("ﻻ", st); got != want {
+		t.Fatalf("measure لا=%d, want ligature %d", got, want)
+	}
+	// And the ligature is narrower than the two letters would be: the alef
+	// slot paints nothing of its own.
+	if got, sum := f.Measure("لا", st), f.Measure("ل", st)+f.Measure("ا", st); got >= sum {
+		t.Fatalf("ligature measure %d not under the two-letter sum %d", got, sum)
+	}
+}
+
 // TestRegistryZeroValueIsBitmapHonest: a nil registry degrades exactly like a
 // failed hard-coded load — bitmap metrics, honest name.
 func TestRegistryZeroValueIsBitmapHonest(t *testing.T) {

@@ -20,6 +20,7 @@ func regFaces(t *testing.T) map[string]*Face {
 		"CHROME.TTF":   loadFace(t, chromePath),
 		"NOTOSERF.TTF": loadFace(t, "../../../image/fonts/NotoSerif-Regular.ttf"),
 		"NOTOHEB.TTF":  loadFace(t, "../../../image/fonts/NotoSansHebrew-Regular.ttf"),
+		"NOTOARAB.TTF": loadFace(t, "../../../image/fonts/NotoNaskhArabic-Regular.ttf"),
 	}
 }
 
@@ -62,7 +63,8 @@ func TestManifestParsesShippedShape(t *testing.T) {
 	// ui cascade's tail, NOTOCJK trails the symbol faces so every chain
 	// reaches it last, and INTERBI is the one row carrying weight=700 AND
 	// style=italic. M178a adds NOTOHEB as the ui cascade's Hebrew tail at
-	// order=6, after the styled rows.
+	// order=6, after the styled rows; M186b adds NOTOARAB behind it at
+	// order=7.
 	want := []FaceSpec{
 		{File: "INTER.TTF", Role: "ui", Order: 1, Weight: 400},
 		{File: "INTERB.TTF", Role: "ui", Order: 2, Weight: 700},
@@ -70,6 +72,7 @@ func TestManifestParsesShippedShape(t *testing.T) {
 		{File: "NOTOSERF.TTF", Role: "ui", Order: 4, Weight: 400},
 		{File: "INTERBI.TTF", Role: "ui", Order: 5, Weight: 700, Italic: true},
 		{File: "NOTOHEB.TTF", Role: "ui", Order: 6, Weight: 400},
+		{File: "NOTOARAB.TTF", Role: "ui", Order: 7, Weight: 400},
 		{File: "FIRACODE.TTF", Role: "mono", Order: 1, Weight: 400},
 		{File: "NOTOSERF.TTF", Role: "serif", Order: 1, Weight: 400},
 		{File: "CHROME.TTF", Role: "symbol", Order: 1, Weight: 400},
@@ -552,6 +555,47 @@ CHROME.TTF   | role=symbol | order=1
 	// The cascade walked role order on the miss: INTER, INTERB, NOTOHEB — and
 	// the symbol face was never read for a covered rune.
 	want := []string{"INTER.TTF", "INTERB.TTF", "NOTOHEB.TTF"}
+	if len(*reads) != len(want) {
+		t.Fatalf("reads %v, want %v", *reads, want)
+	}
+	for i := range want {
+		if (*reads)[i] != want[i] {
+			t.Fatalf("reads %v, want %v", *reads, want)
+		}
+	}
+}
+
+// TestChainArabicReachesTheCoverageFace is the M186b cascade fact: an
+// Arabic rune — base letter or presentation form — falls through every
+// earlier ui face, including the Hebrew tail, to NOTOARAB. The painter
+// resolves faces on the shaped text, so the form runes themselves must
+// land on the Naskh face.
+func TestChainArabicReachesTheCoverageFace(t *testing.T) {
+	faces := regFaces(t)
+	load, reads := fixtureLoader(t, faces)
+	specs, err := ParseManifest([]byte(`# test
+INTER.TTF    | role=ui | order=1
+INTERB.TTF   | role=ui | order=2 | weight=700
+NOTOHEB.TTF  | role=ui | order=6
+NOTOARAB.TTF | role=ui | order=7
+CHROME.TTF   | role=symbol | order=1
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	reg := NewRegistry(specs, load)
+	ui := reg.Chain(Query{Role: "ui"})
+	pieces := ui.Split("abﺑﺤde")
+	if len(pieces) != 3 || pieces[1].Face != faces["NOTOARAB.TTF"] {
+		t.Fatalf("Arabic run did not split onto NOTOARAB: %+v", pieces)
+	}
+	if pieces[0].Face != faces["INTER.TTF"] || pieces[2].Face != faces["INTER.TTF"] {
+		t.Fatalf("Latin did not stay on the primary: %+v", pieces)
+	}
+	if reg.Notdef() != 0 {
+		t.Errorf("a covered Arabic rune counted as notdef (%d)", reg.Notdef())
+	}
+	want := []string{"INTER.TTF", "INTERB.TTF", "NOTOHEB.TTF", "NOTOARAB.TTF"}
 	if len(*reads) != len(want) {
 		t.Fatalf("reads %v, want %v", *reads, want)
 	}
