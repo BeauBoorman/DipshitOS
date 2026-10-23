@@ -22,6 +22,7 @@ verify-portable:
     python3 tools/test-timing.py init
     zig fmt --check boot/src/*.zig kernel/src/*.zig user/src/*.zig build.zig
     python3 tools/test-timing.py run timing-reporter -- python3 -m unittest discover -s tools/tests -p test_test_timing.py
+    python3 tools/test-timing.py run registry -- python3 -m unittest discover -s tools/tests -p test_component_registry.py
     python3 tools/test-timing.py run zig-unit -- bash tools/verify-unit-tests.sh
     python3 tools/test-timing.py run console-transcript -- zig build test-console
     zig build

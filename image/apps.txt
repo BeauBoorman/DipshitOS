@@ -29,6 +29,7 @@
 # that is truncated at the last whole line, silently dropping tail rows.
 # sexiburger's host test pins this file under it. A not-yet-shipped row
 # refuses "Binary not staged".
+# Registry: each row needs an `app` row in docs/component-registry.md.
 GOCALC.ELF | 64-bit Calc | c | dock=true
 NOTE.ELF | Text Editor | n | dock=true | v=2 | opens=text
 GOEDIT.ELF | Code Editor | e | dock=true | v=2 | opens=text,binary | selection=primary
