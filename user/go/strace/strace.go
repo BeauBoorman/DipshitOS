@@ -112,6 +112,36 @@ func (s *Session) Read() ([]vi.TraceRecord, uint64, error) {
 	return records, header.Dropped, resultError(result)
 }
 
+// Drain is the read-render-print loop every consumer had open-coded
+// (#3189's deduplicated pull): read until the ring answers an empty batch —
+// or for at most maxBatches reads when maxBatches > 0 — rendering every
+// record to the console. fn, when non-nil, observes each record after its
+// line prints (the rendered line comes along so a caller retaining rows
+// never renders twice) and may end the drain early by returning false. The
+// returned count is the ring's cumulative dropped total from the last batch
+// read.
+func (s *Session) Drain(maxBatches int, fn func(vi.TraceRecord, string) bool) (uint64, error) {
+	var dropped uint64
+	for batch := 0; maxBatches <= 0 || batch < maxBatches; batch++ {
+		records, loss, err := s.Read()
+		if err != nil {
+			return dropped, err // the failed read's header is zeroed; keep the last good total
+		}
+		dropped = loss
+		for _, record := range records {
+			line := Render(record)
+			vi.ConsoleLine(line)
+			if fn != nil && !fn(record, line) {
+				return dropped, nil
+			}
+		}
+		if len(records) == 0 {
+			break
+		}
+	}
+	return dropped, nil
+}
+
 func errno(code uint32, slot uint64) string {
 	names := [...]string{"", "EINVAL", "EBADF", "EFAULT", "ENOSYS", "ENOSPC",
 		"ENOENT", "EACCES", "ENAMETOOLONG", "ENXIO", "ENOMEM", "EAGAIN", "ETIMEDOUT"}

@@ -132,6 +132,110 @@ func TestArmExecWireOrderingAndFailureDisarm(t *testing.T) {
 	}
 }
 
+// drainHook serves scripted TraceRead batches: counts[i] records and a
+// cumulative dropped of drops[i] on call i, then empty batches. Each record
+// carries slot 24 (sys_file_read) so the rendered line is deterministic.
+func drainHook(t *testing.T, counts []uint32, drops []uint64, calls *int) func(num, a0, a1, a2, a3 uintptr) int64 {
+	return func(num, a0, a1, a2, a3 uintptr) int64 {
+		if num == vi.SlotWrite {
+			return int64(a2) // the console write reports its length, nothing more
+		}
+		if num != vi.SlotTrace || a0 != vi.TraceRead {
+			t.Fatalf("unexpected syscall num=%d op=%d", num, a0)
+		}
+		i := *calls
+		*calls++
+		count, dropped := uint32(0), uint64(0)
+		if i < len(counts) {
+			count, dropped = counts[i], drops[i]
+		}
+		b := unsafe.Slice((*byte)(unsafe.Pointer(a2)), a3)
+		binary.LittleEndian.PutUint32(b, 1)
+		binary.LittleEndian.PutUint32(b[4:], vi.TraceRecordBytes)
+		binary.LittleEndian.PutUint32(b[8:], count)
+		binary.LittleEndian.PutUint64(b[16:], dropped)
+		for j := uint32(0); j < count; j++ {
+			r := b[24+j*vi.TraceRecordBytes:]
+			binary.LittleEndian.PutUint32(r, 1)
+			binary.LittleEndian.PutUint64(r[8:], uint64(100+j))
+			binary.LittleEndian.PutUint64(r[32:], 24)
+			binary.LittleEndian.PutUint64(r[40:], 3)
+			binary.LittleEndian.PutUint64(r[88:], uint64(j))
+		}
+		return int64(count)
+	}
+}
+
+func TestDrainReadsRendersStopsAndDrops(t *testing.T) {
+	calls := 0
+	previous := vi.SetSyscallHookForTest(drainHook(t,
+		[]uint32{3, 1, 0}, []uint64{0, 0, 9}, &calls))
+	defer vi.SetSyscallHookForTest(previous)
+	s := &Session{Token: 5}
+	var seen []string
+	dropped, err := s.Drain(0, func(r vi.TraceRecord, line string) bool {
+		seen = append(seen, line)
+		return true
+	})
+	if err != nil || dropped != 9 || calls != 3 || len(seen) != 4 ||
+		seen[0] != "[strace 100] sys_file_read(fd=3, buf=0x0, len=0) = 0" {
+		t.Fatalf("dropped=%d calls=%d seen=%v err=%v", dropped, calls, seen, err)
+	}
+}
+
+func TestDrainMaxBatchesAndEarlyStop(t *testing.T) {
+	calls := 0
+	previous := vi.SetSyscallHookForTest(drainHook(t,
+		[]uint32{3, 1, 0}, []uint64{0, 0, 9}, &calls))
+	defer vi.SetSyscallHookForTest(previous)
+	s := &Session{Token: 5}
+	var seen []string
+	if _, err := s.Drain(1, func(r vi.TraceRecord, line string) bool {
+		seen = append(seen, line)
+		return true
+	}); err != nil || calls != 1 || len(seen) != 3 {
+		t.Fatalf("bounded drain: calls=%d seen=%v err=%v", calls, seen, err)
+	}
+	calls = 0
+	seen = seen[:0]
+	dropped, err := s.Drain(0, func(r vi.TraceRecord, line string) bool {
+		seen = append(seen, line)
+		return len(seen) != 2
+	})
+	if err != nil || dropped != 0 || calls != 1 || len(seen) != 2 {
+		t.Fatalf("early stop: dropped=%d calls=%d seen=%v err=%v", dropped, calls, seen, err)
+	}
+}
+
+func TestDrainErrorPropagates(t *testing.T) {
+	calls := 0
+	previous := vi.SetSyscallHookForTest(func(num, a0, a1, a2, a3 uintptr) int64 {
+		if num == vi.SlotWrite {
+			return int64(a2)
+		}
+		calls++
+		if calls == 2 {
+			return -vi.ErrENOENT
+		}
+		b := unsafe.Slice((*byte)(unsafe.Pointer(a2)), a3)
+		binary.LittleEndian.PutUint32(b, 1)
+		binary.LittleEndian.PutUint32(b[4:], vi.TraceRecordBytes)
+		binary.LittleEndian.PutUint32(b[8:], 1)
+		binary.LittleEndian.PutUint64(b[16:], 7)
+		r := b[24:]
+		binary.LittleEndian.PutUint32(r, 1)
+		binary.LittleEndian.PutUint64(r[8:], 100)
+		binary.LittleEndian.PutUint64(r[32:], 24)
+		return 1
+	})
+	defer vi.SetSyscallHookForTest(previous)
+	s := &Session{Token: 5}
+	dropped, err := s.Drain(0, nil)
+	if err == nil || err.Error() != "ENOENT" || dropped != 7 || calls != 2 {
+		t.Fatalf("dropped=%d calls=%d err=%v", dropped, calls, err)
+	}
+}
+
 func TestReadBatchWireAndBounds(t *testing.T) {
 	previous := vi.SetSyscallHookForTest(func(slot, op, token, ptr, size uintptr) int64 {
 		b := unsafe.Slice((*byte)(unsafe.Pointer(ptr)), size)

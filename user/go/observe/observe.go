@@ -23,6 +23,12 @@
 // means the filtered tracer (empty slot mask — every call is a filtered
 // check), the 100 Hz sampler and the heap memstat poll all armed on
 // OBSERVE itself, instead of the profiler alone.
+//
+// Why I'm separate (the #3189 diagnostics census, docs/diagnostics.md):
+// observe CREATES a bounded collection against one live target — the other
+// diagnostics surfaces only read data the kernel already keeps: logview
+// the app-log rings, crashview the receipt files, GOTOP the point-in-time
+// snapshots.
 package observe
 
 import (
@@ -94,22 +100,13 @@ func isSave(r vi.TraceRecord, watch string) bool {
 }
 
 func drainTrace(session *strace.Session, watch string) (saves int, dropped uint64, err error) {
-	for {
-		records, loss, e := session.Read()
-		if e != nil {
-			return saves, dropped, e
+	dropped, err = session.Drain(0, func(record vi.TraceRecord, _ string) bool {
+		if isSave(record, watch) {
+			saves++
 		}
-		dropped = loss
-		for _, record := range records {
-			vi.ConsoleLine(strace.Render(record))
-			if isSave(record, watch) {
-				saves++
-			}
-		}
-		if len(records) == 0 {
-			return saves, dropped, nil
-		}
-	}
+		return true
+	})
+	return saves, dropped, err
 }
 
 func drainProfile(token uint64, report *prof.Report, symbols *prof.Symbols) (dropped uint64, err error) {

@@ -54,20 +54,12 @@ func main() {
 	vi.ConsoleLine(fmt.Sprintf("strace: session=%d pid=%d", session.Token, pid))
 	deadline := vi.Nanos() + 120*1e9
 	for vi.Nanos() < deadline {
-		for {
-			records, dropped, err := session.Read()
-			if err != nil {
-				die(err)
-			}
-			for _, record := range records {
-				vi.ConsoleLine(strace.Render(record))
-			}
-			if len(records) == 0 {
-				if dropped != 0 {
-					vi.ConsoleLine(fmt.Sprintf("strace: dropped=%d", dropped))
-				}
-				break
-			}
+		dropped, err := session.Drain(0, nil)
+		if err != nil {
+			die(err)
+		}
+		if dropped != 0 {
+			vi.ConsoleLine(fmt.Sprintf("strace: dropped=%d", dropped))
 		}
 		_, state := vi.Probe(int64(pid))
 		if state != vi.ProbeRunning {
@@ -75,19 +67,12 @@ func main() {
 				die(err)
 			}
 			// Drain the last records after disarming. Disarm never clears them.
-			for {
-				records, dropped, err := session.Read()
-				if err != nil {
-					die(err)
-				}
-				for _, record := range records {
-					vi.ConsoleLine(strace.Render(record))
-				}
-				if len(records) == 0 {
-					vi.ConsoleLine(fmt.Sprintf("strace: done dropped=%d", dropped))
-					return
-				}
+			dropped, err = session.Drain(0, nil)
+			if err != nil {
+				die(err)
 			}
+			vi.ConsoleLine(fmt.Sprintf("strace: done dropped=%d", dropped))
+			return
 		}
 		vi.Sleep(1)
 	}

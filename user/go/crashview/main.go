@@ -1,3 +1,15 @@
+// Command crashview is CRASHVIEW.ELF — the crash-receipt browser: it polls
+// the tombstone directories (vi.CrashReceiptDir, plus /host/crash until a
+// probe proves they alias) for the frozen APP.ELF.TXT/.STK receipts and
+// pid-APP.txt kernel tombstones the crashguard publishes, newest observed
+// first. R reopens the selected receipt's recorded basename under the
+// in-process M94b tracer.
+//
+// Why I'm separate (the #3189 diagnostics census, docs/diagnostics.md):
+// this is the post-mortem surface — what died and why, read from files
+// frozen at crash time. logview shows the live rings those last-log tails
+// were cut from, GOTOP shows what is running now, observe arms a session
+// on a live target.
 package main
 
 import (
@@ -264,34 +276,22 @@ func (a *application) reopen() {
 }
 
 func (a *application) drainTrace() (uint64, int64, bool, error) {
-	var dropped uint64
-	for batch := 0; batch < 16; batch++ {
-		records, loss, err := a.trace.Read()
-		if err != nil {
-			return loss, 0, false, err
-		}
-		dropped = loss
-		for _, r := range records {
-			line := strace.Render(r)
-			vi.ConsoleLine(line)
-			a.traceRows = append(a.traceRows, line)
-			if r.PID == a.tracePID && r.Number == uint64(vi.SlotExit) && r.Flags&vi.TraceNoReturn != 0 {
-				// The registry can reuse this PID before our next poll. The
-				// captured exit is authoritative; do not show a successor's calls.
-				if len(a.traceRows) > 64 {
-					a.traceRows = a.traceRows[len(a.traceRows)-64:]
-				}
-				return dropped, int64(r.Args[0]), true, nil
-			}
-		}
+	var status int64
+	exited := false
+	dropped, err := a.trace.Drain(16, func(r vi.TraceRecord, line string) bool {
+		a.traceRows = append(a.traceRows, line)
 		if len(a.traceRows) > 64 {
 			a.traceRows = a.traceRows[len(a.traceRows)-64:]
 		}
-		if len(records) == 0 {
-			break
+		if r.PID == a.tracePID && r.Number == uint64(vi.SlotExit) && r.Flags&vi.TraceNoReturn != 0 {
+			// The registry can reuse this PID before our next poll. The
+			// captured exit is authoritative; do not show a successor's calls.
+			status, exited = int64(r.Args[0]), true
+			return false
 		}
-	}
-	return dropped, 0, false, nil
+		return true
+	})
+	return dropped, status, exited, err
 }
 
 func (a *application) pollTrace() bool {

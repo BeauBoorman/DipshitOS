@@ -28,6 +28,7 @@ func (s *Session) Filter(pids, slots []uint64) error
 func (s *Session) Disarm() error
 func (s *Session) Status() (vi.ObserveReadHeader, error)
 func (s *Session) Read() ([]vi.TraceRecord, uint64, error)
+func (s *Session) Drain(maxBatches int, fn func(vi.TraceRecord, string) bool) (uint64, error)
 ```
 
 `ArmExec` returns the session and already-traced child pid. The kernel pins
@@ -40,7 +41,11 @@ replace the entire target set and mask. There is one session system-wide,
 owned by its opening uid, recoverable by that uid or `cap_proc_admin`.
 Opening another invalidates the old token. Disarm retains unread records.
 Reads return at most 16 whole records and cumulative dropped count. Callers
-must sleep between empty polls and disarm when finished.
+must sleep between empty polls and disarm when finished. `Drain` is the
+shared read-render-print loop the three consumers used to open-code: it
+reads until an empty batch (or a batch bound), prints each rendered record,
+and hands the caller's callback the record and its line for counting,
+retention, or early exit.
 
 `Render` returns one line without a newline. Strings are escaped, truncated
 captures have `…`, inaccessible input has `<fault>`, and native negative

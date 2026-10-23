@@ -1,3 +1,16 @@
+// Command logview is LOGVIEW.ELF — the live app-log tail: it polls the
+// bounded per-app ring files under /host/APPLOG (vi.AppLogNames +
+// vi.ReadLog; each producer owns its own ring) and shows what apps are
+// logging now, in
+// first-observed order, with level/tag/grep/app filters, a follow-tail
+// window, and a bounded /host/LOGEXPORT snapshot on E.
+//
+// Why I'm separate (the #3189 diagnostics census, docs/diagnostics.md):
+// this is the only surface over the LIVE ring data — crashview reads
+// frozen post-mortem receipt files, GOTOP reads point-in-time kernel
+// snapshots, observe arms a session on one target. The question it
+// answers is "what did app X just log", not "what died" or "what is
+// running".
 package main
 
 import (

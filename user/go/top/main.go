@@ -33,6 +33,13 @@
 // counters — busy, queue depth, last kernel time, and the submit ledger —
 // sampled through gpu3d.SampleStats, the kernel's handle-free STATS op, so
 // the monitor never takes the single compute session from a real workload.
+//
+// Why I'm separate (the #3189 diagnostics census, docs/diagnostics.md):
+// GOTOP is the point-in-time monitor — every tab renders one kernel
+// snapshot class (procs/net/agent/gpu/trust/mounts) sampled on demand.
+// None of the append-only surfaces live here: logview owns the live log
+// rings, crashview the frozen receipts, observe the armed per-target
+// session.
 package main
 
 import (
