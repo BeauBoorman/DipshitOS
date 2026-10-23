@@ -8,7 +8,7 @@
 > [`docs/status.md`](../status.md) is the canonical source for milestone-level
 > facts, current gates, and what comes next. This file holds milestone-
 > sixteen's per-card detail and collision-free agent split, following the
-> [`march-m15.md`](march-m15.md) pattern.
+> [`march-m15-audio.md`](march-m15-audio.md) pattern.
 > A card's row flips to ✅ only with real observed class-B evidence, never
 > code-complete alone.
 

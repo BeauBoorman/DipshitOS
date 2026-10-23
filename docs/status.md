@@ -208,11 +208,10 @@ Threads and their current state (the tracker is authoritative):
 | **M147 — GOIRC** | **Closed** (index #2749); all three cards landed: IRC core (#2801, PR #2832), UI/mentions/session state (#2802, PR #2844); acceptance (PR #2862): `go-irc` K=3 — TLS+consent journey, snapshot, restore. | #2749; cards #2801–#2803 |
 | **M148 — GOVAULT** | **Closed** (index #2750); both cards landed: GOVAULT.ELF (#2804, PR #2837); acceptance (PR #2843): receipts — vault's own audit file + Receipts face, K=3. | #2750; cards #2804–#2805 |
 | **M149 — Shipped-app polish** | **Closed** (index #2751); all three cards landed: GOFILES spacebar QuickLook (#2806, PR #2880), GOTERM OSC-8 links + named profiles (#2807, PR #2840), GOEDIT themes + minimap (#2808, PR #2886). | #2751; cards #2806–#2808 |
-| **M189 — Docs tell the truth** | In flight (index #3224): a registry (#3225) claimed; b litterbox census/archive (#3226) and c site render + freshness guard (#3227) open. | #3224; cards #3225–#3227 |
+| **M189 — Docs tell the truth** | In flight (index #3224): a component registry (#3225) landed; b docs litterbox (#3226) in review (PR #3231); c site render + freshness guard (#3227) and d era digest (#3228) open. | #3224; cards #3225–#3228 |
 
 > M150–M188 landed without table rows (the lag the M189 wave exists to
-> fix); their arcs live on the tracker and in `docs/march-m*.md` trackers
-> until the registry work consolidates them.
+> fix); their arcs live on the GitHub tracker.
 
 
 ## Gate status

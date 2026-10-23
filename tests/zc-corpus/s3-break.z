@@ -1,7 +1,7 @@
 const zc = @import("zc");
 
 // M70c S3 corpus fixture (issue #1455): `break` / `continue`, the two
-// loop-control statements the Z4a dialect boundary (docs/line-of-sight.md)
+// loop-control statements the Z4a dialect boundary (docs/archive/line-of-sight.md)
 // listed as non-goals. This file parses under host `zig 0.17` (the gate builds
 // it with the Z4b link contract, which forces full semantic analysis of every
 // body) AND compiles + runs in-guest with ZC.BIN, and it is the behavioral half
