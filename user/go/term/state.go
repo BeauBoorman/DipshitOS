@@ -427,3 +427,115 @@ func (a *altScreenScan) apply(final byte, ts *termState) {
 		ts.alt = false
 	}
 }
+
+// --- M192f (#3251): notify-on-finish -------------------------------------
+// A foreground command that ran past the term_notify_seconds threshold
+// (default 5 s) while its tab was unfocused earns a seat toast — name,
+// status, duration. A focused tab, a fast command, `off`, or an
+// unreadable focus query post nothing: silence is what watching earns.
+// The toast text must fit the WM_RPC frame's 24-byte title
+// (vi.WmRpcTitleMax): the name yields its budget to the status and
+// duration — the part worth tapping — so the wire never clips a field.
+
+const (
+	// notifyKey is the one settings row: a positive seconds count, or
+	// `off` to disable the tap outright.
+	notifyKey         = "term_notify_seconds"
+	notifyDefaultSecs = 5
+	// notifyTextMax is the seat's toast budget — the WM_RPC frame title
+	// (vi.WmRpcTitleMax).
+	notifyTextMax = 24
+)
+
+// notifyThresholdNs reads the key out of a SETTINGS.TXT body. "off" maps
+// to a negative sentinel the caller treats as never-notify; a positive
+// integer is seconds; anything else — absent, non-numeric, zero — falls
+// back to the default.
+func notifyThresholdNs(body string) int64 {
+	v := notifyValue(body)
+	if v == "off" {
+		return -1
+	}
+	if n, ok := parseNotifySeconds(v); ok && n > 0 {
+		return int64(n) * 1e9
+	}
+	return notifyDefaultSecs * 1e9
+}
+
+// notifyValue is the key's raw value, scanned with the same `key =`
+// tolerance restartPolicyFromSettings uses — the kernel's own parse_line
+// trims both sides of '=' (kernel/src/settings.zig), so a spaced row is
+// a real row.
+func notifyValue(body string) string {
+	for _, line := range strings.Split(body, "\n") {
+		line = strings.TrimSpace(line)
+		eq := strings.IndexByte(line, '=')
+		if eq < 0 || strings.TrimSpace(line[:eq]) != notifyKey {
+			continue
+		}
+		return strings.TrimSpace(line[eq+1:])
+	}
+	return ""
+}
+
+// parseNotifySeconds is the decimal parser (the guest strconv port is not
+// imported here) — digits only, bounded so a silly threshold can never
+// wrap the int64 elapsed compare.
+func parseNotifySeconds(s string) (int, bool) {
+	if s == "" {
+		return 0, false
+	}
+	n := 0
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c < '0' || c > '9' {
+			return 0, false
+		}
+		n = n*10 + int(c-'0')
+		if n > 1<<30 {
+			return 0, false
+		}
+	}
+	return n, true
+}
+
+// notifyName is the toast's `name`: the submitted line's first word —
+// the command the user would call it by.
+func notifyName(line string) string {
+	f := strings.Fields(line)
+	if len(f) == 0 {
+		return "command"
+	}
+	return f[0]
+}
+
+// notifyDuration renders elapsed nanoseconds compactly: `7s` under a
+// minute, `2m5s` under an hour, `1h12m` past it — at most 6 bytes so the
+// title budget is spent on the name, not the units.
+func notifyDuration(ns int64) string {
+	s := ns / 1e9
+	switch {
+	case s < 60:
+		return vi.Itoa64(s) + "s"
+	case s < 3600:
+		return vi.Itoa64(s/60) + "m" + vi.Itoa64(s%60) + "s"
+	default:
+		return vi.Itoa64(s/3600) + "h" + vi.Itoa64(s%3600/60) + "m"
+	}
+}
+
+// notifyText builds the toast body — `<name> exited st=<N> in <dur>` —
+// with the name clipped to whatever the 24-byte title leaves after the
+// suffix, so the marker and the screen always carry the same bytes.
+func notifyText(name string, status int, elapsedNs int64) string {
+	suffix := " exited st=" + vi.Itoa64(int64(status)) +
+		" in " + notifyDuration(elapsedNs)
+	budget := notifyTextMax - len(suffix)
+	if budget < 1 {
+		budget = 1
+	}
+	if len(name) > budget {
+		name = name[:budget]
+	}
+	return name + suffix
+}

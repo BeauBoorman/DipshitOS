@@ -44,6 +44,11 @@
 # paste (one edit, one Enter submit), a Ctrl+Shift+F find over the search
 # space, and `term-profile next` under the seat with leg 03's rail probe.
 #
+# Issue #3251 adds leg 05: notify-on-finish — a foreground command that ran
+# past term_notify_seconds (default 5 s) while the tab was unfocused posts
+# a vi.Notify toast naming it, its exit status and the duration; a focused
+# tab or a fast command posts nothing.
+#
 # HOST PREREQUISITE (fails the gate honestly when missing):
 #   bash tools/go/build-goterm.sh   ->  .build/go/GOTERM.ELF
 #   bash tools/go/build-web.sh browser  ->  .build/go/WEB.ELF  (leg 02)
@@ -56,7 +61,7 @@
 # carry engine-computed statuses 0 then nonzero, and the ordering python
 # asserts the whole chain).
 
-vgate_name go-term "issue #1307 M58c: a Go terminal attaches /dev/tty selector 2 in Zig TABWM on VZ"
+vgate_name go-term "issue #1307 M58c + #3251: a Go terminal attaches /dev/tty selector 2 in Zig TABWM on VZ; notify-on-finish toasts a >5s command that ended unfocused"
 vgate_share seed
 vgate_runner_flags -Xswiftc -DSPIKE
 
@@ -898,4 +903,134 @@ if max(mode) <= 0xa0:
     sys.exit("rail band is not the light theme (#%02x%02x%02x) — the "
              "term-profile next publish never reached the seat" % mode)
 print("palette probe: rail band is light — the profile cycle re-themed the seat")
+PY
+
+# --- issue #3251: notify-on-finish -----------------------------------------
+# One input burst types three commands; the M98f interrupter's type-ahead
+# stash parks the later lines while a foreground child runs, so they
+# submit in order as each finishes — all three halves of the bet in one
+# boot:
+#
+#   sleep 6   runs while the tab is FOCUSED -> silence (watching earns it)
+#   sleep 7   runs while blurred -> the toast
+#   cd /data  runs blurred but fast -> silence (under the 5 s threshold)
+#
+# `dui cycle` rides script3 off the `sleep 7` submit marker, so the blur
+# lands inside its 7-second window — the kernel's focus id is what the
+# app's WinQuery reads when the engine answers. The toast click is
+# go-clock run 02's recipe: slot-0's centre (112,702) on the painted
+# toast dismisses it and click-through refocuses the sender. The boot
+# recipe is leg 03's — SESSION.TABS/PANES are removed so the seat comes
+# up live, never restore.
+
+vgate_file script-seat5.txt <<'EOF'
+vf rm SESSION.TABS
+vf rm SESSION.PANES
+set GOMAXPROCS=1
+wm
+exec -u0 GOTABWM.ELF
+EOF
+
+vgate_file script2-05.txt <<'EOF'
+exec -u0 GOTERM.ELF
+EOF
+
+vgate_file script3-05.txt <<'EOF'
+dui cycle
+EOF
+
+vgate_run 05 -- --display --input \
+    --screen '$RUN_DIR/screen-05' \
+    --via-virtio \
+    --script '$RUN_DIR/script-seat5.txt' \
+    --script2 '$RUN_DIR/script2-05.txt' \
+    --script2-after 'gotabwm: present' \
+    --input-chords 's,l,e,e,p,space,6,return,s,l,e,e,p,space,7,return,c,d,space,/,d,a,t,a,return' \
+    --input-chords-after 'goterm: prompt' \
+    --script3 '$RUN_DIR/script3-05.txt' \
+    --script3-after 'goterm: line sleep 7' \
+    --pointer-virtio '112,702,d;112,702,u' \
+    --pointer-virtio-after 'gotabwm: notify paint id=' \
+    --script-expect 'gotabwm: notify dismiss id=' --timeout 300
+
+vgate_assert 05 serial-contains 'exec: loaded GOTABWM.ELF'
+vgate_assert 05 serial-contains 'gotabwm: mode live'
+vgate_assert 05 serial-contains 'gotabwm: present'
+vgate_assert 05 serial-contains 'exec: loaded GOTERM.ELF'
+vgate_assert 05 serial-contains 'goterm: attached'
+vgate_assert 05 serial-contains 'goterm: prompt'
+vgate_assert 05 serial-contains 'goterm: line sleep 6'
+vgate_assert 05 serial-contains 'goterm: line sleep 7'
+vgate_assert 05 serial-contains 'goterm: line cd /data'
+# The blur landed while sleep 7 still owned the foreground.
+vgate_assert 05 serial-contains 'dui: cycle focused='
+# The app's own receipt, printed AFTER the seat acked the request — the
+# gofiles two-sided contract; its absence next to a refused marker would
+# mean the toast died on the wire.
+vgate_assert 05 serial-contains 'goterm: notify sent sleep exited st=0 in '
+vgate_assert 05 serial-absent 'goterm: notify refused'
+vgate_assert 05 serial-contains 'gotabwm: notify paint id='
+vgate_assert 05 serial-contains 'gotabwm: notify dismiss id='
+vgate_assert 05 serial-contains 'gotabwm: tab focus id='
+vgate_assert 05 serial-contains 'gotabwm: host focus id='
+vgate_assert 05 serial-absent '[EXC] parking:'
+vgate_assert 05 serial-absent 'exited status=139'
+
+# The ordering + silence + identity proof in one pass: sleep 6 finished
+# focused and posted nothing; the blur sat inside sleep 7's run; the toast
+# that posted is sleep 7's — same window id queued, painted, dismissed and
+# refocused — and cd /data's blurred-but-fast exit earned nothing either.
+# The focus legs are the FIRST occurrences AFTER the dismiss (adoption
+# prints both at exec time, the go-clock run-02 trap).
+vgate_assert 05 python <<'PY'
+import os, re, sys
+ser = open(os.environ["VG_SER"], errors="replace").read()
+
+def at(pat, what, start=0):
+    m = re.compile(pat).search(ser, start)
+    if not m:
+        sys.exit("no %s in the serial log" % what)
+    return m
+
+sub6   = at(r"(?m)^goterm: line sleep 6$", "sleep 6 submit")
+done6  = at(r"(?m)^goterm: done status=0$", "sleep 6 done", sub6.end())
+sub7   = at(r"(?m)^goterm: line sleep 7$", "sleep 7 submit", done6.end())
+blur   = at(r"(?m)^dui: cycle focused=(\d+)$", "blur marker", sub7.end())
+done7  = at(r"(?m)^goterm: done status=0$", "sleep 7 done", blur.end())
+sent   = at(r"(?m)^goterm: notify sent sleep exited st=0 in (\d+)s$",
+            "app notify marker", done7.end())
+subcd  = at(r"(?m)^goterm: line cd /data$", "cd submit", sent.end())
+donecd = at(r"(?m)^goterm: done status=0$", "cd done", subcd.end())
+queued = at(r"(?m)^gotabwm: notify id=(\d+) sleep exited st=0 in (\d+)s$",
+            "seat queue line")
+painted  = at(r"(?m)^gotabwm: notify paint id=(\d+)$", "toast paint", queued.end())
+dismiss  = at(r"(?m)^gotabwm: notify dismiss id=(\d+)$", "toast dismiss", painted.end())
+tabfoc   = at(r"(?m)^gotabwm: tab focus id=(\d+)$", "tab focus", dismiss.end())
+hostfoc  = at(r"(?m)^gotabwm: host focus id=(\d+)$", "host focus", dismiss.end())
+
+# The toast's dur is the app's own measure of sleep 7 — a 7 s park at
+# 1 Hz ticks can only land inside [6, 9] — and the seat's queue line
+# carries the identical text (the 24-byte title fits it whole).
+dur = int(sent.group(1))
+if not (6 <= dur <= 9):
+    sys.exit("toast dur = %ds — not a plausible sleep-7 measure" % dur)
+if queued.group(2) != sent.group(1):
+    sys.exit("the seat's toast text disagrees with the app's marker")
+
+wid = queued.group(1)
+for name, m in (("paint", painted), ("dismiss", dismiss),
+                ("tab focus", tabfoc), ("host focus", hostfoc)):
+    if m.group(1) != wid:
+        sys.exit("the %s marker names id=%s, want the sender id=%s"
+                 % (name, m.group(1), wid))
+
+# Earnable silence: exactly one notify marker in the whole run — sleep 6
+# (focused) and cd /data (under threshold) both earned nothing.
+n_sent = len(re.findall(r"(?m)^goterm: notify sent ", ser))
+if n_sent != 1:
+    sys.exit("%d 'notify sent' markers — focused or fast commands posted"
+             % n_sent)
+print("notify chain OK: sleep6 focused -> silence; sleep7 blurred -> "
+      "toast %ds id=%s -> click -> focused; cd blurred fast -> silence"
+      % (dur, wid))
 PY

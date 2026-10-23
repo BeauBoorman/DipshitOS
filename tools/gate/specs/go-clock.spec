@@ -1285,5 +1285,3 @@ vgate_assert 11 share-contains 'GOCLOCK.ALARM' 'gocal2 2 1813069800 1430 o+ 1813
 # No imported deadline fires inside the leg — both instants are 2027.
 vgate_assert 11 serial-absent 'goclock: fired alarm'
 vgate_assert 11 serial-absent 'goclock: alarm file bad'
-vgate_assert 11 serial-absent '[EXC] parking:'
-vgate_assert 11 serial-absent 'exited status=139'

@@ -102,6 +102,12 @@ const (
 	// follows the editor repaint that restores the prompt.
 	markerHints    = "goterm: hints "
 	markerHintsRow = "goterm: hints row "
+	// M192f (#3251): notify-on-finish. `notify sent` follows an accepted
+	// seat ack, `notify refused` an absent seat or a refused request —
+	// gofiles' two-sided contract (its markers.go): a gate always tells
+	// earned silence apart from a toast that died on the wire.
+	markerNotify   = "goterm: notify sent "
+	markerNotifyNo = "goterm: notify refused "
 )
 
 func main() {
@@ -287,10 +293,12 @@ func runSession(ta *tabapp.TabApp, fd uint32, ts *termState) {
 					return
 				}
 			}
+			startNs := vi.Nanos()
 			st, act := sh.RunLineBodies(line, bodies)
 			// Only AFTER the engine answered: the gate sequences on this,
 			// so it can never claim an execution that did not happen.
 			vi.ConsoleLine(markerDone + vi.Itoa64(int64(st)))
+			notifyOnFinish(ta, line, st, startNs)
 			if act == shlib.ActionExit && policy == restartStay {
 				writeTTY(ts, fd, []byte(restartMessage(st)))
 				restart = true
@@ -668,6 +676,41 @@ func restartMessage(status int) string {
 
 func closeRequested(line string) bool {
 	return strings.TrimSpace(line) == "exit --close"
+}
+
+// notifyOnFinish is the M192f tap on the shoulder: called after every
+// engine answer; only a foreground command that ran past the
+// term_notify_seconds threshold while this tab was unfocused posts. Each
+// GOTERM window is its own tab and process, so the tracked start is
+// per-tab by construction. The toast text is the marker's text verbatim —
+// already built inside the seat's 24-byte title budget.
+func notifyOnFinish(ta *tabapp.TabApp, line string, status int, startNs int64) {
+	threshold := notifyThresholdNs(settingsBody())
+	if threshold < 0 {
+		return
+	}
+	elapsed := vi.Nanos() - startNs
+	if elapsed <= threshold || windowFocused(ta.Win) {
+		return
+	}
+	text := notifyText(notifyName(line), status, elapsed)
+	if ta.Notify(text) {
+		vi.ConsoleLine(markerNotify + text)
+	} else {
+		vi.ConsoleLine(markerNotifyNo + text)
+	}
+}
+
+// windowFocused reads the kernel's window state for this tab (slot 19 —
+// owner-only, and this process owns ta.Win). out[5] is the focused flag.
+// A refused query reports true: the toast's rule is "unfocused only",
+// and an unreadable state cannot prove unfocused.
+func windowFocused(win int) bool {
+	st, r := vi.WinQuery(win)
+	if r < 0 {
+		return true
+	}
+	return st[5] != 0
 }
 
 // settingsBody is the raw SETTINGS.TXT, or "" when it cannot be read. The
