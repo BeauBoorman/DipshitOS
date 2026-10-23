@@ -73,6 +73,14 @@
 # GOSOUND PCM), keys over cv-input; K=3 samples 999,777 / 1,002,732 /
 # 1,003,770 — ~1.0 s, i.e. still about one tick_avg on this shape.
 # Baseline is the best observed sample; x2.
+# net-rx/net-tx (new legs, card #3147, same host 2026-10-22): the first
+# network rows — a pinned 4 MiB stream through the --net relay to a
+# host-side source/sink. The guest stack ACKs one segment per drain and
+# drains run inside syscalls (no net IRQ), so the floor is
+# ACK-cadence-bound, not wire-bound: rx samples 693/766 (pin run) +
+# 660/664/686 (acceptance run), tx 71/139/193 + 176/302/332 — a ~4.7x
+# spread under a busy host. Baselines are the best observed samples;
+# the hf-read -75% family covers the observed spread.
 #
 id	cmp	budget	baseline	margin	ref
 boot-shell	<=	4	1	x4	#2485
@@ -90,3 +98,5 @@ smp-scale-c4	<=	66754980	33377490	x2	#2485
 seat-mbox-burst	>=	24	32	-8	#2487; ring bound, measured post-fix on this host
 seat-key-latency	<=	1999554	999777	x2	#3040; new leg, best of K=3 on this host
 timer-jitter	<=	23480	4696	x5	#3040; new leg, best observed of four boots (tail: 17823)
+net-rx	>=	191.5	766	-75%	#3147; best of K=3 samples 766/693 (one serial-torn) on this host
+net-tx	>=	83	332	-75%	#3147; best of 6 same-shape samples across two runs on this host (71/139/176/193/302/332 — ~4.7x spread)

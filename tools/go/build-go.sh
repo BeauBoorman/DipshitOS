@@ -78,6 +78,9 @@ for prog in "${@:-$REPO/tools/go/hello.go}"; do
         # mapped-memory bound (`go-hello` run 11).
         goloadbss)  base="GOLOADBSS" ;;
         goread)     base="GOREAD" ;;
+        # M179a (#3147): the net-throughput bench fixture — dials the
+        # --net relay and moves a fixed 4 MiB stream rx or tx.
+        gonetrate)  base="GONETRATE" ;;
         # M119c (#2487): the seat-mailbox burst-absorption fixture.
         mburst)     base="GOMBURST" ;;
         gosyscall)  base="GOSYSCALL" ;;
@@ -102,7 +105,7 @@ for prog in "${@:-$REPO/tools/go/hello.go}"; do
         # `vi` surface, which is what puts it in this class.
         # M119c (#2487): GOMBURST also links `vi` (IpcSend/WmctlSeatPid) —
         # same class.
-        GOREAD | GOMBURST) strip="-s -w" ;;
+        GOREAD | GOMBURST | GONETRATE) strip="-s -w" ;;
         # M70c-S1P (#1525): the syscall-layer fixture — the std `syscall`
         # package for GOOS=virelai, which is smaller than `vi` but not small.
         GOSYSCALL) strip="-s -w" ;;

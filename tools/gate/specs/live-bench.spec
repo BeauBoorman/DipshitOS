@@ -18,7 +18,9 @@
 # re-drawn for luck. Legs with an OBSERVED instability run K=3 attempts
 # (smp{2,4}{a,b,c}, hfread{a,b,c}; M170f #3040 adds key{a,b,c} — the
 # three-runtime seat leg samples K=3 per the card's best-of-K instruction,
-# not an observed flake); the leg's verdict checks ONE aggregate
+# not an observed flake; M179a #3147 adds netrx{a,b,c}/nettx{a,b,c} — the
+# card's K=3 variance-sample shape, and like hf-read a no-metric attempt
+# is a hang and stays a hard FAIL); the leg's verdict checks ONE aggregate
 # — the direction-aware best sample (min for `<=`, max for `>=`: the
 # corpus metric is an achievable bound and each baseline was itself a
 # best-case observation; contention noise perturbs single samples, a real
@@ -45,10 +47,14 @@
 # `verdict=breach` receipt naming the row. Recorded on #2486.
 #
 # HOST PREREQUISITE (not hermetic — tools/go/README.md):
-# .build/go/{GOSH,GOSCALE,GOBIG,GOREAD,GOTABWM,GOSOUND,GOMBURST,GOCALC,
-# GOTOP}.ELF; setup stages them into the seeded share and refuses when
-# one is missing. TIMER.BIN rides the seeded zig-out bundle like every
-# other .BIN (card #3036's jitter mode is its M170f consumer).
+# .build/go/{GOSH,GOSCALE,GOBIG,GOREAD,GONETRATE,GOTABWM,GOSOUND,GOMBURST,
+# GOCALC,GOTOP}.ELF; setup stages them into the seeded share and refuses
+# when one is missing. TIMER.BIN rides the seeded zig-out bundle like
+# every other .BIN (card #3036's jitter mode is its M170f consumer). The
+# net legs also need the setup-started host servers: netrate.py `serve`
+# on 127.0.0.1:24660 (the rx source) and `sink` on 127.0.0.1:24661 (the
+# tx sink) behind the runner's `--net-tcp-respond :relay` endpoint — the
+# rows measure the guest stack PLUS the host relay, not a NAT path.
 
 vgate_name live-bench "M119b: run the benchmark corpus on VZ, fail on budget breach"
 vgate_share seed
@@ -170,6 +176,8 @@ def measure(row_id, ser):
         "seat-mbox-burst": r"mburst: accepted=(\d+) of \d+ refused=\d+",
         "go-rss": r"top: row pid=\d+ name=GOCALC\.ELF .* mem=(\d+)",
         "timer-jitter": r"timertest: jitter n=\d+ max_late_us=(\d+)",
+        "net-rx": r"gonetrate: rate dir=rx bytes=\d+ us=\d+ kib_s=(\d+)",
+        "net-tx": r"gonetrate: rate dir=tx bytes=\d+ us=\d+ kib_s=(\d+)",
     }
     found = re.findall(patterns[row_id], ser)
     if not found:
@@ -272,6 +280,7 @@ need = {
     "GOSCALE.ELF": "bash tools/go/build-go.sh tools/go/smpscale.go",
     "GOBIG.ELF": "bash tools/go/build-go.sh tools/go/gobig.go",
     "GOREAD.ELF": "bash tools/go/build-go.sh tools/go/goread.go",
+    "GONETRATE.ELF": "bash tools/go/build-go.sh tools/go/gonetrate.go",
     "GOTABWM.ELF": "bash tools/go/build-gotabwm.sh",
     "GOSOUND.ELF": "bash tools/go/build-gosound.sh",
     "GOMBURST.ELF": "bash tools/go/build-go.sh tools/go/mburst.go",
@@ -312,6 +321,35 @@ hdr = (b"RIFF" + struct.pack("<I", 36 + len(data)) + b"WAVE" +
 with open(os.path.join(d, "TONE.WAV"), "wb") as f:
     f.write(hdr + data)
 print("staged SND/TONE.WAV (%d bytes)" % (len(hdr) + len(data)))
+PY
+
+# The net legs' host side (M179a #3147): the runner's `--net-tcp-respond
+# :relay` endpoint proxies the guest's dial of 10.0.0.2:<port> to a real
+# TCP server on 127.0.0.1 — netrate.py is that server in both modes:
+# `serve` writes the deterministic 4 MiB pattern per connection (the rx
+# source), `sink` reads to EOF and logs `netsink: conn=N bytes=<n>
+# fnv=0x<hash>` per connection (the tx byte-count + checksum the card
+# assigns to the host). Leftover servers from a previous run are killed
+# by port, exactly like go-fetch-https; each server exits after CONNS
+# connections or its accept deadline, so nothing outlives the spec.
+vgate_setup_python <<'PY'
+import os, subprocess, sys, time
+rd = os.environ["RUN_DIR"]
+netrate = os.path.join(rd, "netrate.py")
+for port in (24660, 24661):
+    subprocess.run(["sh", "-c", "lsof -ti tcp:%d | xargs kill -9" % port],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+time.sleep(0.2)
+for mode, port in (("serve", 24660), ("sink", 24661)):
+    out = open(os.path.join(rd, "netrate-%s.out" % mode), "wb")
+    argv = [sys.executable, netrate, mode, str(port), "8"]
+    if mode == "sink":
+        argv.append(os.path.join(rd, "netsink.log"))
+    proc = subprocess.Popen(argv, stdout=out, stderr=subprocess.STDOUT,
+                            start_new_session=True)
+    print("live-bench: netrate %s pid=%d on 127.0.0.1:%d"
+          % (mode, proc.pid, port))
+time.sleep(0.3)
 PY
 
 # --- run 01: boot-shell -------------------------------------------------------
@@ -1075,11 +1113,434 @@ for p in sorted(glob.glob(os.path.join(os.environ["RUN_DIR"],
 benchlib.leg_verdict("seat-key-latency", samples)
 PY
 
+# --- runs 11a-c/12a-c: net-rx + net-tx (M179a #3147, K=3 samples) ----------
+# The first network bench rows: guest stack PLUS the host relay, not the
+# NAT path. GONETRATE.ELF dials the runner's `--net-tcp-respond :relay`
+# endpoint (10.0.0.2:24660 rx / :24661 tx), which forwards the byte stream
+# to a real host-side netrate.py source/sink the setup block started on
+# 127.0.0.1. Both directions move a FIXED 4 MiB deterministic stream:
+# rx hashes AND pattern-checks every received byte guest-side (the card's
+# checksum check), tx streams the same pattern for the host sink's
+# byte-count + FNV receipt. K=3 variance samples per direction like
+# hf-read, verdict on the direction-aware best; NO starvation tolerance —
+# a dial or stream that lands no `gonetrate: rate` in 300 s is a hang,
+# not a flake.
+vgate_file netrate.py <<'PY'
+#!/usr/bin/env python3
+"""netrate.py -- the live-bench net-rx/net-tx host source+sink (M179a #3147).
+
+Modes (started by this spec's setup block, killed by port on the next):
+
+  serve <port> <conns>          -- accept a connection, write the
+                                 deterministic 4 MiB pattern, close;
+                                 repeat for <conns> connections (one per
+                                 leg boot) or until the accept deadline.
+  sink  <port> <conns> <log>    -- accept a connection, read to EOF,
+                                 append `netsink: conn=N bytes=<n>
+                                 fnv=0x<hash>` to <log>; repeat.
+
+The pattern is a xorshift64* stream -- byte-for-byte the same generator
+tools/go/gonetrate.go runs -- so the checksum is a real comparison, not a
+constant both sides could drift away from. The python asserts import this
+module for expected_hex()/SIZE rather than recomputing their own.
+"""
+import socket
+import sys
+
+SEED = 0x9E3779B97F4A7C15
+SIZE = 4 * 1024 * 1024
+MASK = (1 << 64) - 1
+FNV_OFFSET = 0xcbf29ce484222325
+FNV_PRIME = 0x100000001b3
+
+_payload = None
+
+
+def payload():
+    """The deterministic 4 MiB stream — xorshift64*, 8 bytes little-endian
+    per step, identical to gonetrate.go's pattern generator."""
+    global _payload
+    if _payload is None:
+        out = bytearray()
+        s = SEED
+        while len(out) < SIZE:
+            s ^= s >> 12
+            s ^= (s << 25) & MASK
+            s ^= s >> 27
+            out += ((s * 2685821657736338717) & MASK).to_bytes(8, "little")
+        _payload = bytes(out[:SIZE])
+    return _payload
+
+
+def fnv(data):
+    """FNV-1a 64 — the same hash gonetrate.go folds over the wire bytes."""
+    h = FNV_OFFSET
+    for b in data:
+        h = ((h ^ b) * FNV_PRIME) & MASK
+    return h
+
+
+def expected_hex():
+    return "%016x" % fnv(payload())
+
+
+def listen(port):
+    ls = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    ls.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    ls.bind(("127.0.0.1", port))
+    ls.listen(4)
+    # Overall accept deadline: long enough to cover every leg of one spec
+    # run, so the server never outlives the bench that started it.
+    ls.settimeout(1800)
+    return ls
+
+
+def serve(port, conns):
+    ls = listen(port)
+    body = payload()
+    n = 0
+    while n < conns:
+        try:
+            c, _ = ls.accept()
+        except socket.timeout:
+            break
+        n += 1
+        try:
+            c.sendall(body)
+            c.shutdown(socket.SHUT_WR)
+            print("netsrc: conn=%d sent=%d" % (n, len(body)), flush=True)
+        except (BrokenPipeError, ConnectionResetError):
+            # The guest stops reading at exactly SIZE and FINs; a send that
+            # outlives it dies quietly — the stream is still byte-exact.
+            print("netsrc: conn=%d peer gone mid-send" % n, flush=True)
+        finally:
+            c.close()
+    ls.close()
+
+
+def sink(port, conns, logpath):
+    ls = listen(port)
+    n = 0
+    while n < conns:
+        try:
+            c, _ = ls.accept()
+        except socket.timeout:
+            break
+        n += 1
+        total = 0
+        h = FNV_OFFSET
+        c.settimeout(600)
+        try:
+            while True:
+                chunk = c.recv(1 << 16)
+                if not chunk:
+                    break
+                total += len(chunk)
+                for b in chunk:
+                    h = ((h ^ b) * FNV_PRIME) & MASK
+        except socket.timeout:
+            pass  # log whatever arrived — a short count names the failure
+        c.close()
+        line = "netsink: conn=%d bytes=%d fnv=0x%016x" % (n, total, h)
+        with open(logpath, "a") as f:
+            f.write(line + "\n")
+        print(line, flush=True)
+    ls.close()
+
+
+def main():
+    if len(sys.argv) >= 4 and sys.argv[1] == "serve":
+        serve(int(sys.argv[2]), int(sys.argv[3]))
+    elif len(sys.argv) >= 5 and sys.argv[1] == "sink":
+        sink(int(sys.argv[2]), int(sys.argv[3]), sys.argv[4])
+    else:
+        sys.exit("usage: netrate.py serve <port> <conns> | "
+                 "sink <port> <conns> <log>")
+
+
+if __name__ == "__main__":
+    main()
+PY
+
+vgate_file script-netrx.txt <<'EOF'
+net ip 10.0.0.1
+net arp 10.0.0.2
+exec GONETRATE.ELF rx 24660
+EOF
+vgate_file script-nettx.txt <<'EOF'
+net ip 10.0.0.1
+net arp 10.0.0.2
+exec GONETRATE.ELF tx 24661
+EOF
+
+vgate_run netrxa -- --net '$RUN_DIR/netrxa.bin' --net-arp-respond 10.0.0.2 \
+    --net-tcp-respond 10.0.0.2:24660:relay --net-tcp-respond-relay 127.0.0.1:24660 \
+    --script '$RUN_DIR/script-netrx.txt' \
+    --script-expect 'gonetrate: GONETRATE OK' --timeout 300
+vgate_run netrxb -- --net '$RUN_DIR/netrxb.bin' --net-arp-respond 10.0.0.2 \
+    --net-tcp-respond 10.0.0.2:24660:relay --net-tcp-respond-relay 127.0.0.1:24660 \
+    --script '$RUN_DIR/script-netrx.txt' \
+    --script-expect 'gonetrate: GONETRATE OK' --timeout 300
+vgate_run netrxc -- --net '$RUN_DIR/netrxc.bin' --net-arp-respond 10.0.0.2 \
+    --net-tcp-respond 10.0.0.2:24660:relay --net-tcp-respond-relay 127.0.0.1:24660 \
+    --script '$RUN_DIR/script-netrx.txt' \
+    --script-expect 'gonetrate: GONETRATE OK' --timeout 300
+
+vgate_assert netrxa serial-contains 'VirelaiOS kernel has seized control.'
+vgate_assert netrxa serial-contains 'exec: loaded GONETRATE.ELF'
+vgate_assert netrxa serial-contains 'gonetrate: cksum ok'
+vgate_assert netrxa serial-absent 'gonetrate: FAIL'
+vgate_assert netrxa serial-absent '[EXC]'
+vgate_assert netrxa python <<'PY'
+import os, re, sys
+sys.path.insert(0, os.environ["RUN_DIR"])
+import benchlib, netrate
+ser = open(os.environ["VG_SER"], errors="replace").read()
+v = benchlib.measure("net-rx", ser)
+if v is None:
+    sys.exit("bench: no `gonetrate: rate` line — a hung stream is a bug, "
+             "not a retryable flake")
+# The guest printed the FNV of the bytes it received; the host computes
+# the pattern's own FNV here — two implementations of the same stream,
+# not the guest's word against itself.
+m = re.search(r"gonetrate: fnv 0x([0-9a-f]{16})", ser)
+if not m:
+    sys.exit("bench: no `gonetrate: fnv` line — the checksum never printed")
+if m.group(1) != netrate.expected_hex():
+    sys.exit("bench: rx fnv %s != pattern fnv %s — the stream the guest "
+             "read is not the stream the source sent"
+             % (m.group(1), netrate.expected_hex()))
+benchlib.receipt("net-rx", v, "sample", run=os.environ["VG_TAG"])
+PY
+
+vgate_assert netrxb serial-contains 'VirelaiOS kernel has seized control.'
+vgate_assert netrxb serial-contains 'exec: loaded GONETRATE.ELF'
+vgate_assert netrxb serial-contains 'gonetrate: cksum ok'
+vgate_assert netrxb serial-absent 'gonetrate: FAIL'
+vgate_assert netrxb serial-absent '[EXC]'
+vgate_assert netrxb python <<'PY'
+import os, re, sys
+sys.path.insert(0, os.environ["RUN_DIR"])
+import benchlib, netrate
+ser = open(os.environ["VG_SER"], errors="replace").read()
+v = benchlib.measure("net-rx", ser)
+if v is None:
+    sys.exit("bench: no `gonetrate: rate` line — a hung stream is a bug, "
+             "not a retryable flake")
+m = re.search(r"gonetrate: fnv 0x([0-9a-f]{16})", ser)
+if not m:
+    sys.exit("bench: no `gonetrate: fnv` line — the checksum never printed")
+if m.group(1) != netrate.expected_hex():
+    sys.exit("bench: rx fnv %s != pattern fnv %s — the stream the guest "
+             "read is not the stream the source sent"
+             % (m.group(1), netrate.expected_hex()))
+benchlib.receipt("net-rx", v, "sample", run=os.environ["VG_TAG"])
+PY
+
+vgate_assert netrxc serial-contains 'VirelaiOS kernel has seized control.'
+vgate_assert netrxc serial-contains 'exec: loaded GONETRATE.ELF'
+vgate_assert netrxc serial-contains 'gonetrate: cksum ok'
+vgate_assert netrxc serial-absent 'gonetrate: FAIL'
+vgate_assert netrxc serial-absent '[EXC]'
+vgate_assert netrxc python <<'PY'
+import os, re, sys
+sys.path.insert(0, os.environ["RUN_DIR"])
+import benchlib, netrate
+ser = open(os.environ["VG_SER"], errors="replace").read()
+v = benchlib.measure("net-rx", ser)
+if v is None:
+    sys.exit("bench: no `gonetrate: rate` line — a hung stream is a bug, "
+             "not a retryable flake")
+m = re.search(r"gonetrate: fnv 0x([0-9a-f]{16})", ser)
+if not m:
+    sys.exit("bench: no `gonetrate: fnv` line — the checksum never printed")
+if m.group(1) != netrate.expected_hex():
+    sys.exit("bench: rx fnv %s != pattern fnv %s — the stream the guest "
+             "read is not the stream the source sent"
+             % (m.group(1), netrate.expected_hex()))
+benchlib.receipt("net-rx", v, "sample", run=os.environ["VG_TAG"])
+PY
+vgate_assert netrxc python <<'PY'
+import glob, os, sys
+sys.path.insert(0, os.environ["RUN_DIR"])
+import benchlib
+samples = []
+for p in sorted(glob.glob(os.path.join(os.environ["RUN_DIR"],
+                                       "vm-serial-netrx*.log"))):
+    v = benchlib.measure("net-rx",
+                         open(p, errors="replace").read())
+    if v is not None:
+        samples.append(v)
+benchlib.leg_verdict("net-rx", samples)
+PY
+
+vgate_run nettxa -- --net '$RUN_DIR/nettxa.bin' --net-arp-respond 10.0.0.2 \
+    --net-tcp-respond 10.0.0.2:24661:relay --net-tcp-respond-relay 127.0.0.1:24661 \
+    --script '$RUN_DIR/script-nettx.txt' \
+    --script-expect 'gonetrate: GONETRATE OK' --timeout 300
+vgate_run nettxb -- --net '$RUN_DIR/nettxb.bin' --net-arp-respond 10.0.0.2 \
+    --net-tcp-respond 10.0.0.2:24661:relay --net-tcp-respond-relay 127.0.0.1:24661 \
+    --script '$RUN_DIR/script-nettx.txt' \
+    --script-expect 'gonetrate: GONETRATE OK' --timeout 300
+vgate_run nettxc -- --net '$RUN_DIR/nettxc.bin' --net-arp-respond 10.0.0.2 \
+    --net-tcp-respond 10.0.0.2:24661:relay --net-tcp-respond-relay 127.0.0.1:24661 \
+    --script '$RUN_DIR/script-nettx.txt' \
+    --script-expect 'gonetrate: GONETRATE OK' --timeout 300
+
+vgate_assert nettxa serial-contains 'VirelaiOS kernel has seized control.'
+vgate_assert nettxa serial-contains 'exec: loaded GONETRATE.ELF'
+vgate_assert nettxa serial-absent 'gonetrate: FAIL'
+vgate_assert nettxa serial-absent '[EXC]'
+vgate_assert nettxa python <<'PY'
+import os, re, sys, time
+sys.path.insert(0, os.environ["RUN_DIR"])
+import benchlib, netrate
+ser = open(os.environ["VG_SER"], errors="replace").read()
+v = benchlib.measure("net-tx", ser)
+if v is None:
+    sys.exit("bench: no `gonetrate: rate` line — a hung stream is a bug, "
+             "not a retryable flake")
+m = re.search(r"gonetrate: fnv 0x([0-9a-f]{16})", ser)
+if not m:
+    sys.exit("bench: no `gonetrate: fnv` line — the checksum never printed")
+if m.group(1) != netrate.expected_hex():
+    sys.exit("bench: tx fnv %s != pattern fnv %s — the guest hashed bytes "
+             "that are not the stream" % (m.group(1), netrate.expected_hex()))
+# The host's half of the upload check: this leg's conn is ordinal #idx on
+# the shared sink; its receipt must land (bounded wait — the relay's
+# upstream FIN follows the guest's close by a beat) with the pinned byte
+# count and the same checksum.
+idx = {"nettxa": 1, "nettxb": 2, "nettxc": 3}.get(
+    os.environ["VG_TAG"].split("-")[0], 1)
+logp = os.path.join(os.environ["RUN_DIR"], "netsink.log")
+deadline = time.time() + 60
+while True:
+    receipts = []
+    if os.path.exists(logp):
+        receipts = [l for l in open(logp).read().splitlines()
+                    if l.startswith("netsink:")]
+    if len(receipts) >= idx:
+        break
+    if time.time() > deadline:
+        sys.exit("bench: sink logged %d receipt(s); this leg is #%d — the "
+                 "upload never reached the host" % (len(receipts), idx))
+    time.sleep(1)
+r = receipts[idx - 1]
+want = "bytes=%d" % netrate.SIZE
+if want not in r:
+    sys.exit("bench: sink receipt for this leg is not the pinned stream: " + r)
+if ("fnv=0x%s" % netrate.expected_hex()) not in r:
+    sys.exit("bench: sink checksum mismatch — the bytes on the wire are "
+             "not the stream: " + r)
+benchlib.receipt("net-tx", v, "sample", run=os.environ["VG_TAG"])
+PY
+
+vgate_assert nettxb serial-contains 'VirelaiOS kernel has seized control.'
+vgate_assert nettxb serial-contains 'exec: loaded GONETRATE.ELF'
+vgate_assert nettxb serial-absent 'gonetrate: FAIL'
+vgate_assert nettxb serial-absent '[EXC]'
+vgate_assert nettxb python <<'PY'
+import os, re, sys, time
+sys.path.insert(0, os.environ["RUN_DIR"])
+import benchlib, netrate
+ser = open(os.environ["VG_SER"], errors="replace").read()
+v = benchlib.measure("net-tx", ser)
+if v is None:
+    sys.exit("bench: no `gonetrate: rate` line — a hung stream is a bug, "
+             "not a retryable flake")
+m = re.search(r"gonetrate: fnv 0x([0-9a-f]{16})", ser)
+if not m:
+    sys.exit("bench: no `gonetrate: fnv` line — the checksum never printed")
+if m.group(1) != netrate.expected_hex():
+    sys.exit("bench: tx fnv %s != pattern fnv %s — the guest hashed bytes "
+             "that are not the stream" % (m.group(1), netrate.expected_hex()))
+idx = {"nettxa": 1, "nettxb": 2, "nettxc": 3}.get(
+    os.environ["VG_TAG"].split("-")[0], 1)
+logp = os.path.join(os.environ["RUN_DIR"], "netsink.log")
+deadline = time.time() + 60
+while True:
+    receipts = []
+    if os.path.exists(logp):
+        receipts = [l for l in open(logp).read().splitlines()
+                    if l.startswith("netsink:")]
+    if len(receipts) >= idx:
+        break
+    if time.time() > deadline:
+        sys.exit("bench: sink logged %d receipt(s); this leg is #%d — the "
+                 "upload never reached the host" % (len(receipts), idx))
+    time.sleep(1)
+r = receipts[idx - 1]
+want = "bytes=%d" % netrate.SIZE
+if want not in r:
+    sys.exit("bench: sink receipt for this leg is not the pinned stream: " + r)
+if ("fnv=0x%s" % netrate.expected_hex()) not in r:
+    sys.exit("bench: sink checksum mismatch — the bytes on the wire are "
+             "not the stream: " + r)
+benchlib.receipt("net-tx", v, "sample", run=os.environ["VG_TAG"])
+PY
+
+vgate_assert nettxc serial-contains 'VirelaiOS kernel has seized control.'
+vgate_assert nettxc serial-contains 'exec: loaded GONETRATE.ELF'
+vgate_assert nettxc serial-absent 'gonetrate: FAIL'
+vgate_assert nettxc serial-absent '[EXC]'
+vgate_assert nettxc python <<'PY'
+import os, re, sys, time
+sys.path.insert(0, os.environ["RUN_DIR"])
+import benchlib, netrate
+ser = open(os.environ["VG_SER"], errors="replace").read()
+v = benchlib.measure("net-tx", ser)
+if v is None:
+    sys.exit("bench: no `gonetrate: rate` line — a hung stream is a bug, "
+             "not a retryable flake")
+m = re.search(r"gonetrate: fnv 0x([0-9a-f]{16})", ser)
+if not m:
+    sys.exit("bench: no `gonetrate: fnv` line — the checksum never printed")
+if m.group(1) != netrate.expected_hex():
+    sys.exit("bench: tx fnv %s != pattern fnv %s — the guest hashed bytes "
+             "that are not the stream" % (m.group(1), netrate.expected_hex()))
+idx = {"nettxa": 1, "nettxb": 2, "nettxc": 3}.get(
+    os.environ["VG_TAG"].split("-")[0], 1)
+logp = os.path.join(os.environ["RUN_DIR"], "netsink.log")
+deadline = time.time() + 60
+while True:
+    receipts = []
+    if os.path.exists(logp):
+        receipts = [l for l in open(logp).read().splitlines()
+                    if l.startswith("netsink:")]
+    if len(receipts) >= idx:
+        break
+    if time.time() > deadline:
+        sys.exit("bench: sink logged %d receipt(s); this leg is #%d — the "
+                 "upload never reached the host" % (len(receipts), idx))
+    time.sleep(1)
+r = receipts[idx - 1]
+want = "bytes=%d" % netrate.SIZE
+if want not in r:
+    sys.exit("bench: sink receipt for this leg is not the pinned stream: " + r)
+if ("fnv=0x%s" % netrate.expected_hex()) not in r:
+    sys.exit("bench: sink checksum mismatch — the bytes on the wire are "
+             "not the stream: " + r)
+benchlib.receipt("net-tx", v, "sample", run=os.environ["VG_TAG"])
+PY
+vgate_assert nettxc python <<'PY'
+import glob, os, sys
+sys.path.insert(0, os.environ["RUN_DIR"])
+import benchlib
+samples = []
+for p in sorted(glob.glob(os.path.join(os.environ["RUN_DIR"],
+                                       "vm-serial-nettx*.log"))):
+    v = benchlib.measure("net-tx",
+                         open(p, errors="replace").read())
+    if v is not None:
+        samples.append(v)
+benchlib.leg_verdict("net-tx", samples)
+PY
+
 # --- trend table (#2936) -----------------------------------------------------
 # The last assert on the last leg: every measurement of the run is in
 # artifacts/bench/history.tsv by now, so print the regression table over
 # it. Informational — flags warn; they never fail the run.
-vgate_assert keyc python <<'PY'
+vgate_assert nettxc python <<'PY'
 import os, sys
 sys.path.insert(0, os.environ["RUN_DIR"])
 import benchlib
