@@ -30,6 +30,9 @@
 //	                 ≤16-entry ring of typed clips; arrows move, Enter
 //	                 pastes through slot 38 + the content-key forward,
 //	                 Esc dismisses (cliphist.go)
+//	ctrl-shift-3  -> publish the composed scanout as PNG to
+//	                 /host/SHOTS/SHOT-<unix>.png (M190b; screenshot.go)
+//	ctrl-shift-4  -> the same for the focused window's rect (M190b)
 //	ctrl-shift-[  -> nav back for the FOCUSED tab (M79e)
 //	ctrl-shift-]  -> nav forward (M79e)
 //	ctrl-z        -> undo dispatch (M121e): a focused tab answers through
@@ -567,6 +570,13 @@ func runSeatAction(action string, c chords.Chord) {
 		// M190a (#3236): ctrl+shift+i — the clipboard-history paste
 		// menu over the seat chrome.
 		applyClipMenu()
+	case "shot-full":
+		// M190b (#3237): the guest photographs itself — the composed
+		// scanout to /host/SHOTS/ as PNG (screenshot.go).
+		shotChord(false)
+	case "shot-window":
+		// M190b: the focused window's rect of the same scanout.
+		shotChord(true)
 	case "undo":
 		_ = applyUndo()
 	}

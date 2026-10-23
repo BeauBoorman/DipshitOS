@@ -117,6 +117,16 @@ var Global = Table{
 			"the last 16 typed clips; ctrl+shift+v is split-cycle (seat) " +
 			"and tty clipboard paste (kernel), so history rides 'i'",
 		"#3236 (M190a)", false},
+	// M190b (#3237): the guest photographs itself. The macOS pair, spelt
+	// in this table's modifier block — plain ctrl+digit is focus-index
+	// (M79f) and the kernel claims no digit chrome, so the shifted
+	// spellings are free at every scope.
+	{Chord{ModCtrl | ModShift, UsageDigit1 + 2}, "seat", ScopeSeat, "shot-full",
+		"publish the composed scanout as PNG to /host/SHOTS/SHOT-<unix>.png",
+		"#3237 (M190b)", false},
+	{Chord{ModCtrl | ModShift, UsageDigit1 + 3}, "seat", ScopeSeat, "shot-window",
+		"publish the focused window's rect of the scanout the same way",
+		"#3237 (M190b)", false},
 	// M121b (#2565): the tab-manipulation chords. Close rides ctrl+shift+w
 	// — the card's proposed ctrl+w is GOSH.ELF's kill-word (the app row
 	// below, "the chord the seat must never bind"); a seat row on it would

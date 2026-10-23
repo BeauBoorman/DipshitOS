@@ -195,6 +195,9 @@ func TestSeatRowsAreTheSeatSurface(t *testing.T) {
 		"sel-paste": 1, "close": 1, "move-left": 1, "move-right": 1,
 		"undo":      1,
 		"clip-menu": 1,
+		// M190b (#3237): the guest's own camera — full scanout and the
+		// focused window's rect of it.
+		"shot-full": 1, "shot-window": 1,
 		// M132a (#2752): the wave's reserved seat chords.
 		"pane-focus-left": 1, "pane-focus-right": 1, "pane-focus-up": 1,
 		"pane-focus-down": 1, "space-prev": 1, "space-next": 1,
@@ -238,6 +241,34 @@ func TestM121bTabChordPicks(t *testing.T) {
 	// kill-word, and a seat row would eat the editor's key.
 	if _, bound := got[Chord{ModCtrl, UsageW}]; bound {
 		t.Error("ctrl+w must stay unbound at the seat (GOSH.ELF kill-word)")
+	}
+}
+
+// TestM190bShotChordPicks pins the screenshot pair's spellings: the
+// macOS shot chords (3 = full screen, 4 = the window) spelt in this
+// table's modifier block — plain ctrl+digit is focus-index (M79f) and
+// must stay the ONLY unshifted digit owner at the seat. The collision
+// half of the acceptance is TestGlobalValidates.
+func TestM190bShotChordPicks(t *testing.T) {
+	want := map[Chord]string{
+		{ModCtrl | ModShift, UsageDigit1 + 2}: "shot-full",
+		{ModCtrl | ModShift, UsageDigit1 + 3}: "shot-window",
+	}
+	got := map[Chord]string{}
+	for _, r := range Global.SeatRows() {
+		got[r.Chord] = r.Action
+	}
+	for c, action := range want {
+		if got[c] != action {
+			t.Errorf("seat chord %s: action %q want %q", c, got[c], action)
+		}
+	}
+	// The unshifted digit row is focus-index's and stays so: a shot
+	// spelling without shift would eat M79f's rail-focus chord.
+	for i := uint8(0); i < 9; i++ {
+		if a := got[Chord{ModCtrl, UsageDigit1 + i}]; a != "focus-index" {
+			t.Errorf("ctrl+%d: action %q want focus-index", i+1, a)
+		}
 	}
 }
 

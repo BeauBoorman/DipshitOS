@@ -2422,7 +2422,7 @@ PY
 #
 #     x y z          a typed run into the scratch buffer -> `goedit: dirty`
 #     ?              M121c: the app's own '?' opens the registry-fed hint
-#                    overlay -> `goedit: hints n=40` + the `hints row` dump
+#                    overlay -> `goedit: hints n=43` + the `hints row` dump
 #     down x6        nav strokes the modal consumes -- dwell so the kind-4
 #                    snapshot armed on `hints n=` streams a frame while
 #                    the plate is still up
@@ -2539,11 +2539,13 @@ vgate_assert 09 serial-contains 'gotabwm: key'
 vgate_assert 09 serial-contains 'goedit: dirty'
 
 # --- M121c leg: '?' opens the registry-fed overlay; Esc closes it ---------
-# n= is the live registry's own row count for GOEDIT (the app's rows plus
-# the seat's globals -- 40 at this revision); the two rows below are the
-# journey's own chords made visible -- the palette's summon and the undo
+# n= is the live registry's own row count for GOEDIT (the app's 4 rows
+# plus the seat's globals): 40 at M121d, 41 once M190a's clip-menu row
+# landed, 43 with M190b's shot pair (the pin drifted one revision
+# behind across M190a — corrected here). The two rows below are the
+# journey's own chords made visible — the palette's summon and the undo
 # dispatch.
-vgate_assert 09 serial-contains 'goedit: hints n=40'
+vgate_assert 09 serial-contains 'goedit: hints n=43'
 vgate_assert 09 serial-contains 'goedit: hints row ctrl+shift+p summon the command palette'
 vgate_assert 09 serial-contains 'goedit: hints row ctrl+z dispatch undo'
 vgate_assert 09 serial-contains 'goedit: hints close'
@@ -2864,4 +2866,169 @@ for path in files:
 if not painted:
     sys.exit("no armed snapshot caught the painted badge rect")
 print("badge rect painted on the scanout in %s" % (painted,))
+PY
+
+# ---------------------------------------------------------------------------
+# M190b (#3237): the guest photographs itself. One ctrl-shift-3 makes the
+# seat write the composed scanout to /host/SHOTS/SHOT-<unix>.png through
+# the seat's own seams — vi.ScanoutRead in 12-row bands under
+# ScanoutReadMax, webrender.EncodePNG, vi.WriteFileSafe — then a toast
+# names the file. No host recorder is involved: the seat owns the only
+# pixel-complete view of the guest (M33 seam B), so the guest IS the
+# camera. The leg:
+#
+#   gosh: prompt           the first-boot starter tab is settled — the
+#                          scene is static (the grid carries no blinking
+#                          cursor; the only live repaints are the bottom
+#                          chrome band, the clock bottom-right and
+#                          toasts bottom-left)
+#   ctrl-shift-3           the seat chord fires — banded read, encode,
+#                          publish, toast
+#   gotabwm: shot saved    arms the kind-4 snapshot: snap-10-0.raw is the
+#                          same framebuffer's BGRX dump, and script a's
+#                          echo ends the run
+#
+# The python leg decodes the share's SHOT-*.png with the spec's own
+# decoder idiom (boot 04's — no library) and byte-compares two pinned
+# pixel rows against snap-10-0.raw. Rows 360 and 600 sit above the
+# bottom chrome band (y 692..712) that the shot's own toast and the
+# ticking clock can repaint between the read and the armed frame, so a
+# match is a byte-equality claim, never a tolerance.
+#
+# The between-run cleanup drops SESSION.TABS (boot 09's close+reopen
+# journey would otherwise restore its tabs here) and any stale SHOTS/
+# tree, so the boot lands on the first-boot workspace — a starter GOSH
+# — and the glob below can only name this boot's shot.
+# ---------------------------------------------------------------------------
+vgate_assert 09 python <<'PY'
+import os, shutil, sys
+share = os.environ.get("VG_SHARE")
+if not share:
+    sys.exit("no armed share exported to the assert (vgate_share arm?)")
+removed = []
+p = os.path.join(share, "SESSION.TABS")
+if os.path.exists(p):
+    os.remove(p)
+    removed.append("SESSION.TABS")
+d = os.path.join(share, "SHOTS")
+if os.path.isdir(d):
+    shutil.rmtree(d)
+    removed.append("SHOTS/")
+print("between-run cleanup: removed " +
+      (", ".join(removed) if removed else "nothing") +
+      " (boot 10 shoots a first-boot strip)")
+PY
+
+vgate_file script-10a.txt <<'EOF'
+echo rx-m190b-ok
+EOF
+
+vgate_run 10 -- \
+    --via-virtio --cvc-snap \
+    --screen '$RUN_DIR/screen-10' \
+    --snapshot-out '$RUN_DIR/snap-10' \
+    --snapshot-after 'gotabwm: shot saved' \
+    --input-chords 'ctrl-shift-3' \
+    --input-chords-after 'gosh: prompt' \
+    --script '$RUN_DIR/script-10a.txt' \
+    --script-after 'gotabwm: notify paint' \
+    --script-expect 'rx-m190b-ok' --timeout 300
+
+# The LIVE default seat on a first-boot strip: the starter GOSH is the
+# focused window the photograph includes.
+vgate_assert 10 serial-contains 'wm: autostart gotabwm (settings wm=gotabwm)'
+vgate_assert 10 serial-contains 'gotabwm: mode live'
+vgate_assert 10 serial-contains 'dogfood: seat'
+vgate_assert 10 serial-contains 'gosh: prompt'
+
+# The chord's own receipts: the publish marker carries path + mode +
+# shape, the toast names the file, and the toast paints (the
+# UI-surface half of every seat receipt).
+vgate_assert 10 serial-contains 'gotabwm: shot saved /host/SHOTS/SHOT-'
+vgate_assert 10 serial-contains ' mode=full w=1280 h=720 bytes='
+vgate_assert 10 serial-contains 'gotabwm: notify id=0 shot SHOT-'
+vgate_assert 10 serial-contains 'gotabwm: notify paint id=0'
+vgate_assert 10 serial-count 'gotabwm: shot saved ' 1
+vgate_assert 10 serial-absent 'gotabwm: shot refused'
+
+# The pixel leg: the share's SHOT-*.png decodes to the scanout's shape,
+# and two pinned rows byte-compare against the armed .raw snapshot.
+vgate_assert 10 python <<'PY'
+import glob, os, struct, sys, zlib
+share = os.environ["VG_SHARE"]
+rd = os.environ["RUN_DIR"]
+
+shots = sorted(glob.glob(os.path.join(share, "SHOTS", "SHOT-*.png")))
+if not shots:
+    sys.exit("no SHOTS/SHOT-*.png on the share after the shot chord")
+path = shots[-1]
+d = open(path, "rb").read()
+if d[:8] != b'\x89PNG\r\n\x1a\n':
+    sys.exit(os.path.basename(path) + " is not a PNG")
+pos = 8
+idat = b''
+w = h = ct = 0
+while pos < len(d):
+    ln, typ = struct.unpack('>I4s', d[pos:pos+8])
+    data = d[pos+8:pos+8+ln]
+    if typ == b'IHDR':
+        w, h, bd, ct = struct.unpack('>IIBB', data[:10])
+    elif typ == b'IDAT':
+        idat += data
+    pos += 12 + ln
+if (w, h) != (1280, 720):
+    sys.exit("SHOT png is %dx%d, want the scanout's 1280x720" % (w, h))
+raw = zlib.decompress(idat)
+bpp = 4 if ct == 6 else 3
+stride = w * bpp
+out = bytearray()
+prev = bytearray(stride)
+i = 0
+for y in range(h):
+    f = raw[i]
+    i += 1
+    line = bytearray(raw[i:i+stride])
+    i += stride
+    if f == 1:
+        for x in range(bpp, stride):
+            line[x] = (line[x] + line[x-bpp]) & 0xff
+    elif f == 2:
+        for x in range(stride):
+            line[x] = (line[x] + prev[x]) & 0xff
+    elif f == 3:
+        for x in range(stride):
+            a = line[x-bpp] if x >= bpp else 0
+            line[x] = (line[x] + ((a + prev[x]) >> 1)) & 0xff
+    elif f == 4:
+        for x in range(stride):
+            a = line[x-bpp] if x >= bpp else 0
+            b = prev[x]
+            c = prev[x-bpp] if x >= bpp else 0
+            p = a + b - c
+            pa, pb, pc = abs(p-a), abs(p-b), abs(p-c)
+            pr = a if (pa <= pb and pa <= pc) else (b if pb <= pc else c)
+            line[x] = (line[x] + pr) & 0xff
+    out += line
+    prev = line
+
+snaps = sorted(glob.glob(os.path.join(rd, "snap-10-*.raw")))
+if not snaps:
+    sys.exit("no snap-10-*.raw captured (the shot-saved arm never fired)")
+snap = open(snaps[0], "rb").read()
+if len(snap) < 1280*720*4:
+    sys.exit("snapshot raw is %d bytes, want %d" % (len(snap), 1280*720*4))
+
+# Rows 360 and 600 sit above the bottom chrome band (the toast and the
+# clock live at y 692..712 — the only repaints the armed frame can add).
+# Every RGB triple in each row must equal the raw's BGRX pixel.
+for y in (360, 600):
+    for x in range(1280):
+        o = (y * 1280 + x) * bpp
+        k = (y * 1280 + x) * 4
+        if (out[o], out[o+1], out[o+2]) != (snap[k+2], snap[k+1], snap[k]):
+            sys.exit("row %d x=%d: png #%02x%02x%02x != scanout #%02x%02x%02x"
+                     % (y, x, out[o], out[o+1], out[o+2],
+                        snap[k+2], snap[k+1], snap[k]))
+print("%s %dx%d ctype=%d: rows 360,600 byte-equal to the scanout (%s)"
+      % (os.path.basename(path), w, h, ct, os.path.basename(snaps[0])))
 PY
