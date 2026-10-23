@@ -416,3 +416,118 @@ if dark > 2:
 print("seat rail: %d/%d px DarkHC chrome tokens, %d plain-Dark strays"
       % (hc, len(samples), dark))
 PY
+
+# --- run 04 (M183a / #3171): the table past 24 — the second bank -----------
+# The between-runs python (tagged to run 03, the seed-before-next-boot
+# idiom) rewrites SETTINGS.TXT as a #v2 file carrying the full known union
+# — all 24 rows a pre-M183a table held AT its cap — plus eight overflow
+# rows. Run 04 boots on it: the kernel's own `settings list` must print
+# every row (rows 25..32 are the second bank — at the old cap they dropped
+# silently at load), GOSET opens on the same file and renders the whole
+# 32-row table (`goset: ready keys=32`), and a bare Enter publishes the
+# table crash-safe with the overflow rows still in it.
+#
+# The seat autostarts on the seeded file (run 02's rename left
+# GOTABWM.ELF on the share; the seed carries wm=gotabwm init=on). The
+# script's `settings list` is a kernel-console command — it runs under the
+# live seat the same way run 03's `exec` lines did. The seed also removes
+# SESSION.TABS: the seat's dogfood restore of the earlier runs' tabs would
+# re-open a second GOSET and leave focus on a restored window — the
+# Return below must land in THE exec'd panel (observed: with the stale
+# session, five apps re-opened and no save marker ever printed).
+
+vgate_assert 03 python <<'PY'
+import os, sys
+share = os.environ.get("VG_SHARE")
+if not share:
+    sys.exit("no armed share exported to the assert (vgate_share seed?)")
+# Drop the stale session so the seat opens only its first-boot workspace
+# (GOSH) and GOSET's declare is the last one — focus lands on the panel.
+sess = os.path.join(share, "SESSION.TABS")
+if os.path.exists(sess):
+    os.remove(sess)
+rows = [
+    # The nine seeded rows with their compiled defaults.
+    "hostname=virelai", "prompt=virelai>", "theme=dark", "scrollback=1000",
+    "shadow=off", "focus_follows_mouse=off", "shell=monitor",
+    "wm=gotabwm", "init=on",
+    # The fifteen accepted rows — the rest of the 24-row wave-5 union.
+    "palette_fg=00ff00", "palette_bg=101418", "palette_accent=3b82f6",
+    "font_size=medium", "keyboard_layout=us", "idle_minutes=5",
+    "notify_dnd=off", "notify_sound=on", "audio_volume=100",
+    "timezone=UTC", "data_root=host", "term_restart=stay",
+    "a11y.contrast=high", "a11y.reduce_motion=on", "a11y.text_scale=150",
+] + ["overflow%d=zz%d" % (i, i) for i in range(8)]
+body = "#v2\n" + "\n".join(rows) + "\n"
+p = os.path.join(share, "SETTINGS.TXT")
+open(p, "w", encoding="utf-8").write(body)
+print("run-04 seed: SETTINGS.TXT carries %d rows (24 union + 8 overflow), %d bytes"
+      % (len(rows), len(body)))
+PY
+
+vgate_file script-04.txt <<'EOF'
+settings list
+exec GOSET.ELF
+EOF
+
+# The script waits on the first-boot workspace's `gosh: attached`, NOT
+# `mode live` — the seat hands focus to the LAST declare, so GOSET must
+# exec after the workspace's shell settles or the later declare steals
+# the keystroke (the run-02 lesson). The bare Enter after
+# `goset: ready keys=32` is the crash-safe publish; the run ends on the
+# save marker (graded run — the program's own line).
+vgate_run 04 -- \
+    --screen '$RUN_DIR/screen-04' \
+    --via-virtio \
+    --script '$RUN_DIR/script-04.txt' \
+    --script-after 'gosh: attached' \
+    --input-chords 'return' \
+    --input-chords-after 'goset: ready keys=32' \
+    --script-expect 'goset: saved keys=32' --timeout 300
+
+vgate_assert 04 serial-contains 'VirelaiOS kernel has seized control.'
+vgate_assert 04 serial-contains 'wm: autostart gotabwm (settings wm=gotabwm)'
+vgate_assert 04 serial-contains 'gotabwm: mode live'
+vgate_assert 04 serial-contains 'gosh: attached'
+vgate_assert 04 serial-contains 'exec: loaded GOSET.ELF'
+vgate_assert 04 serial-contains 'goset: declare accepted'
+# The kernel table held all 32 rows — every seeded pair prints from
+# `settings list`, rows 25..32 included. Under the old cap the tail
+# dropped silently at load and the dict compare fails.
+vgate_assert 04 python <<'PY'
+import os, re, sys
+ser = open(os.environ["VG_SER"], errors="replace").read()
+m = re.search(r"^settings:\r?\n((?:  [^\n]*\r?\n)+)", ser, re.M)
+if not m:
+    sys.exit("no `settings list` block in the serial log")
+listed = {}
+for line in m.group(1).splitlines():
+    listed[line.strip()] = True
+want = [
+    "hostname=virelai", "prompt=virelai>", "theme=dark", "scrollback=1000",
+    "shadow=off", "focus_follows_mouse=off", "shell=monitor",
+    "wm=gotabwm", "init=on",
+    "palette_fg=00ff00", "palette_bg=101418", "palette_accent=3b82f6",
+    "font_size=medium", "keyboard_layout=us", "idle_minutes=5",
+    "notify_dnd=off", "notify_sound=on", "audio_volume=100",
+    "timezone=UTC", "data_root=host", "term_restart=stay",
+    "a11y.contrast=high", "a11y.reduce_motion=on", "a11y.text_scale=150",
+] + ["overflow%d=zz%d" % (i, i) for i in range(8)]
+missing = [w for w in want if w not in listed]
+if missing:
+    sys.exit("kernel table dropped %d seeded row(s): %s (listed %d)"
+             % (len(missing), missing, len(listed)))
+if len(listed) != len(want):
+    sys.exit("kernel table lists %d rows, want exactly %d"
+             % (len(listed), len(want)))
+print("kernel table: all %d seeded rows listed (rows 25+ ride the second bank)"
+      % len(listed))
+PY
+# GOSET decoded the same file and renders the whole list — the codec's
+# MaxKeys mirrors the banked cap, so keys=32 not 24.
+vgate_assert 04 serial-contains 'goset: ready keys=32 wm=gotabwm theme=dark'
+vgate_assert 04 serial-contains 'goset: saved keys=32'
+# And the overflow rows survived the panel's own crash-safe publish.
+vgate_assert 04 share-contains 'SETTINGS.TXT' 'overflow7=zz7'
+vgate_assert 04 serial-absent '[EXC] parking:'
+vgate_assert 04 serial-absent 'exited status=139'

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -66,7 +67,7 @@ func TestSettingsParseIsFailClosed(t *testing.T) {
 
 // The kernel's parser drops a malformed ROW and the load stands; only the
 // header gates the whole file. The decoder mirrors that (and caps the
-// table like the kernel's 17 entries / 32-byte keys / 64-byte values).
+// table like the kernel's max_entries / 32-byte keys / 64-byte values).
 func TestSettingsParseDropsRowsButStands(t *testing.T) {
 	ss, ok := Parse([]byte("#v2\nwm=none\nno_equals_here\n=emptykey\n"))
 	if !ok {
@@ -87,7 +88,7 @@ func TestSettingsParseDropsRowsButStands(t *testing.T) {
 	var b strings.Builder
 	b.WriteString("#v2\n")
 	for i := 0; i < MaxKeys+3; i++ {
-		b.WriteString("k" + strings.Repeat("x", i) + "=v\n")
+		b.WriteString("k" + strconv.Itoa(i) + "=v\n")
 	}
 	ss, ok = Parse([]byte(b.String()))
 	if !ok {
@@ -1040,10 +1041,14 @@ func TestA11yKeysAcceptedUnseededCyclableAndStrict(t *testing.T) {
 	}
 }
 
-// M165b (#2983): the cap moved to 24 so a file carrying EVERY known row
-// still loads intact — and its body stays far under MaxBody (the card's
-// condition for leaving MaxBody alone). Both halves are pinned here.
-func TestFullUnionTableFitsTheCapAndTheBody(t *testing.T) {
+// M183a (#3171): the union is 24 rows — no longer the cap. A file carrying
+// the union PLUS overflow rows up to MaxKeys loads intact (and stays far
+// under MaxBody, the card's condition for leaving the byte bound alone);
+// the row past the cap is still the one that drops. And a table under the
+// row cap whose rendered body exceeds MaxBody is refused by Save — the
+// kernel's stat gate would refuse that file WHOLE, so the panel must not
+// publish it.
+func TestFullUnionPlusOverflowFitsTheCapAndTheBody(t *testing.T) {
 	var rows []Setting
 	for _, k := range KnownKeys {
 		rows = append(rows, Setting{Key: k.Name, Val: k.Default})
@@ -1059,21 +1064,52 @@ func TestFullUnionTableFitsTheCapAndTheBody(t *testing.T) {
 	// term_restart is kernel-accepted but unknown to this codec — it is a
 	// real row a file can carry, so the union includes it.
 	rows = append(rows, Setting{Key: "term_restart", Val: "stay"})
-	if len(rows) != MaxKeys {
-		t.Fatalf("the known union is %d rows, want exactly MaxKeys %d", len(rows), MaxKeys)
+	if len(rows) != 24 {
+		t.Fatalf("the known union is %d rows, want the pinned wave-5 census of 24", len(rows))
 	}
 	body := Render(rows)
 	if len(body) > MaxBody {
 		t.Fatalf("the full union renders %d bytes, over MaxBody %d", len(body), MaxBody)
 	}
 	decoded, ok := Parse(body)
+	if !ok || len(decoded) != 24 {
+		t.Fatalf("the union dropped a row: rows=%d ok=%v", len(decoded), ok)
+	}
+	// Bank two: union + overflow rows up to MaxKeys all survive the parse.
+	for len(rows) < MaxKeys {
+		rows = append(rows, Setting{Key: "overflow" + strconv.Itoa(len(rows)), Val: "v"})
+	}
+	body = Render(rows)
+	if len(body) > MaxBody {
+		t.Fatalf("union + overflow renders %d bytes, over MaxBody %d", len(body), MaxBody)
+	}
+	decoded, ok = Parse(body)
 	if !ok || len(decoded) != MaxKeys {
-		t.Fatalf("the union dropped a row at the new cap: rows=%d ok=%v", len(decoded), ok)
+		t.Fatalf("the full table dropped a row at the new cap: rows=%d ok=%v", len(decoded), ok)
+	}
+	last := "overflow" + strconv.Itoa(MaxKeys-1)
+	if v, found := Get(decoded, last); !found || v != "v" {
+		t.Fatalf("the last overflow row = %q found=%v", v, found)
 	}
 	// And the row past the cap is the one that drops.
-	decoded, ok = Parse(append(body, []byte("overflow=v\n")...))
+	decoded, ok = Parse(append(body, []byte("one_too_many=v\n")...))
 	if !ok || len(decoded) != MaxKeys {
 		t.Fatalf("over-cap load = %d rows ok=%v, want the capped %d", len(decoded), ok, MaxKeys)
+	}
+	// A table under the row cap but over the byte bound refuses to publish:
+	// SaveFull, not a file the kernel would reject whole at boot.
+	var fat []Setting
+	for i := 0; i < MaxKeys/2; i++ {
+		fat = append(fat, Setting{
+			Key: strings.Repeat("k", MaxKey-4) + strconv.Itoa(i),
+			Val: strings.Repeat("x", MaxVal),
+		})
+	}
+	if len(Render(fat)) <= MaxBody {
+		t.Fatal("the fat fixture does not exceed MaxBody")
+	}
+	if rc := (File{Rows: fat, State: StateOK}).Save(); rc != SaveFull {
+		t.Fatalf("over-byte-cap save rc = %d, want SaveFull %d", rc, SaveFull)
 	}
 }
 

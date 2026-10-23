@@ -31,6 +31,14 @@
 //!   `settings set <key> <value>` persists immediately to the share by
 //!   updating in-memory state and writing `SETTINGS.TXT`.
 //!
+//! Capacity (M183a, issue #3171): the table is a bounded 48 entries — the
+//! original 24-row bank plus a second bank of overflow headroom for the
+//! rows later arcs add. The file grammar is unchanged (`#v2` header,
+//! `key=value` rows, the 2048-byte load/save buffer): a file past the row
+//! cap still drops its tail rows at load, `table_full` still refuses a
+//! `set` at the new cap, and a file past the byte bound is still refused
+//! whole.
+//!
 //! No libc, no POSIX, bounded BSS storage, no heap allocation.
 //!
 //! Version contract (Arc5 issue #247; amended M66b #1444):
@@ -132,14 +140,19 @@ pub const max_key_len: usize = 32;
 pub const max_val_len: usize = 64;
 // M99d (#2182): nine seeded rows plus the Go codec's ten optional/accepted
 // rows (palette_fg/bg/accent, font_size, keyboard_layout, idle_minutes,
-// notify_dnd, notify_sound, audio_volume, timezone) can all persist, with
-// one slot to spare — a file carrying the full union is 19 rows and must
-// load without dropping the tail. M100f (#2311) added data_root, and M165b
-// (#2983) adds the three a11y.* rows: the Go codec's union is 23 rows, and
-// with the kernel's own accepted term_restart the full known union is 24 —
-// the table holds every known row and the row past the cap is the one that
-// drops.
-pub const max_entries: usize = 24;
+// notify_dnd, notify_sound, audio_volume, timezone) can all persist — a
+// file carrying the full union is 19 rows and must load without dropping
+// the tail. M100f (#2311) added data_root, and M165b (#2983) added the
+// three a11y.* rows: the Go codec's union is 23 rows, and with the
+// kernel's own accepted term_restart the full known union is 24 — exactly
+// the wave-5 cap, which is why wave-5 cards could not take a settings row.
+// M183a (#3171): the table doubles into a bounded second bank — entries
+// 25..48 are pure headroom for the feature rows later arcs add. The
+// on-disk format does not change (still `#v2` + `key=value` inside the
+// 2048-byte file bound — no schema bump, nothing to migrate), so a
+// SETTINGS.TXT written by a 24-cap kernel loads whole; `table_full` still
+// names the refusal at the new cap.
+pub const max_entries: usize = 48;
 
 pub const Entry = struct {
     key: [max_key_len]u8 = @as([max_key_len]u8, @splat(@as(u8, 0))),
@@ -972,6 +985,74 @@ test "settings: a full legacy table can gain the persisted layout" {
     try std.testing.expect(apply_bytes(bytes[0..len]));
     try std.testing.expectEqualStrings("de", get("keyboard_layout").?);
     try std.testing.expectEqualStrings("v", get("extension7").?);
+}
+
+test "settings: the second bank loads a >24-row file whole; table_full at 48 (M183a #3171)" {
+    init();
+    defer {
+        // The fixture file carries font_size — restore the boot look for
+        // the rest of the suite (the M80i pattern above).
+        text.set_font_size(.small);
+        driving_award.apply_grid_font_size(.medium);
+        init();
+        apply_palette();
+    }
+    // The wave-5 census as a file: three seeded-key rows plus the fifteen
+    // accepted rows make the full known union — 24 distinct keys, the
+    // table a pre-M183a kernel held AT its cap. It must still load whole:
+    // nothing a 24-cap kernel or codec could write may drop.
+    const file_rows = [_][]const u8{
+        "hostname=oldbox",   "wm=tabwm",               "theme=light",
+        "palette_fg=00ff00", "palette_bg=101418",      "palette_accent=3b82f6",
+        "font_size=medium",  "keyboard_layout=us",     "idle_minutes=5",
+        "notify_dnd=off",    "notify_sound=on",        "audio_volume=40",
+        "timezone=UTC",      "data_root=host",         "term_restart=stay",
+        "a11y.contrast=off", "a11y.reduce_motion=off", "a11y.text_scale=100",
+    };
+    var buf: [2048]u8 = undefined;
+    var pos: usize = 0;
+    const hdr = "#v2\n";
+    @memcpy(buf[pos .. pos + hdr.len], hdr);
+    pos += hdr.len;
+    for (file_rows) |row| {
+        @memcpy(buf[pos .. pos + row.len], row);
+        pos += row.len;
+        buf[pos] = '\n';
+        pos += 1;
+    }
+    try std.testing.expect(apply_bytes(buf[0..pos]));
+    try std.testing.expectEqual(@as(usize, 24), count());
+    try std.testing.expectEqualStrings("oldbox", get_hostname());
+    try std.testing.expectEqualStrings("tabwm", wm_seat());
+    try std.testing.expectEqualStrings("stay", get("term_restart").?);
+
+    // Rows 25..32 ride the second bank — the row past the OLD cap no
+    // longer drops at load.
+    for (0..8) |i| {
+        const row = try std.fmt.bufPrint(buf[pos..], "overflow{d}=zz{d}\n", .{ i, i });
+        pos += row.len;
+    }
+    init();
+    try std.testing.expect(apply_bytes(buf[0..pos]));
+    try std.testing.expectEqual(@as(usize, 32), count());
+    try std.testing.expectEqualStrings("zz7", get("overflow7").?);
+    try std.testing.expectEqualStrings("stay", get("term_restart").?);
+
+    // `set` still refuses at the cap, under the same verdict name.
+    for (count()..max_entries) |i| {
+        var kb: [16]u8 = undefined;
+        const name = try std.fmt.bufPrint(&kb, "pad{d}", .{i});
+        try std.testing.expectEqual(SetResult.ok, set(name, "v"));
+    }
+    try std.testing.expectEqual(SetResult.table_full, set("one_too_many", "v"));
+
+    // And the grown table round-trips through the unchanged byte format.
+    var out: [2048]u8 = undefined;
+    const n = serialize(&out);
+    init();
+    try std.testing.expect(apply_bytes(out[0..n]));
+    try std.testing.expectEqual(max_entries, count());
+    try std.testing.expectEqualStrings("zz7", get("overflow7").?);
 }
 
 test "settings: the a11y rows are accepted, unseeded, and persist once set (M165b #2983)" {

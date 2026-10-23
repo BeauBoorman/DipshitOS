@@ -1,6 +1,7 @@
 package main
 
 import (
+	"strconv"
 	"strings"
 	"testing"
 
@@ -338,6 +339,68 @@ func TestViewSwitchMarkerIsUniform(t *testing.T) {
 		if !found {
 			t.Fatalf("no %q in %v", w, *events)
 		}
+	}
+}
+
+// M183a (#3171): a file past the old 24-row cap is one table to GOSET —
+// the union plus the overflow rows all render (the unknown rows kept, not
+// offered), the summary counts them, and the save path is bounded by the
+// codec's cap, not by 24.
+func TestOverflowTableListsEveryRowAndSavesWhole(t *testing.T) {
+	a := newStripPanel()
+	var rows []settings.Setting
+	for _, k := range settings.KnownKeys {
+		rows = append(rows, settings.Setting{Key: k.Name, Val: k.Default})
+	}
+	for _, group := range [][]settings.Key{
+		settings.PaletteKeys, settings.FontKeys, settings.KeyboardLayoutKeys,
+		settings.IdleKeys, settings.NotifyKeys, settings.NotifySoundKeys,
+		settings.VolumeKeys, settings.TimezoneKeys, settings.DataRootKeys,
+		settings.A11yKeys,
+	} {
+		for _, k := range group {
+			rows = append(rows, settings.Setting{Key: k.Name, Val: k.Default})
+		}
+	}
+	// The kernel accepts term_restart; the codec does not know it — a real
+	// file can carry it, so the union does.
+	rows = append(rows, settings.Setting{Key: "term_restart", Val: "stay"})
+	if len(rows) != 24 {
+		t.Fatalf("the known union is %d rows, want the pinned wave-5 census of 24", len(rows))
+	}
+	for i := 0; i < 8; i++ {
+		rows = append(rows, settings.Setting{Key: "overflow" + strconv.Itoa(i), Val: "zz"})
+	}
+	a.disp = (settings.File{Rows: rows, State: settings.StateOK}).Display()
+	if len(a.disp) != 32 {
+		t.Fatalf("display = %d rows, want the whole 32-row table", len(a.disp))
+	}
+	if got := len(a.labels()); got != 32 {
+		t.Fatalf("labels = %d, want one per row", got)
+	}
+	if got := a.summary(); got != "keys=32 wm=gotabwm theme=dark" {
+		t.Fatalf("summary = %q", got)
+	}
+	// The unknown overflow rows render as kept — preserved, not editable.
+	if lab := a.labels()[31]; !strings.Contains(lab, "overflow7") || !strings.Contains(lab, "(kept)") {
+		t.Fatalf("overflow row label = %q", lab)
+	}
+	// A 32-row save is NOT refused at either the old or the new row cap: the
+	// publish attempt runs and fails on the host's syscall seam — the status
+	// names the attempt's rc, never the "settings full" refusal.
+	a.save()
+	if !strings.HasPrefix(a.status, "save failed rc=") {
+		t.Fatalf("32-row save status = %q — the panel must not refuse at the cap", a.status)
+	}
+	// Past MaxKeys the codec's own named refusal stands.
+	full := append([]settings.Setting(nil), a.disp...)
+	for len(full) < settings.MaxKeys+1 {
+		full = append(full, settings.Setting{Key: "pad" + strconv.Itoa(len(full)), Val: "v"})
+	}
+	a.disp = full
+	a.save()
+	if a.status != "settings full: the kernel cannot load this table whole" {
+		t.Fatalf("over-cap save status = %q", a.status)
 	}
 }
 

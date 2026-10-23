@@ -506,7 +506,7 @@ func (a *panel) save() {
 	}
 	if rc == settings.SaveFull {
 		vi.ConsoleLine(markerRefused)
-		a.status = "settings full: remove a row before saving"
+		a.status = "settings full: the kernel cannot load this table whole"
 		return
 	}
 	if rc < 0 {

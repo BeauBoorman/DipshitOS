@@ -38,17 +38,17 @@ const (
 	// panel writes it too, through the same crash-safe publish.
 	Path = "/host/SETTINGS.TXT"
 	// Caps mirror the kernel's table (max_entries / max_key_len / max_val_len)
-	// and its bounded load buffer. M99d (#2182) raised the cap 18 -> 20: the
-	// Go-side union (nine seeded + palette 3 + font_size + keyboard_layout +
-	// idle_minutes + notify_dnd + timezone + notify_sound + audio_volume) is
-	// 19 rows, and the table must hold a file that carries all of them with
-	// one slot to spare rather than silently dropping the last row at load.
-	// M100f (#2311) added data_root, and M165b (#2983) adds the three a11y.*
-	// rows, so the cap moved 20 -> 24: the Go union is 23 rows, the kernel's
-	// own accepted term_restart makes the full known union 24, and the row
-	// past the cap is the one that drops. MaxBody stays 2048 — a file
-	// carrying every known row is a few hundred bytes, pinned by test.
-	MaxKeys = 24
+	// and its bounded load buffer. M99d (#2182) raised the cap 18 -> 20, then
+	// M100f (#2311) added data_root and M165b (#2983) the three a11y.* rows:
+	// the Go union is 23 rows, and the kernel's own accepted term_restart
+	// makes the full known union 24 — exactly the wave-5 cap, which is why
+	// wave-5 cards could not take a settings row. M183a (#3171) lifts the row
+	// cap 24 -> 48 as a bounded second bank: the union now leaves headroom,
+	// and the row past 48 is the one that drops. MaxBody stays 2048 — the
+	// byte bound every reader of this file shares is unchanged; the union
+	// plus realistic overflow rows is still a few hundred bytes, pinned by
+	// test.
+	MaxKeys = 48
 	MaxKey  = 32
 	MaxVal  = 64
 	MaxBody = 2048
@@ -766,8 +766,8 @@ func (f File) Display() []Setting {
 	for _, group := range [][]Key{IdleKeys, NotifyKeys, TimezoneKeys} {
 		for _, k := range group {
 			if _, ok := Get(f.Rows, k.Name); !ok {
-				// A legacy table may already have 16 rows; its visible layout
-				// row fills the kernel's 17-slot cap. Do not make an unchanged
+				// A legacy table may already sit at the cap; its visible
+				// layout row fills the last slot. Do not make an unchanged
 				// GOSET save fail merely by displaying one more default.
 				if len(out) >= MaxKeys {
 					break
@@ -803,9 +803,12 @@ func Load() File {
 // Save publishes the file's rows crash-safe (vi.WriteFileSafe: temp + fsync +
 // delete/rename). It REFUSES a corrupt decode — a panel must never launder a
 // file the kernel refused — returning SaveRefused. SaveFull likewise refuses a
-// table the kernel would truncate. Any other negative return is the kernel
-// code of the step that failed; every failure removes the temp, so the target
-// is either the old bytes, the new bytes, or absent (defaults).
+// table the kernel cannot load intact: more rows than the kernel's banked
+// table holds, or a rendered body over MaxBody — the kernel's stat gate
+// refuses an oversized file WHOLE, so publishing it would write a file the
+// boot reads as corrupt. Any other negative return is the kernel code of the
+// step that failed; every failure removes the temp, so the target is either
+// the old bytes, the new bytes, or absent (defaults).
 func (f File) Save() int64 {
 	if f.State == StateCorrupt {
 		return SaveRefused
@@ -813,7 +816,11 @@ func (f File) Save() int64 {
 	if len(f.Rows) > MaxKeys {
 		return SaveFull
 	}
-	return vi.WriteFileSafe(Path, Render(f.Rows))
+	body := Render(f.Rows)
+	if len(body) > MaxBody {
+		return SaveFull
+	}
+	return vi.WriteFileSafe(Path, body)
 }
 
 // Subscribe asks the active WM seat to deliver changes to key to this tab.
