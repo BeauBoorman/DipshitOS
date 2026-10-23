@@ -194,7 +194,7 @@ func (a *app) draw() {
 		text(padX, h-footerH+16, "[g]rant consent — writes the grant row   [d]eny — keeps the ambient floor", th.Muted)
 		return
 	}
-	text(padX, h-footerH+4, "[l]ist [/]search [enter]detail [i]nstall [u]pdate [r]ollback [d]elete [q]uit", th.Muted)
+	text(padX, h-footerH+4, "[l]ist [/]search [enter]detail [i]nstall [u]pdate [r]ollback [p]in [d]elete [q]uit", th.Muted)
 	if a.status != "" {
 		text(padX, h-footerH+16, a.status, th.Accent)
 	}

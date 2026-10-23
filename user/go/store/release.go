@@ -73,7 +73,9 @@ func foldReleaseOps(changes []Change) map[atomKey]string {
 // four required ones plus the optional ADR 0055 catalog fields when the
 // publisher declared them ("" means the const is absent). Caps carries
 // ADR 0054 D10's ReleaseCaps — the signed word request STORE proposes
-// and GOSET consent lands (nil = the release declares nothing).
+// and GOSET consent lands (nil = the release declares nothing). Depends
+// carries ADR 0055 D8's ReleaseDepends — the release names install
+// resolves before this one lands (nil = the release needs nothing).
 type release struct {
 	Name        string
 	Version     string
@@ -85,6 +87,7 @@ type release struct {
 	Category    string
 	IconSHA256  string
 	Caps        []string
+	Depends     []string
 }
 
 // requiredConsts are the four const declarations a release.go must carry
@@ -110,6 +113,7 @@ var optionalConsts = []string{
 	"ReleaseCategory",
 	"ReleaseIconSHA256",
 	"ReleaseCaps",
+	"ReleaseDepends",
 }
 
 // releaseCategories is the closed category vocabulary (ADR 0055 D3.1) —
@@ -265,6 +269,13 @@ func parseRelease(src []byte) (*release, error) {
 		}
 		r.Caps = caps
 	}
+	if v, ok := vals["ReleaseDepends"]; ok {
+		deps, err := parseReleaseDepends(v)
+		if err != nil {
+			return nil, err
+		}
+		r.Depends = deps
+	}
 	return r, nil
 }
 
@@ -305,6 +316,44 @@ func parseReleaseCaps(v string) ([]string, error) {
 		if seen[w] {
 			out = append(out, w)
 		}
+	}
+	return out, nil
+}
+
+// releaseDependsMax bounds the ReleaseDepends const (ADR 0055 D8):
+// eight max-length stems joined by commas is 8*28+7 = 231 bytes, so 255
+// is far past honest and keeps a manifest from staging a dep-list soak.
+// maxDeps bounds the list itself — a manifest naming more needs a
+// bundle, not a longer row.
+const (
+	releaseDependsMax = 255
+	maxDeps           = 8
+)
+
+// parseReleaseDepends enforces the ReleaseDepends grammar — a
+// comma-separated list of distinct release names, each in the
+// ReleaseName stem grammar (a dep names the release it needs by its
+// signed ReleaseName, the same identity APPS.TXT and the catalog fold
+// know). A present const must carry at least one name: an empty
+// declaration is a manifest bug, not a semantic. `dep_invalid` names a
+// malformed shape (empty const, empty element, duplicate, oversize,
+// over-long list); the stems themselves refuse through the same
+// name_invalid grammar validate runs.
+func parseReleaseDepends(v string) ([]string, error) {
+	if v == "" || len(v) > releaseDependsMax {
+		return nil, refuse("dep_invalid", "ReleaseDepends")
+	}
+	var out []string
+	seen := map[string]bool{}
+	for _, w := range strings.Split(v, ",") {
+		if w == "" || seen[w] || !validStem(w) {
+			return nil, refuse("dep_invalid", w)
+		}
+		seen[w] = true
+		out = append(out, w)
+	}
+	if len(out) > maxDeps {
+		return nil, refuse("dep_invalid", "ReleaseDepends")
 	}
 	return out, nil
 }

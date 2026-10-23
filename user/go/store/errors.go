@@ -27,12 +27,13 @@ var ConsoleFn = vi.ConsoleLine
 
 // LegFn, when non-nil, runs at each signed-pipeline leg boundary — the
 // verify → fetch → sha → publish → .prev narration the GOSTORE GUI renders
-// live. Names: "sync" (clone/pull), "verify", "fetch", "sha", "publish",
-// "prev" (the post-commit .prev rotation — the leg a killed update must
-// leave survivable). Leg calls fire at leg START, so a hook that pauses on
-// "prev" freezes the pipeline after the STORE.TXT commit and before the
-// .prev rotation — exactly the torn-publish shape readRollbackBytes
-// recovers from .prev.new.
+// live. Names: "sync" (clone/pull), "verify", "fetch", "deps" (ADR 0055
+// D8 dependency resolution), "sha", "publish", "prev" (the post-commit
+// .prev rotation — the leg a killed update must leave survivable). Leg
+// calls fire at leg START, so a hook that pauses on "prev" freezes the
+// pipeline after the STORE.TXT commit and before the .prev rotation —
+// exactly the torn-publish shape readRollbackBytes recovers from
+// .prev.new.
 var LegFn func(leg string)
 
 // emitLeg reports a leg boundary to the optional LegFn hook.

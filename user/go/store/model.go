@@ -17,8 +17,11 @@ import (
 //     the delivered ELF), and ReleaseManifestRow (the schema-v2 APPS.TXT
 //     row the installer writes). ADR 0055 D3 adds the optional signed
 //     catalog consts ReleaseSummary/ReleaseDescription/ReleaseCategory/
-//     ReleaseIconSHA256, and D5 derives the publisher fingerprint from
-//     the head Change's author key — never from a manifest const.
+//     ReleaseIconSHA256, D5 derives the publisher fingerprint from the
+//     head Change's author key — never from a manifest const, D8 adds
+//     ReleaseDepends (the releases install resolves first), and D9's
+//     per-head member <stream>/<head-change-hex>/ carries the bytes a
+//     `store pin` to a prior signed head verifies against.
 //   - A release is a signed Change touching release.go. The Change
 //     signature plus each Op's new_hash authenticates the atom text, so
 //     the manifest consts are authenticated end to end by the M101b

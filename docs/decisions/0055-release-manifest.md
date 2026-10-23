@@ -225,6 +225,66 @@ because the icon is per-stream anyway (one release stream = one app).
   independent, already in tree). An icon the renderer cannot decode is
   not displayed; it is not an install refusal.
 
+### D8. `ReleaseDepends` — dependency rows (#3188)
+
+An optional signed const may declare the releases a release needs:
+
+| const | presence | grammar + bound | named refusal |
+|---|---|---|---|
+| `ReleaseDepends` | optional | comma-separated list of 1–8 distinct release names, each in the `ReleaseName` stem grammar; the whole const ≤ 255 bytes | `dep_invalid` |
+
+A dep names a release by its signed `ReleaseName` — the same identity
+APPS.TXT rows, STORE.TXT entries, and the catalog fold already know.
+Deps are not streams: the name travels the manifest, and resolution
+finds whichever remote stream's head release carries the name (streams
+are a delivery detail; the release name is the contract).
+
+**Resolution** runs on every manifest-consuming install verb —
+`install`, `update`, `pin` — after the manifest parses and before the
+release's own ELF is fetched:
+
+- A dep whose `<NAME>.ELF` already carries an APPS.TXT row is satisfied
+  in place; no re-verify, no re-fetch.
+- Otherwise the remote catalog fold (the D3 enumeration) finds the
+  stream whose head release declares the name, and that stream is
+  installed first — recursively, with the requesting release's name on
+  the ancestor chain.
+- No remote stream's head release carrying the name → `dep_missing
+  <name>`; a dep naming a release already on the ancestor chain →
+  `dep_cycle <name>`; an ancestor chain deeper than 8 → `dep_depth`;
+  a dep install that refuses → `dep_failed <name>` (the inner refusal
+  prints its own name first).
+- A refused dep leaves the requesting release uninstalled: deps land
+  before the requester, never alongside a partial state.
+
+### D9. The pinned-head member (#3188)
+
+`store pin <name> [<head>]` installs the release a *prior signed head*
+carried — the stream is an append-only fold, so pinning is a verify
+operation: the committed prefix already authenticates the older
+manifest's atom set, and only the bytes are needed. The bytes live on
+the untrusted channel as member **`<stream>/<head-change-id-hex>/`** —
+the head Change's id rendered as 32 lowercase hex (dashes stripped), a
+directory holding `release.go` and `<NAME>.ELF` exactly as the head
+drop carries them.
+
+- The member name is derived from the signed log, not declared by the
+  publisher — a channel path a hostile writer cannot aim at a different
+  head.
+- `store publish` drops the member unconditionally at publish time; an
+  absent member at pin time is `channel_missing`, a tampered one is
+  `release_mismatch`/`elf_mismatch` — the same refusals the head drop
+  earns.
+- Reader rule identical to D4: the pinned manifest verifies
+  atom-for-atom against the fold at the selected change and is then
+  parsed under the full grammar — an old manifest stays honest.
+- Selection refusals: `unsigned_history` (the selector — or the
+  recorded installed head — is not in the verified committed prefix),
+  `head_already` (the selector is the current head), `no_such_release`
+  (the selection's fold carries no release atoms, or no prior release
+  head exists).
+
+
 ## Non-goals
 
 | Non-goal | Where it goes |

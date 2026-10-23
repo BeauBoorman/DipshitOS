@@ -23,6 +23,7 @@ type PublishArgs struct {
 	Row      string // --row=<row>: the schema-v2 APPS.TXT row
 	Summary  string // --summary=<s>: optional ADR 0055 ReleaseSummary
 	Category string // --category=<c>: optional ADR 0055 ReleaseCategory
+	Depends  string // --depends=<csv>: optional ADR 0055 D8 ReleaseDepends
 }
 
 // Publish implements `store publish <NAME> <elf> --src=<dir> --version=<v>
@@ -92,6 +93,13 @@ func Publish(fs FS, root string, a PublishArgs) int {
 		}
 		rel.Category = a.Category
 	}
+	if a.Depends != "" {
+		deps, err := parseReleaseDepends(a.Depends)
+		if err != nil {
+			return runErr(err)
+		}
+		rel.Depends = deps
+	}
 
 	// Render canonically and round-trip: the file that lands is exactly
 	// the file parseRelease certifies.
@@ -102,7 +110,8 @@ func Publish(fs FS, root string, a PublishArgs) int {
 	}
 	if parsed.Name != rel.Name || parsed.Version != rel.Version ||
 		parsed.ELFSHA256 != rel.ELFSHA256 || parsed.ManifestRow != rel.ManifestRow ||
-		parsed.Summary != rel.Summary || parsed.Category != rel.Category {
+		parsed.Summary != rel.Summary || parsed.Category != rel.Category ||
+		strings.Join(parsed.Depends, ",") != strings.Join(rel.Depends, ",") {
 		return runErr(refuse("release_malformed", ""))
 	}
 
@@ -205,6 +214,43 @@ func Publish(fs FS, root string, a PublishArgs) int {
 	if err := fs.WriteFileSafe(dropDir+"/"+bin, elf); err != nil {
 		return runErr(err)
 	}
+
+	// The pinned member (ADR 0055 D9): <drop>/<stream>/<head hex>/ keeps
+	// this release's bytes fetchable at its own signed head — a release
+	// whose pinned member is absent can never be selected by `store
+	// pin`, so publish drops it unconditionally (the `unchanged` case
+	// included — it backfills drops cut before the convention). After a
+	// commit the record's head is the new signed head; re-read it.
+	head := ""
+	if unchanged {
+		if st.Head != nil {
+			head = *st.Head
+		}
+	} else {
+		_, byIDNow, err := listStreamRecords(fs, root)
+		if err != nil {
+			return runErr(err)
+		}
+		if cur := byIDNow[id]; cur != nil && cur.Head != nil {
+			head = *cur.Head
+		}
+	}
+	if head == "" {
+		// A commit that landed no head cannot name a pinned member —
+		// the stream and its record disagree.
+		return runErr(refuse("stream_malformed", st.Name))
+	}
+	pinDir := dropDir + "/" + changeIDHex(head)
+	if err := ensureDirAll(fs, pinDir); err != nil {
+		return runErr(err)
+	}
+	if err := fs.WriteFileSafe(pinDir+"/"+releaseFile, src); err != nil {
+		return runErr(err)
+	}
+	if err := fs.WriteFileSafe(pinDir+"/"+bin, elf); err != nil {
+		return runErr(err)
+	}
+	ConsoleFn("store: pinned " + rel.Name + " head=" + head)
 	line := "store: published " + rel.Name + " " + rel.Version +
 		" sha256=" + rel.ELFSHA256 + " drop=" + dropDir
 	if unchanged {
@@ -233,6 +279,9 @@ func renderRelease(r *release) []byte {
 	}
 	if r.Category != "" {
 		emit("ReleaseCategory", r.Category)
+	}
+	if len(r.Depends) > 0 {
+		emit("ReleaseDepends", strings.Join(r.Depends, ","))
 	}
 	return []byte(b.String())
 }

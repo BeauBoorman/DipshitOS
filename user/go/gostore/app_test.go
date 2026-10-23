@@ -412,3 +412,30 @@ func TestConsentPromptIsModal(t *testing.T) {
 		t.Fatal("'q' answered the prompt")
 	}
 }
+
+// M188c (#3188): 'p' drives store.Pin on the selected row's release name
+// with an empty selector — the verb picks the prior signed head itself.
+func TestPinTargetsReleaseName(t *testing.T) {
+	a, lines := testApp(t)
+	loadFn = func(store.FS, string, string, string, string, string) ([]store.CatalogRow, error) {
+		return rowsFixture(), nil
+	}
+	a.refresh()
+	var gotName, gotSel, gotRemote, gotChannel string
+	pinFn = func(fs store.FS, root, name, sel, remote, channel string) int {
+		gotName, gotSel, gotRemote, gotChannel = name, sel, remote, channel
+		return 0
+	}
+	a.key(vi.Event{Kind: vi.EvKeyDown, Arg1: 'p'})
+	if gotName != "GOHELLO" || gotSel != "" || gotRemote != a.remote || gotChannel != a.channel {
+		t.Fatalf("pin(%q,%q,%q,%q)", gotName, gotSel, gotRemote, gotChannel)
+	}
+	var start, done bool
+	for _, l := range *lines {
+		start = start || l == "gostore: pin GOHELLO"
+		done = done || l == "gostore: pin rc=0"
+	}
+	if !start || !done {
+		t.Fatalf("pin op markers missing in %v", *lines)
+	}
+}

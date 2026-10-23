@@ -1,6 +1,6 @@
 // Command gostore is GOSTORE.ELF — M110c (#2405): the store's human path.
-// Browse, search, detail, install, update, remove and rollback as a tab
-// on the default seat — every action driving the SAME signed legs
+// Browse, search, detail, install, update, remove, rollback and pin as a
+// tab on the default seat — every action driving the SAME signed legs
 // STORE.ELF runs (verify → fetch → sha → publish → .prev) through
 // package virelai/store linked in-process. STORE stays the scriptable
 // path and the only implementation: GOSTORE never execs STORE.ELF —
@@ -8,7 +8,8 @@
 // (16 > 13 user task slots; the seat's proven envelope is three).
 //
 // Keys: j/k or arrows move, Enter toggles the detail card, / searches,
-// l reloads the catalog, i/u/r/d act on the selected row, q quits.
+// l reloads the catalog, i/u/r/d act on the selected row, p pins the
+// prior signed head (M188c #3188), q quits.
 // argv: --remote=<flintd addr> --channel=<dir|http://...> --kill-at=<leg>
 // (the gate's mid-publish kill point; never set in real use).
 package main

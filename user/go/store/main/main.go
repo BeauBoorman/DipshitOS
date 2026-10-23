@@ -10,10 +10,12 @@
 // --category filters), `store info <name>`, `store install <stream>`,
 // `store update <name>`, `store rollback <name>`, `store remove <name>`
 // (M101d #2316 adds the last two plus the STORE.TXT prev-head state
-// file; M110b #2404 adds the catalog ls/info), and `store publish`
+// file; M110b #2404 adds the catalog ls/info), `store publish`
 // (M181a: the producer half — writes the signed manifest into a FLINT
 // workspace, commits it under agent-sign, and drops the layout install
-// reads).
+// reads), and `store pin <name> [<head>]` (M188c #3188: signed-head
+// rollback — selects a prior signed head in the verified fold and
+// installs the release it carried).
 // Every failure is a named refusal — `store: refuse <code>` — and a
 // failed install leaves zero partial state: no ELF, no row, no
 // half-copied file.
@@ -52,11 +54,11 @@ func cliArgs(raw []string) []string {
 	return raw
 }
 
-const usageLine = "store: usage: store ls [--remote=<r>] [--channel=<dir|http://ip:port/base>] [--search=<s>] [--category=<c>] | store info <name> [--remote=<r>] [--channel=<dir|http://ip:port/base>] | store install <stream> [--remote=<r>] [--channel=<dir|http://ip:port/base>] | store update <name> [--remote=<r>] [--channel=<dir|http://ip:port/base>] | store rollback <name> | store remove <name> | store consent <name> | store decline <name> | store publish <NAME> <elf> --src=<dir> --version=<v> --stream=<s> [--channel=<dir>] [--row=<row>] [--summary=<s>] [--category=<c>]"
+const usageLine = "store: usage: store ls [--remote=<r>] [--channel=<dir|http://ip:port/base>] [--search=<s>] [--category=<c>] | store info <name> [--remote=<r>] [--channel=<dir|http://ip:port/base>] | store install <stream> [--remote=<r>] [--channel=<dir|http://ip:port/base>] | store update <name> [--remote=<r>] [--channel=<dir|http://ip:port/base>] | store rollback <name> | store pin <name|stream> [<head>] [--remote=<r>] [--channel=<dir|http://ip:port/base>] | store remove <name> | store consent <name> | store decline <name> | store publish <NAME> <elf> --src=<dir> --version=<v> --stream=<s> [--channel=<dir>] [--row=<row>] [--summary=<s>] [--category=<c>] [--depends=<csv>]"
 
 // publishUsage is the one verb whose flag vocabulary the shared loop
 // below would reject as unknown, so publish parses its own args.
-const publishUsage = "store: usage: store publish <NAME> <elf> --src=<dir> --version=<v> --stream=<s> [--channel=<dir>] [--row=<row>] [--summary=<s>] [--category=<c>]"
+const publishUsage = "store: usage: store publish <NAME> <elf> --src=<dir> --version=<v> --stream=<s> [--channel=<dir>] [--row=<row>] [--summary=<s>] [--category=<c>] [--depends=<csv>]"
 
 func runPublish(args []string) int {
 	var a store.PublishArgs
@@ -77,6 +79,8 @@ func runPublish(args []string) int {
 			a.Summary = f[len("--summary="):]
 		case strings.HasPrefix(f, "--category="):
 			a.Category = f[len("--category="):]
+		case strings.HasPrefix(f, "--depends="):
+			a.Depends = f[len("--depends="):]
 		case strings.HasPrefix(f, "-"):
 			store.ConsoleFn(publishUsage)
 			return 2
@@ -151,6 +155,16 @@ func run(args []string) int {
 			return 2
 		}
 		return store.Rollback(store.GuestFS{}, positional[0])
+	case "pin":
+		if len(positional) < 1 || len(positional) > 2 || filterArgs {
+			store.ConsoleFn(usageLine)
+			return 2
+		}
+		sel := ""
+		if len(positional) == 2 {
+			sel = positional[1]
+		}
+		return store.Pin(store.GuestFS{}, store.DefaultStoreRoot, positional[0], sel, remoteFlag, channelArg)
 	case "remove":
 		if len(positional) != 1 || remoteFlag != "" || channelArg != "" || filterArgs {
 			store.ConsoleFn(usageLine)

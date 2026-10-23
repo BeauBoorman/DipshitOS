@@ -158,6 +158,12 @@ func Update(fs FS, root, arg, remoteFlag, channelArg string) int {
 	if rel.Name+".ELF" != bin {
 		return runErr(refuse("name_mismatch", bin))
 	}
+	// An update's manifest can declare deps the install predates — the
+	// same D8 resolution runs before the new bytes land.
+	emitLeg("deps")
+	if err := resolveDeps(fs, root, rel, remoteFlag, channelArg, []string{rel.Name}); err != nil {
+		return runErr(err)
+	}
 	elf, err := ch.fetch(ent.Stream+"/"+bin, MaxELFBytes)
 	if err != nil {
 		return runErr(err)
@@ -172,45 +178,15 @@ func Update(fs FS, root, arg, remoteFlag, channelArg string) int {
 		return runErr(err)
 	}
 
-	// Publish. Order is the crash contract: the new rollback bytes are
-	// STAGED at <bin>.prev.new first — .prev is never written before
-	// the commit, so a kill anywhere in the publish cannot destroy the
-	// target the still-live PrevSHA names — the ELF itself is the
-	// atomic point (old install live until it lands), the row follows
-	// the bytes it launches, the STORE.TXT swap commits, and only then
-	// does .prev rotate to the staged bytes. A kill between the commit
-	// and the rotation leaves PrevSHA naming <bin>.prev.new instead of
-	// <bin>.prev; rollback reads whichever matches.
+	// Publish. Order is the crash contract — see swapPublish.
 	emitLeg("publish")
-	if err := fs.WriteFileSafe(prevStagePath(bin), curELF); err != nil {
-		return runErr(err)
-	}
-	if err := fs.WriteFileSafe("/host/"+bin, elf); err != nil {
-		return runErr(err)
-	}
-	if err := fs.WriteFileSafe(appsPath, manifest); err != nil {
-		return runErr(err)
-	}
-	state, err := loadState(fs)
-	if err != nil {
-		return runErr(err)
-	}
-	state[bin] = &storeEntry{
+	if err := swapPublish(fs, bin, curELF, elf, manifest, &storeEntry{
 		Name: bin, Stream: ent.Stream, Head: newHead, SHA256: rel.ELFSHA256,
 		Caps:     strings.Join(rel.Caps, ","),
 		PrevHead: ent.Head, PrevSHA: ent.SHA256, PrevCaps: ent.Caps, PrevRow: curRow,
-	}
-	if err := fs.WriteFileSafe(statePath, renderState(state)); err != nil {
+	}); err != nil {
 		return runErr(err)
 	}
-	emitLeg("prev")
-	if err := fs.WriteFileSafe(prevPath(bin), curELF); err != nil {
-		// Committed already: the staged file still hashes to the new
-		// PrevSHA, so rollback is not lost — but the rotation did not
-		// land, so report the publish incomplete.
-		return runErr(err)
-	}
-	_ = fs.Remove(prevStagePath(bin))
 	ConsoleFn("store: update ok " + bin + " version=" + rel.Version)
 	grantSync(bin, rel.ELFSHA256, rel.Caps)
 	return 0
@@ -220,6 +196,45 @@ func Update(fs FS, root, arg, remoteFlag, channelArg string) int {
 // rollback bytes to BEFORE the state commit — never <bin>.prev~, which
 // is WriteFileSafe's own sacrificial temp for <bin>.prev.
 func prevStagePath(bin string) string { return "/host/" + bin + ".prev.new" }
+
+// swapPublish runs the staged-publish contract update and pin's
+// installed path share. Order is the crash contract: the new rollback
+// bytes are STAGED at <bin>.prev.new first — .prev is never written
+// before the commit, so a kill anywhere in the publish cannot destroy
+// the target the still-live PrevSHA names — the ELF itself is the
+// atomic point (old install live until it lands), the row follows the
+// bytes it launches, the STORE.TXT swap commits, and only then does
+// .prev rotate to the staged bytes. A kill between the commit and the
+// rotation leaves PrevSHA naming <bin>.prev.new instead of <bin>.prev;
+// rollback reads whichever matches.
+func swapPublish(fs FS, bin string, curELF, newELF, manifest []byte, e *storeEntry) error {
+	if err := fs.WriteFileSafe(prevStagePath(bin), curELF); err != nil {
+		return err
+	}
+	if err := fs.WriteFileSafe("/host/"+bin, newELF); err != nil {
+		return err
+	}
+	if err := fs.WriteFileSafe(appsPath, manifest); err != nil {
+		return err
+	}
+	state, err := loadState(fs)
+	if err != nil {
+		return err
+	}
+	state[bin] = e
+	if err := fs.WriteFileSafe(statePath, renderState(state)); err != nil {
+		return err
+	}
+	emitLeg("prev")
+	if err := fs.WriteFileSafe(prevPath(bin), curELF); err != nil {
+		// Committed already: the staged file still hashes to the new
+		// PrevSHA, so rollback is not lost — but the rotation did not
+		// land, so report the publish incomplete.
+		return err
+	}
+	_ = fs.Remove(prevStagePath(bin))
+	return nil
+}
 
 // readRollbackBytes returns the retained prior ELF: whichever of
 // <bin>.prev (the published name) or <bin>.prev.new (the staged survivor

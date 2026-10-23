@@ -542,6 +542,15 @@ func Info(fs FS, root, sel, remoteFlag, channelArg string) int {
 // Install implements `store install <stream> [--remote=<r>]
 // [--channel=<c>]` — the full verify-then-install pipeline.
 func Install(fs FS, root, stream, remoteFlag, channelArg string) int {
+	return install(fs, root, stream, remoteFlag, channelArg, nil)
+}
+
+// install is the pipeline body; chain carries the ReleaseNames already
+// being resolved above this call (ADR 0055 D8) — an install reached as
+// another release's dependency runs the identical legs with the
+// ancestor names on the chain so a declared cycle refuses instead of
+// recursing forever.
+func install(fs FS, root, stream, remoteFlag, channelArg string, chain []string) int {
 	ConsoleFn("store: install " + stream)
 	remote, err := resolveRemote(fs, root, remoteFlag)
 	if err != nil {
@@ -622,6 +631,15 @@ func Install(fs FS, root, stream, remoteFlag, channelArg string) int {
 	}
 	bin := rel.Name + ".ELF"
 
+	// The signed dep rows resolve BEFORE this release's own fetch —
+	// a release lands after what it needs, and a missing dep refuses
+	// the parent by name without touching a byte of state.
+	emitLeg("deps")
+	if err := resolveDeps(fs, root, rel, remoteFlag, channelArg,
+		append(append([]string{}, chain...), rel.Name)); err != nil {
+		return runErr(err)
+	}
+
 	// 4. Fetch + hash the ELF.
 	elf, err := ch.fetch(stream+"/"+bin, MaxELFBytes)
 	if err != nil {
@@ -633,11 +651,38 @@ func Install(fs FS, root, stream, remoteFlag, channelArg string) int {
 		return runErr(refuse("elf_mismatch", bin))
 	}
 
-	// 5. Install checks against current state.
+	// 5. Install checks + publish — the tail materializeRelease shares
+	// with pin's untracked-stream path.
 	lines, err := loadManifest(fs)
 	if err != nil {
 		return runErr(err)
 	}
+	emitLeg("publish")
+	headID := ""
+	if st.Head != nil {
+		headID = *st.Head
+	}
+	done, err := materializeRelease(fs, rel, elf, bin, st.Name, headID, lines)
+	if err != nil {
+		return runErr(err)
+	}
+	if done {
+		return 0
+	}
+	ConsoleFn("store: install ok " + bin + " version=" + rel.Version)
+	grantSync(bin, rel.ELFSHA256, rel.Caps)
+	return 0
+}
+
+// materializeRelease publishes a verified release: ELF first (orphan =
+// harmless), then the row, then the STORE.TXT entry — a failed later
+// write reverts the earlier ones so no partial state survives. headID is
+// the stream head the entry records ("" skips the state write — never
+// write a line the parser would refuse back: an empty head self-corrupts
+// STORE.TXT, and an untracked install beats a malformed state file).
+// done=true means the idempotent already-installed path ran (it prints
+// its own line and grant-syncs); the caller prints the ok line.
+func materializeRelease(fs FS, rel *release, elf []byte, bin, streamName, headID string, lines []string) (bool, error) {
 	if manifestHasBin(lines, bin) {
 		// Idempotent re-install: the signed manifest covers the same ELF,
 		// and a gate/shell retry after a raced exec must not read as a
@@ -646,7 +691,7 @@ func Install(fs FS, root, stream, remoteFlag, channelArg string) int {
 		have, rerr := fs.ReadFile("/host/"+bin, MaxELFBytes)
 		haveSum := sshlib.SHA256Sum(have)
 		if rerr != nil || sshlib.EncodeHex(haveSum[:]) != rel.ELFSHA256 {
-			return runErr(refuse("already_installed", bin))
+			return false, refuse("already_installed", bin)
 		}
 		// Converge to a tracked install: a crash between the APPS.TXT
 		// write and the state write left a live app STORE.TXT does not
@@ -656,23 +701,23 @@ func Install(fs FS, root, stream, remoteFlag, channelArg string) int {
 		if cur, _ := manifestRowFor(lines, bin); cur != rel.ManifestRow {
 			manifest, merr := manifestWithBinRow(lines, bin, rel.ManifestRow)
 			if merr != nil {
-				return runErr(merr)
+				return false, merr
 			}
 			if err := fs.WriteFileSafe(appsPath, manifest); err != nil {
-				return runErr(err)
+				return false, err
 			}
 		}
-		if st.Head != nil {
+		if headID != "" {
 			if err := writeStateEntry(fs, &storeEntry{
-				Name: bin, Stream: st.Name, Head: *st.Head, SHA256: rel.ELFSHA256,
+				Name: bin, Stream: streamName, Head: headID, SHA256: rel.ELFSHA256,
 				Caps: strings.Join(rel.Caps, ","),
 			}); err != nil {
-				return runErr(err)
+				return false, err
 			}
 		}
 		ConsoleFn("store: already installed " + bin + " version=" + rel.Version)
 		grantSync(bin, rel.ELFSHA256, rel.Caps)
-		return 0
+		return true, nil
 	}
 	elfPath := "/host/" + bin
 	elfOrphan := false
@@ -685,51 +730,117 @@ func Install(fs FS, root, stream, remoteFlag, channelArg string) int {
 		have, rerr := fs.ReadFile(elfPath, MaxELFBytes)
 		sum := sshlib.SHA256Sum(have)
 		if rerr != nil || sshlib.EncodeHex(sum[:]) != rel.ELFSHA256 {
-			return runErr(refuse("elf_exists", bin))
+			return false, refuse("elf_exists", bin)
 		}
 		elfOrphan = true
 	}
 	manifest, err := manifestWithRow(lines, rel.ManifestRow)
 	if err != nil {
-		return runErr(err)
+		return false, err
 	}
 
-	// 6. Publish: ELF first (orphan = harmless), then the row, then the
+	// Publish: ELF first (orphan = harmless), then the row, then the
 	// STORE.TXT entry — a failed later write reverts the earlier ones so
 	// no partial state survives. The entry records the resolved stream
 	// NAME (not the selector: `update` pulls it by name) and head id;
 	// prev_* stay empty until the first update retains a rollback target.
-	emitLeg("publish")
 	if !elfOrphan {
 		if err := fs.WriteFileSafe(elfPath, elf); err != nil {
-			return runErr(err)
+			return false, err
 		}
 	}
 	if err := fs.WriteFileSafe(appsPath, manifest); err != nil {
 		if !elfOrphan {
 			_ = fs.Remove(elfPath)
 		}
-		return runErr(err)
+		return false, err
 	}
-	// st.Head is non-nil in practice — a headless stream has no changes,
-	// so release_missing refused earlier — but never write a state line
-	// the parser would refuse back (an empty head self-corrupts
-	// STORE.TXT): an untracked install beats a malformed state file.
-	if st.Head != nil {
+	if headID != "" {
 		if err := writeStateEntry(fs, &storeEntry{
-			Name: bin, Stream: st.Name, Head: *st.Head, SHA256: rel.ELFSHA256,
+			Name: bin, Stream: streamName, Head: headID, SHA256: rel.ELFSHA256,
 			Caps: strings.Join(rel.Caps, ","),
 		}); err != nil {
 			_ = fs.WriteFileSafe(appsPath, renderManifest(lines))
 			if !elfOrphan {
 				_ = fs.Remove(elfPath)
 			}
-			return runErr(err)
+			return false, err
 		}
 	}
-	ConsoleFn("store: install ok " + bin + " version=" + rel.Version)
-	grantSync(bin, rel.ELFSHA256, rel.Caps)
-	return 0
+	return false, nil
+}
+
+// maxDepChain bounds the ancestor chain a dep resolution may descend —
+// the same bound the manifest grammar puts on one release's dep list.
+// A deeper nest is a packaging bug (or a cycle the name check would
+// catch one level later); dep_depth names it.
+const maxDepChain = 8
+
+// resolveDeps runs ADR 0055 D8 resolution for a verified release's
+// declared ReleaseDepends, in declared order: a dep already carrying an
+// APPS.TXT row is satisfied in place; otherwise the remote's signed
+// catalog fold finds the stream whose head release names it and that
+// stream installs first — recursively, with this release's name on the
+// chain. chain already includes rel.Name, so a dep naming an in-flight
+// ancestor is dep_cycle, a dep no remote stream's head release carries
+// is dep_missing, and a dep install that refuses propagates as
+// dep_failed naming the leg that could not land.
+func resolveDeps(fs FS, root string, rel *release, remoteFlag, channelArg string, chain []string) error {
+	if len(rel.Depends) == 0 {
+		return nil
+	}
+	if len(chain) > maxDepChain {
+		return refuse("dep_depth", rel.Name)
+	}
+	lines, err := loadManifest(fs)
+	if err != nil {
+		return err
+	}
+	var rows []CatalogRow
+	scanned := false
+	for _, dep := range rel.Depends {
+		for _, c := range chain {
+			if c == dep {
+				return refuse("dep_cycle", dep)
+			}
+		}
+		bin := dep + ".ELF"
+		if manifestHasBin(lines, bin) {
+			ConsoleFn("store: dep " + dep + " present")
+			continue
+		}
+		if !scanned {
+			// One catalog fold per resolution pass — the dep lookup is
+			// the same signed enumeration ls runs; per-stream refusals
+			// inside it are tolerated, a stream that cannot fold simply
+			// is not a candidate.
+			rows, err = LoadCatalog(fs, root, remoteFlag, channelArg, "", "")
+			if err != nil {
+				return err
+			}
+			scanned = true
+		}
+		stream := ""
+		for i := range rows {
+			if r := &rows[i]; r.Status == "release" && r.Entry != nil &&
+				r.Entry.Rel != nil && r.Entry.Rel.Name == dep {
+				stream = r.Stream
+				break
+			}
+		}
+		if stream == "" {
+			return refuse("dep_missing", dep)
+		}
+		ConsoleFn("store: dep " + dep + " -> " + stream)
+		if rc := install(fs, root, stream, remoteFlag, channelArg, chain); rc != 0 {
+			return refuse("dep_failed", dep)
+		}
+		// The dep's row landed — later deps read the manifest fresh.
+		if lines, err = loadManifest(fs); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // Remove implements `store remove <name>` — the symmetric case: the

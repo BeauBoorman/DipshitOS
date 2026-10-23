@@ -39,10 +39,14 @@ import (
 //	STORE_FIXTURE_ICON_SHA256  ReleaseIconSHA256               (optional)
 //	STORE_FIXTURE_CAPS         ReleaseCaps                     (ADR 0054 D10 optional;
 //	                           "" omits the const)
+//	STORE_FIXTURE_DEPENDS      ReleaseDepends                  (ADR 0055 D8 optional;
+//	                           "" omits the const)
 //	STORE_FIXTURE_PREV_CAPS    parent's ReleaseCaps            (default: same as
 //	                           STORE_FIXTURE_CAPS — the widening-update leg sets
 //	                           a different parent ask; "-" = parent omitted it,
 //	                           which emits an `add` op for the const)
+//	STORE_FIXTURE_PREV_DEPS    parent's ReleaseDepends         (default: same as
+//	                           STORE_FIXTURE_DEPENDS; "-" = parent omitted it)
 //	STORE_FIXTURE_STREAM       stream uuid                     (default `rel`)
 //	STORE_FIXTURE_CHANGE       change id                       (default genChangeID)
 //	STORE_FIXTURE_PARENT       parent change id                (default none)
@@ -89,6 +93,7 @@ func genAtomID(name string) string {
 type genSpec struct {
 	elfPath, name, version, row, streamID, changeID, parent, msg string
 	summary, description, category, iconSHA, caps, prevCaps      string
+	deps, prevDeps                                               string
 	seedFile, seedHex, prevElf, prevVersion, dir, tag            string
 	ts                                                           int64
 	empty                                                        bool
@@ -125,6 +130,8 @@ func genSpecFromEnv(t *testing.T) genSpec {
 		"STORE_FIXTURE_ICON_SHA256":  &s.iconSHA,
 		"STORE_FIXTURE_CAPS":         &s.caps,
 		"STORE_FIXTURE_PREV_CAPS":    &s.prevCaps,
+		"STORE_FIXTURE_DEPENDS":      &s.deps,
+		"STORE_FIXTURE_PREV_DEPS":    &s.prevDeps,
 		"STORE_FIXTURE_STREAM":       &s.streamID,
 		"STORE_FIXTURE_CHANGE":       &s.changeID,
 		"STORE_FIXTURE_MSG":          &s.msg,
@@ -201,7 +208,7 @@ func TestGenReleaseFixture(t *testing.T) {
 			t.Fatalf("parse: %v", err)
 		}
 		wantAtoms := len(requiredConsts)
-		for _, opt := range []string{spec.summary, spec.description, spec.category, spec.iconSHA, spec.caps} {
+		for _, opt := range []string{spec.summary, spec.description, spec.category, spec.iconSHA, spec.caps, spec.deps} {
 			if opt != "" {
 				wantAtoms++
 			}
@@ -232,6 +239,13 @@ func TestGenReleaseFixture(t *testing.T) {
 				prevSpec.caps = spec.prevCaps
 				if prevSpec.caps == "-" {
 					prevSpec.caps = ""
+				}
+			}
+			prevSpec.deps = spec.deps
+			if spec.prevDeps != "" {
+				prevSpec.deps = spec.prevDeps
+				if prevSpec.deps == "-" {
+					prevSpec.deps = ""
 				}
 			}
 			prevAtoms, err := p.Parse("release.go",
@@ -338,6 +352,9 @@ func (s genSpec) releaseGo(elfSHA, version string) string {
 	}
 	if s.caps != "" {
 		emit("ReleaseCaps", s.caps)
+	}
+	if s.deps != "" {
+		emit("ReleaseDepends", s.deps)
 	}
 	return b.String()
 }

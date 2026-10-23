@@ -3,8 +3,8 @@ package store
 // api.go — the exported M110c (#2405) surface GOSTORE.ELF links against.
 // STORE stays the only implementation of the signed legs; this file adds
 // no behavior, it only names what the in-process caller needs beyond the
-// verbs themselves (Ls/Info/Install/Update/Rollback/Remove, ConsoleFn,
-// LegFn, LoadCatalog, CatalogRow).
+// verbs themselves (Ls/Info/Install/Update/Rollback/Pin/Remove,
+// ConsoleFn, LegFn, LoadCatalog, CatalogRow).
 
 // Release is the signed release manifest on a CatalogEntry — an alias so
 // the GUI renders the authenticated consts by name.

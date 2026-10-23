@@ -143,6 +143,17 @@ func TestPublishHappy(t *testing.T) {
 	defer restore()
 	fs := fx.fs
 	seedPublisher(t, fs)
+	// The fake commit lands a real signed head — the pinned member's
+	// directory name comes off the post-commit record head.
+	prevExec := execFn
+	execFn = func(name string, args ...string) (int64, error) {
+		rc, err := fx.run(name, args...)
+		if strings.Contains(strings.Join(args, " "), "commit") {
+			mintSignedReleaseChange(t, fs, pubRelPath, pubChangeID)
+		}
+		return rc, err
+	}
+	defer func() { execFn = prevExec }()
 
 	rc := Publish(fs, DefaultStoreRoot, pubArgs())
 	if rc != 0 {

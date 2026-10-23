@@ -1986,3 +1986,346 @@ func TestRemoveCleansState(t *testing.T) {
 		t.Fatalf("remove left state: %v %v", state, err)
 	}
 }
+
+// ---- M188c (#3188): ReleaseDepends + signed-head pin ------------------------
+
+// releaseGoDep renders a manifest carrying ReleaseDepends beside the
+// required four.
+func releaseGoDep(name, version string, elf []byte, row, deps string) []byte {
+	src := string(releaseGo(name, version, elf, row))
+	if deps != "" {
+		src += fmt.Sprintf("const ReleaseDepends = %q\n", deps)
+	}
+	return []byte(src)
+}
+
+func TestParseReleaseDepends(t *testing.T) {
+	src := releaseGoDep("GOHELLO", "1.0.0", testELF, rowV1, "BOUNCE,LIBX")
+	rel, err := parseRelease(src)
+	if err != nil {
+		t.Fatalf("parseRelease: %v", err)
+	}
+	if len(rel.Depends) != 2 || rel.Depends[0] != "BOUNCE" || rel.Depends[1] != "LIBX" {
+		t.Fatalf("depends=%v", rel.Depends)
+	}
+	for _, bad := range []string{
+		"", "BOUNCE,BOUNCE", "BOUNCE,", ",BOUNCE", "bounce",
+		"A,B,C,D,E,F,G,H,I", strings.Repeat("A,B,", 64) + "C",
+	} {
+		badSrc := releaseGoDep("GOHELLO", "1.0.0", testELF, rowV1, bad)
+		if bad == "" {
+			// empty string means the const is absent — fine
+			continue
+		}
+		if _, err := parseRelease(badSrc); err == nil {
+			t.Fatalf("depends %q accepted", bad)
+		} else {
+			refuseCode(t, err, "dep_invalid")
+		}
+	}
+	// An unsigned atom the signature does not cover still refuses:
+	// signed set covers 4 atoms, fetched file carries 5.
+	signed := releaseOps(t, releaseGo("GOHELLO", "1.0.0", testELF, rowV1))
+	if err := verifyRelease(src, signed); err == nil {
+		t.Fatal("verifyRelease accepted an unsigned ReleaseDepends")
+	} else {
+		refuseCode(t, err, "release_mismatch")
+	}
+}
+
+// seedDepStreams stages a second release stream (BOUNCE via rel2) beside
+// seedConsumer's rel/GOHELLO — the dep-resolution catalog.
+func seedDepStreams(t *testing.T, fs *memFS) {
+	src2 := releaseGo("BOUNCE", "1.4.0", testELF, "BOUNCE.ELF | Bounce | g | dock=false")
+	streamWithReleaseAs(t, fs, "rel2", "0199de2d-dc00-7000-8000-00000000c200",
+		"0199de2d-dc00-7000-8000-00000000c201", strings.Repeat("e5", 32), src2)
+	fs.dirs["/host/DROP/rel2"] = true
+	fs.files["/host/DROP/rel2/release.go"] = src2
+	fs.files["/host/DROP/rel2/BOUNCE.ELF"] = testELF
+	head := testChangeV1
+	head2 := "0199de2d-dc00-7000-8000-00000000c201"
+	prev := remoteStreamsFn
+	remoteStreamsFn = func(string) ([]Stream, error) {
+		return []Stream{
+			{ID: testStreamID, Name: "rel", Head: &head},
+			{ID: "0199de2d-dc00-7000-8000-00000000c200", Name: "rel2", Head: &head2},
+		}, nil
+	}
+	t.Cleanup(func() { remoteStreamsFn = prev })
+}
+
+func TestInstallDepResolved(t *testing.T) {
+	fs, _, lines, restore := seedConsumer(t)
+	defer restore()
+	seedDepStreams(t, fs)
+	src := releaseGoDep("GOHELLO", "1.0.0", testELF, rowV1, "BOUNCE")
+	// The dep-carrying manifest replaces rel's signed atoms + drop.
+	fs.files["/host/DROP/rel/release.go"] = src
+	streamWithRelease(t, fs, "rel", src)
+
+	rc := Install(fs, DefaultStoreRoot, "rel", "10.0.0.2:4748", "/host/DROP")
+	if rc != 0 {
+		t.Fatalf("install rc=%d lines=%v", rc, *lines)
+	}
+	joined := strings.Join(*lines, "\n")
+	for _, want := range []string{
+		"store: dep BOUNCE -> rel2",
+		"store: install ok BOUNCE.ELF",
+		"store: install ok GOHELLO.ELF",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("missing %q in\n%s", want, joined)
+		}
+	}
+	if string(fs.files["/host/BOUNCE.ELF"]) != string(testELF) {
+		t.Fatal("dep ELF did not land")
+	}
+	if !strings.Contains(string(fs.files[appsPath]), "BOUNCE.ELF | Bounce") {
+		t.Fatal("dep manifest row missing")
+	}
+}
+
+func TestInstallDepAlreadyPresentSkipsCatalog(t *testing.T) {
+	fs, _, lines, restore := seedConsumer(t)
+	defer restore()
+	src := releaseGoDep("GOHELLO", "1.0.0", testELF, rowV1, "BOUNCE")
+	fs.files["/host/DROP/rel/release.go"] = src
+	streamWithRelease(t, fs, "rel", src)
+	fs.files[appsPath] = []byte("BOUNCE.ELF | Bounce | g | dock=false\n")
+	// A remote scan must never run — the dep is already satisfied.
+	prev := remoteStreamsFn
+	remoteStreamsFn = func(string) ([]Stream, error) {
+		return nil, refuse("wire_error", "")
+	}
+	defer func() { remoteStreamsFn = prev }()
+
+	rc := Install(fs, DefaultStoreRoot, "rel", "10.0.0.2:4748", "/host/DROP")
+	if rc != 0 {
+		t.Fatalf("install rc=%d lines=%v", rc, *lines)
+	}
+	if !strings.Contains(strings.Join(*lines, "\n"), "store: dep BOUNCE present") {
+		t.Fatalf("dep present line missing: %v", *lines)
+	}
+}
+
+func TestInstallDepMissing(t *testing.T) {
+	fs, _, lines, restore := seedConsumer(t)
+	defer restore()
+	seedDepStreams(t, fs)
+	src := releaseGoDep("GOHELLO", "1.0.0", testELF, rowV1, "NOSUCHAPP")
+	fs.files["/host/DROP/rel/release.go"] = src
+	streamWithRelease(t, fs, "rel", src)
+
+	rc := Install(fs, DefaultStoreRoot, "rel", "10.0.0.2:4748", "/host/DROP")
+	if rc != 1 {
+		t.Fatalf("install rc=%d lines=%v", rc, *lines)
+	}
+	if !strings.Contains(strings.Join(*lines, "\n"), "store: refuse dep_missing NOSUCHAPP") {
+		t.Fatalf("dep_missing line missing: %v", *lines)
+	}
+	if fs.Exists("/host/GOHELLO.ELF") {
+		t.Fatal("refused dep install still wrote the ELF")
+	}
+	if strings.Contains(string(fs.files[appsPath]), "GOHELLO.ELF") {
+		t.Fatal("refused dep install still wrote the row")
+	}
+}
+
+func TestInstallDepCycle(t *testing.T) {
+	fs, _, lines, restore := seedConsumer(t)
+	defer restore()
+	// rel -> GOHELLO deps BOUNCE; rel2 -> BOUNCE deps GOHELLO.
+	src := releaseGoDep("GOHELLO", "1.0.0", testELF, rowV1, "BOUNCE")
+	fs.files["/host/DROP/rel/release.go"] = src
+	streamWithRelease(t, fs, "rel", src)
+	src2 := releaseGoDep("BOUNCE", "1.4.0", testELF,
+		"BOUNCE.ELF | Bounce | g | dock=false", "GOHELLO")
+	streamWithReleaseAs(t, fs, "rel2", "0199de2d-dc00-7000-8000-00000000c200",
+		"0199de2d-dc00-7000-8000-00000000c201", strings.Repeat("e5", 32), src2)
+	fs.dirs["/host/DROP/rel2"] = true
+	fs.files["/host/DROP/rel2/release.go"] = src2
+	fs.files["/host/DROP/rel2/BOUNCE.ELF"] = testELF
+	head := testChangeV1
+	head2 := "0199de2d-dc00-7000-8000-00000000c201"
+	prev := remoteStreamsFn
+	remoteStreamsFn = func(string) ([]Stream, error) {
+		return []Stream{
+			{ID: testStreamID, Name: "rel", Head: &head},
+			{ID: "0199de2d-dc00-7000-8000-00000000c200", Name: "rel2", Head: &head2},
+		}, nil
+	}
+	defer func() { remoteStreamsFn = prev }()
+
+	rc := Install(fs, DefaultStoreRoot, "rel", "10.0.0.2:4748", "/host/DROP")
+	if rc != 1 {
+		t.Fatalf("install rc=%d lines=%v", rc, *lines)
+	}
+	joined := strings.Join(*lines, "\n")
+	if !strings.Contains(joined, "store: refuse dep_cycle GOHELLO") ||
+		!strings.Contains(joined, "store: refuse dep_failed BOUNCE") {
+		t.Fatalf("cycle refusals missing:\n%s", joined)
+	}
+	if fs.Exists("/host/GOHELLO.ELF") || fs.Exists("/host/BOUNCE.ELF") {
+		t.Fatal("a dep cycle still installed bytes")
+	}
+}
+
+// ---- pin: signed-head rollback ---------------------------------------------
+
+// stagePinDrop drops the v1 bytes under rel's pinned member dir — what
+// `store publish`'s D9 write leaves for the v1 head.
+func stagePinDrop(fs *memFS, headID string, src, elf []byte) {
+	d := "/host/DROP/rel/" + changeIDHex(headID)
+	fs.dirs[d] = true
+	fs.files[d+"/release.go"] = src
+	fs.files[d+"/GOHELLO.ELF"] = elf
+}
+
+func TestPinPriorSignedHead(t *testing.T) {
+	fs, _, lines, restore := seedConsumer(t)
+	defer restore()
+	srcV1 := fs.files["/host/DROP/rel/release.go"]
+	seedConsumerV2(t, fs)
+	stagePinDrop(fs, testChangeV1, srcV1, testELF)
+	if rc := Install(fs, DefaultStoreRoot, "rel", "10.0.0.2:4748", "/host/DROP"); rc != 0 {
+		t.Fatalf("install rc=%d", rc)
+	}
+	rc := Pin(fs, DefaultStoreRoot, "GOHELLO", "", "10.0.0.2:4748", "/host/DROP")
+	if rc != 0 {
+		t.Fatalf("pin rc=%d lines=%v", rc, *lines)
+	}
+	joined := strings.Join(*lines, "\n")
+	if !strings.Contains(joined, "store: pin ok GOHELLO.ELF head="+testChangeV1) {
+		t.Fatalf("pin ok line missing:\n%s", joined)
+	}
+	if got := shaHex(fs.files["/host/GOHELLO.ELF"]); got != shaHex(testELF) {
+		t.Fatalf("pinned ELF sha=%s want v1 %s", got, shaHex(testELF))
+	}
+	e := stateEntry(t, fs, "GOHELLO.ELF")
+	if e.Head != testChangeV1 || e.PrevHead != testChangeV2 || e.PrevSHA != shaHex(testELFv2) {
+		t.Fatalf("state after pin: %+v", e)
+	}
+	// The pin itself is one step undoable: .prev now carries v2.
+	if got := shaHex(fs.files[prevPath("GOHELLO.ELF")]); got != shaHex(testELFv2) {
+		t.Fatalf(".prev after pin sha=%s want v2", got)
+	}
+}
+
+func TestPinExplicitHeadAndRefusals(t *testing.T) {
+	fs, _, lines, restore := seedConsumer(t)
+	defer restore()
+	srcV1 := fs.files["/host/DROP/rel/release.go"]
+	seedConsumerV2(t, fs)
+	stagePinDrop(fs, testChangeV1, srcV1, testELF)
+	if rc := Install(fs, DefaultStoreRoot, "rel", "10.0.0.2:4748", "/host/DROP"); rc != 0 {
+		t.Fatalf("install rc=%d", rc)
+	}
+	// Explicit selector in the dashed-uuid form pins v1.
+	if rc := Pin(fs, DefaultStoreRoot, "gohello", testChangeV1, "10.0.0.2:4748", "/host/DROP"); rc != 0 {
+		t.Fatalf("pin explicit rc=%d lines=%v", rc, *lines)
+	}
+	// head_already: the selector IS the installed head.
+	rc := Pin(fs, DefaultStoreRoot, "gohello", testChangeV1, "10.0.0.2:4748", "/host/DROP")
+	if rc != 1 || !strings.Contains(strings.Join(*lines, "\n"), "store: refuse head_already") {
+		t.Fatalf("head_already rc=%d lines=%v", rc, *lines)
+	}
+	// unsigned_history: a selector the verified log never carried.
+	rc = Pin(fs, DefaultStoreRoot, "gohello",
+		"0199de2d-dc00-7000-8000-00000000beef", "10.0.0.2:4748", "/host/DROP")
+	if rc != 1 || !strings.Contains(strings.Join(*lines, "\n"), "store: refuse unsigned_history") {
+		t.Fatalf("unsigned_history rc=%d lines=%v", rc, *lines)
+	}
+	// Malformed selector is a usage refusal (rc=2).
+	rc = Pin(fs, DefaultStoreRoot, "gohello", "not-a-head", "10.0.0.2:4748", "/host/DROP")
+	if rc != 2 || !strings.Contains(strings.Join(*lines, "\n"), "store: refuse usage") {
+		t.Fatalf("usage rc=%d lines=%v", rc, *lines)
+	}
+}
+
+func TestPinNoSuchRelease(t *testing.T) {
+	fs, _, lines, restore := seedConsumer(t)
+	defer restore()
+	if rc := Install(fs, DefaultStoreRoot, "rel", "10.0.0.2:4748", "/host/DROP"); rc != 0 {
+		t.Fatalf("install rc=%d", rc)
+	}
+	// One release head in history, nothing before it: no prior target.
+	rc := Pin(fs, DefaultStoreRoot, "GOHELLO", "", "10.0.0.2:4748", "/host/DROP")
+	if rc != 1 || !strings.Contains(strings.Join(*lines, "\n"), "store: refuse no_such_release") {
+		t.Fatalf("no_such_release rc=%d lines=%v", rc, *lines)
+	}
+}
+
+func TestPinUntrackedStreamInstallsAtHead(t *testing.T) {
+	fs, _, lines, restore := seedConsumer(t)
+	defer restore()
+	srcV1 := fs.files["/host/DROP/rel/release.go"]
+	seedConsumerV2(t, fs)
+	stagePinDrop(fs, testChangeV1, srcV1, testELF)
+	// No install: pin the stream to the v1 head directly.
+	rc := Pin(fs, DefaultStoreRoot, "rel", testChangeV1, "10.0.0.2:4748", "/host/DROP")
+	if rc != 0 {
+		t.Fatalf("pin rc=%d lines=%v", rc, *lines)
+	}
+	if got := shaHex(fs.files["/host/GOHELLO.ELF"]); got != shaHex(testELF) {
+		t.Fatalf("pinned ELF sha=%s want v1", got)
+	}
+	e := stateEntry(t, fs, "GOHELLO.ELF")
+	if e.Head != testChangeV1 {
+		t.Fatalf("state head=%s want %s", e.Head, testChangeV1)
+	}
+	// Pinning the record head is head_already — that is just install.
+	rc = Pin(fs, DefaultStoreRoot, "rel3", testChangeV1, "10.0.0.2:4748", "/host/DROP")
+	if rc != 1 {
+		t.Fatalf("unknown stream rc=%d want 1", rc)
+	}
+}
+
+func TestPinChannelMissing(t *testing.T) {
+	fs, _, lines, restore := seedConsumer(t)
+	defer restore()
+	seedConsumerV2(t, fs)
+	if rc := Install(fs, DefaultStoreRoot, "rel", "10.0.0.2:4748", "/host/DROP"); rc != 0 {
+		t.Fatalf("install rc=%d", rc)
+	}
+	// The publisher kept no pinned member for v1 — the pin refuses
+	// channel_missing instead of installing bytes it cannot verify.
+	rc := Pin(fs, DefaultStoreRoot, "GOHELLO", "", "10.0.0.2:4748", "/host/DROP")
+	if rc != 1 || !strings.Contains(strings.Join(*lines, "\n"), "store: refuse channel_missing") {
+		t.Fatalf("channel_missing rc=%d lines=%v", rc, *lines)
+	}
+	if got := shaHex(fs.files["/host/GOHELLO.ELF"]); got != shaHex(testELFv2) {
+		t.Fatal("refused pin touched the live ELF")
+	}
+}
+
+func TestPublishWritesPinnedMember(t *testing.T) {
+	fs := newMemFS()
+	fx, lines, restore := seedExec()
+	defer restore()
+	seedPublisher(t, fs)
+	fx.steps = []execStep{{match: "add"}, {match: "commit"}}
+	origExec := execFn
+	execFn = func(name string, args ...string) (int64, error) {
+		rc, err := fx.run(name, args...)
+		if strings.Contains(strings.Join(args, " "), "commit") {
+			mintSignedReleaseChange(t, fs, pubRelPath, pubChangeID)
+		}
+		return rc, err
+	}
+	defer func() { execFn = origExec }()
+
+	rc := Publish(fs, DefaultStoreRoot, pubArgs())
+	if rc != 0 {
+		t.Fatalf("publish rc=%d lines=%v", rc, *lines)
+	}
+	pinDir := "/host/DROP/rel/" + changeIDHex(pubChangeID)
+	if _, ok := fs.files[pinDir+"/release.go"]; !ok {
+		t.Fatalf("pinned release.go missing under %s", pinDir)
+	}
+	if got := fs.files[pinDir+"/GOHELLO.ELF"]; string(got) != string(testELF) {
+		t.Fatal("pinned ELF missing or wrong")
+	}
+	if !strings.Contains(strings.Join(*lines, "\n"), "store: pinned GOHELLO head="+pubChangeID) {
+		t.Fatalf("pinned line missing: %v", *lines)
+	}
+}

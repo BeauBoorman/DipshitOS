@@ -17,6 +17,7 @@ var (
 	installFn    = store.Install
 	updateFn     = store.Update
 	rollbackFn   = store.Rollback
+	pinFn        = store.Pin
 	removeFn     = store.Remove
 	consoleFn    = vi.ConsoleLine
 	sleepFn      = vi.Sleep
@@ -407,6 +408,14 @@ func (a *app) key(ev vi.Event) {
 		target := a.target()
 		a.runOp("rollback", target, func() int {
 			return rollbackFn(a.fs, target)
+		})
+	case 'p':
+		// Pin = signed-head rollback through the fold (M188c): the GUI
+		// gesture names no head, so the verb selects the prior release
+		// head before the installed one itself.
+		target := a.target()
+		a.runOp("pin", target, func() int {
+			return pinFn(a.fs, store.DefaultStoreRoot, target, "", a.remote, a.channel)
 		})
 	case 'd':
 		target := a.target()

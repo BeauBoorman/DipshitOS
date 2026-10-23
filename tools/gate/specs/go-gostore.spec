@@ -18,6 +18,9 @@
 #   05  rollback after the kill -> v1 exec (the .prev target survived)
 #   06  elf_mismatch        07  release_mismatch    08  key_unknown+key_revoked
 #   09  prev_mismatch       10  state_mismatch x2   11  remove
+#   12  install v2 then pin to the prior signed head (v1) -> v1 exec
+#   13  ReleaseDepends resolved install: NEEDY pulls BOUNCE first
+#   14  ReleaseDepends dep_missing refusal
 #
 # HOST PREREQ:
 #   bash tools/go/build-gotabwm.sh -> GOTABWM.ELF
@@ -185,6 +188,45 @@ EOF
 
 vgate_file script-11b.txt <<'EOF'
 echo rx-gostore-11-ok
+EOF
+
+vgate_file script-12a.txt <<'EOF'
+net ip 10.0.0.1
+net arp 10.0.0.2
+EOF
+
+vgate_file script-12x.txt <<'EOF'
+exec GOSTORE.ELF --remote=10.0.0.2:4858 --channel=/host/DROPV2
+EOF
+
+vgate_file script-12b.txt <<'EOF'
+exec GOHELLO.ELF
+EOF
+
+vgate_file script-13a.txt <<'EOF'
+net ip 10.0.0.1
+net arp 10.0.0.2
+EOF
+
+vgate_file script-13x.txt <<'EOF'
+exec GOSTORE.ELF --remote=10.0.0.2:4857 --channel=/host/DROP
+EOF
+
+vgate_file script-13b.txt <<'EOF'
+exec NEEDY.ELF
+EOF
+
+vgate_file script-14a.txt <<'EOF'
+net ip 10.0.0.1
+net arp 10.0.0.2
+EOF
+
+vgate_file script-14x.txt <<'EOF'
+exec GOSTORE.ELF --remote=10.0.0.2:4857 --channel=/host/DROP
+EOF
+
+vgate_file script-14b.txt <<'EOF'
+echo rx-gostore-14-ok
 EOF
 
 # --- setup -------------------------------------------------------------------
@@ -372,6 +414,43 @@ gen_release_fixture({
 })
 
 
+# M188c legs: rel3 (NEEDY) declares ReleaseDepends=BOUNCE — the resolved
+# dep is rel2's release name; rel4 (ORPHAN) declares a dep no stream
+# carries — the dep_missing leg. NEEDY.ELF is the marker-patched GOHELLO
+# (same 13-byte marker slot the v2 fixture uses).
+mark_dp = b"virelai-go DP"
+if len(mark_dp) != len(mark_v1):
+    sys.exit("marker length mismatch")
+elf_dp = elf_bytes.replace(mark_v1, mark_dp)
+open(os.path.join(fixture_dir, "gohello-dp.elf"), "wb").write(elf_dp)
+gen_release_fixture({
+    "STORE_FIXTURE_ELF": os.path.join(fixture_dir, "gohello-dp.elf"),
+    "STORE_FIXTURE_NAME": "NEEDY",
+    "STORE_FIXTURE_VERSION": "1.0.0",
+    "STORE_FIXTURE_ROW": "NEEDY.ELF | Needy | g | dock=false",
+    "STORE_FIXTURE_STREAM": "0199de2d-dc00-7000-8000-00000000b013",
+    "STORE_FIXTURE_CHANGE": "0199de2d-dc00-7000-8000-00000000c012",
+    "STORE_FIXTURE_TS": "1760000600000",
+    "STORE_FIXTURE_MSG": "needy release",
+    "STORE_FIXTURE_DEPENDS": "BOUNCE",
+    "STORE_FIXTURE_DIR": fixture_dir,
+    "STORE_FIXTURE_TAG": "rel3",
+})
+gen_release_fixture({
+    "STORE_FIXTURE_ELF": os.path.abspath(gohello),
+    "STORE_FIXTURE_NAME": "ORPHAN",
+    "STORE_FIXTURE_VERSION": "1.0.0",
+    "STORE_FIXTURE_ROW": "ORPHAN.ELF | Orphan | g | dock=false",
+    "STORE_FIXTURE_STREAM": "0199de2d-dc00-7000-8000-00000000b014",
+    "STORE_FIXTURE_CHANGE": "0199de2d-dc00-7000-8000-00000000c013",
+    "STORE_FIXTURE_TS": "1760000700000",
+    "STORE_FIXTURE_MSG": "orphan release",
+    "STORE_FIXTURE_DEPENDS": "NOSUCHAPP",
+    "STORE_FIXTURE_DIR": fixture_dir,
+    "STORE_FIXTURE_TAG": "rel4",
+})
+
+
 def load_gen_change(tag):
     line = open(os.path.join(fixture_dir, "release-%s-stream.jsonl" % tag),
                 "r", encoding="utf-8").read().strip()
@@ -382,10 +461,16 @@ badkey_ch, badkey_line = load_gen_change("badkey")
 revkey_ch, revkey_line = load_gen_change("revkey")
 rel2_ch, rel2_line = load_gen_change("rel2")
 legacy_ch, legacy_line = load_gen_change("legacy")
+rel3_ch, rel3_line = load_gen_change("rel3")
+rel4_ch, rel4_line = load_gen_change("rel4")
 rel2_go = open(os.path.join(fixture_dir, "release-rel2.go"),
                "r", encoding="utf-8").read()
 legacy_go = open(os.path.join(fixture_dir, "release-legacy.go"),
                  "r", encoding="utf-8").read()
+rel3_go = open(os.path.join(fixture_dir, "release-rel3.go"),
+               "r", encoding="utf-8").read()
+rel4_go = open(os.path.join(fixture_dir, "release-rel4.go"),
+               "r", encoding="utf-8").read()
 
 # badkey/revkey are remote-only — the keyring gate fires inside FLINT.ELF
 # on the real clone the GUI's list and install legs run.
@@ -401,7 +486,9 @@ for ch, line, sname in ((badkey_ch, badkey_line, "badkey"),
 
 for ch, line, sname in ((rel_change, rel_change_line, "rel"),
                         (rel2_ch, rel2_line, "rel2"),
-                        (legacy_ch, legacy_line, "legacy")):
+                        (legacy_ch, legacy_line, "legacy"),
+                        (rel3_ch, rel3_line, "rel3"),
+                        (rel4_ch, rel4_line, "rel4")):
     with open(os.path.join(flintd_store, "streams", ch["stream"] + ".jsonl"), "w") as f:
         f.write(line + "\n")
     with open(os.path.join(flintd_store, "streams", ch["stream"] + ".json"), "w") as f:
@@ -536,7 +623,9 @@ open(os.path.join(store_share, "FLINT", "TRUSTED.TXT"), "w", encoding="utf-8").w
 for ch, line, sname in ((good_changes[-1], good_raw.decode("utf-8"), "main"),
                         (rel_change, rel_change_line, "rel"),
                         (rel2_ch, rel2_line, "rel2"),
-                        (legacy_ch, legacy_line, "legacy")):
+                        (legacy_ch, legacy_line, "legacy"),
+                        (rel3_ch, rel3_line, "rel3"),
+                        (rel4_ch, rel4_line, "rel4")):
     sid = ch["stream"]
     with open(os.path.join(store_share, "FLINT", "streams", sid + ".jsonl"), "w") as f:
         f.write(line if line.endswith("\n") else line + "\n")
@@ -562,6 +651,17 @@ write_drop("DROP", legacy_go, elf_bytes, sname="legacy", bin_name="LEGACY.ELF")
 write_drop("DROPV2", release_v2_go, elf_v2)
 write_drop("DROPV2BAD", release_v2_go, elf_v2 + b"\x00")
 write_drop("DROPV2SIG", release_v2_go.replace('"2.0.0"', '"9.9.9"'), elf_v2)
+write_drop("DROP", rel3_go, elf_dp, sname="rel3", bin_name="NEEDY.ELF")
+write_drop("DROP", rel4_go, elf_bytes, sname="rel4", bin_name="ORPHAN.ELF")
+
+# The pinned member for rel's v1 head (ADR 0055 D9): `store pin` to the
+# prior signed head fetches <stream>/<head-change-id-hex>/ off the same
+# channel the v2 drop rides.
+pin_v1 = os.path.join(store_share, "DROPV2", "rel",
+                      rel_change["id"].replace("-", ""))
+os.makedirs(pin_v1, exist_ok=True)
+open(os.path.join(pin_v1, "release.go"), "w", encoding="utf-8").write(release_go)
+open(os.path.join(pin_v1, "GOHELLO.ELF"), "wb").write(elf_bytes)
 desc_tampered = release_v2_go.replace("smallest signed release",
                                       "smallest unsigned release")
 assert desc_tampered != release_v2_go
@@ -1143,3 +1243,155 @@ if os.path.isfile(p):
 open(os.path.join(share, "SESSION.TABS"), "wb").write(b"\x00" * 6)
 print("reset seat session files")
 PY2
+
+# ---- 12: install the v2 head, then pin to the prior signed head (v1) -------
+vgate_run 12 -- \
+    --via-virtio \
+    --screen '$RUN_DIR/screen-12' \
+    --cvc-file '$RUN_DIR/store-share' \
+    --virtio-fs '$RUN_DIR/store-share' \
+    --net '$RUN_DIR/cap12.bin' --net-arp-respond 10.0.0.2 \
+    --net-tcp-respond 10.0.0.2:4858:relay --net-tcp-respond-relay 127.0.0.1:4858 \
+    --script '$RUN_DIR/script-12a.txt' \
+    --script-after 'gotabwm: holding seat' \
+    --script2 '$RUN_DIR/script-12x.txt' \
+    --script2-after 'gotabwm: present' \
+    --input-string $'/gohello\nip' \
+    --input-string-after 'gostore: ready' \
+    --script3 '$RUN_DIR/script-12b.txt' \
+    --script3-after 'store: pin ok' \
+    --script-expect 'virelai-go OK' --timeout 900
+
+vgate_assert 12 serial-contains 'store: install ok GOHELLO.ELF version=2.0.0'
+vgate_assert 12 serial-contains 'gostore: pin GOHELLO'
+vgate_assert 12 serial-contains 'gostore: leg deps'
+vgate_assert 12 serial-contains 'gostore: leg fetch'
+vgate_assert 12 serial-contains 'gostore: leg sha'
+vgate_assert 12 serial-contains 'gostore: leg publish'
+vgate_assert 12 serial-contains 'gostore: leg prev'
+vgate_assert 12 serial-contains 'store: pin ok GOHELLO.ELF head='
+vgate_assert 12 serial-contains 'gostore: pin rc=0'
+vgate_assert 12 serial-contains 'virelai-go OK'
+vgate_assert 12 serial-absent 'store: refuse'
+vgate_assert 12 serial-absent '[EXC] parking:'
+vgate_assert 12 python <<'PY'
+import hashlib, json, os, sys
+run = os.environ["RUN_DIR"]
+share = os.path.join(run, "store-share")
+ids = json.load(open(os.path.join(run, "ids.json")))
+live = hashlib.sha256(open(os.path.join(share, "GOHELLO.ELF"), "rb").read()).hexdigest()
+prev = hashlib.sha256(open(os.path.join(share, "GOHELLO.ELF.prev"), "rb").read()).hexdigest()
+if live != ids["v1_sha"]:
+    sys.exit("post-pin live ELF %s != v1" % live)
+if prev != ids["v2_sha"]:
+    sys.exit("post-pin .prev %s != v2" % prev)
+state = open(os.path.join(share, "STORE.TXT"), "r", encoding="utf-8").read()
+if ids["rel"] not in state or ids["v2"] not in state:
+    sys.exit("STORE.TXT did not pin v1 head with v2 as prev:\n" + state)
+print("run-12 pin to the prior signed head restored v1; v2 rides .prev")
+PY
+
+vgate_assert 12 python <<'PY2'
+import os
+run = os.environ["RUN_DIR"]
+share = os.path.join(run, "store-share")
+# WINDOWS.SAV restores kernel-owned windows next boot — delete it so the
+# seat's session windows do not accumulate into the 8-slot cap.
+# SESSION.TABS gets the empty-seed bytes back, not a delete: a missing
+# file is the seat's first-boot branch (starter GOSH).
+p = os.path.join(share, "WINDOWS.SAV")
+if os.path.isfile(p):
+    os.remove(p)
+open(os.path.join(share, "SESSION.TABS"), "wb").write(b"\x00" * 6)
+print("reset seat session files")
+PY2
+
+# ---- 13: ReleaseDepends resolved — NEEDY pulls BOUNCE first ----------------
+vgate_run 13 -- \
+    --via-virtio \
+    --screen '$RUN_DIR/screen-13' \
+    --cvc-file '$RUN_DIR/store-share' \
+    --virtio-fs '$RUN_DIR/store-share' \
+    --net '$RUN_DIR/cap13.bin' --net-arp-respond 10.0.0.2 \
+    --net-tcp-respond 10.0.0.2:4857:relay --net-tcp-respond-relay 127.0.0.1:4857 \
+    --script '$RUN_DIR/script-13a.txt' \
+    --script-after 'gotabwm: holding seat' \
+    --script2 '$RUN_DIR/script-13x.txt' \
+    --script2-after 'gotabwm: present' \
+    --input-string $'/needy\ni' \
+    --input-string-after 'gostore: ready' \
+    --script3 '$RUN_DIR/script-13b.txt' \
+    --script3-after 'store: install ok NEEDY.ELF' \
+    --script-expect 'virelai-go DP' --timeout 900
+
+vgate_assert 13 serial-contains 'gostore: install rel3'
+vgate_assert 13 serial-contains 'gostore: leg deps'
+vgate_assert 13 serial-contains 'store: dep BOUNCE -> rel2'
+vgate_assert 13 serial-contains 'store: install ok BOUNCE.ELF'
+vgate_assert 13 serial-contains 'store: install ok NEEDY.ELF'
+vgate_assert 13 serial-contains 'gostore: install rc=0'
+vgate_assert 13 serial-contains 'virelai-go DP'
+vgate_assert 13 serial-absent '[EXC] parking:'
+vgate_assert 13 python <<'PY'
+import os, sys
+run = os.environ["RUN_DIR"]
+share = os.path.join(run, "store-share")
+for name in ("BOUNCE.ELF", "NEEDY.ELF"):
+    if not os.path.isfile(os.path.join(share, name)):
+        sys.exit(name + " missing after dep-resolved install")
+apps = open(os.path.join(share, "APPS.TXT"), "r", encoding="utf-8").read()
+if "BOUNCE.ELF |" not in apps or "NEEDY.ELF |" not in apps:
+    sys.exit("dep-resolved install rows missing:\n" + apps)
+print("run-13 dep-resolved install landed BOUNCE then NEEDY")
+PY
+
+vgate_assert 13 python <<'PY2'
+import os
+run = os.environ["RUN_DIR"]
+share = os.path.join(run, "store-share")
+# WINDOWS.SAV restores kernel-owned windows next boot — delete it so the
+# seat's session windows do not accumulate into the 8-slot cap.
+# SESSION.TABS gets the empty-seed bytes back, not a delete: a missing
+# file is the seat's first-boot branch (starter GOSH).
+p = os.path.join(share, "WINDOWS.SAV")
+if os.path.isfile(p):
+    os.remove(p)
+open(os.path.join(share, "SESSION.TABS"), "wb").write(b"\x00" * 6)
+print("reset seat session files")
+PY2
+
+# ---- 14: dep_missing — ORPHAN names a release no stream carries ------------
+vgate_run 14 -- \
+    --via-virtio \
+    --screen '$RUN_DIR/screen-14' \
+    --cvc-file '$RUN_DIR/store-share' \
+    --virtio-fs '$RUN_DIR/store-share' \
+    --net '$RUN_DIR/cap14.bin' --net-arp-respond 10.0.0.2 \
+    --net-tcp-respond 10.0.0.2:4857:relay --net-tcp-respond-relay 127.0.0.1:4857 \
+    --script '$RUN_DIR/script-14a.txt' \
+    --script-after 'gotabwm: holding seat' \
+    --script2 '$RUN_DIR/script-14x.txt' \
+    --script2-after 'gotabwm: present' \
+    --input-string $'/orphan\ni' \
+    --input-string-after 'gostore: ready' \
+    --script-expect 'gostore: install rc=1' \
+    --script-expect-tail 3 --timeout 900
+
+vgate_assert 14 serial-contains 'gostore: install rel4'
+vgate_assert 14 serial-contains 'gostore: leg deps'
+vgate_assert 14 serial-contains 'store: refuse dep_missing NOSUCHAPP'
+vgate_assert 14 serial-contains 'gostore: refuse dep_missing NOSUCHAPP'
+vgate_assert 14 serial-contains 'gostore: install rc=1'
+vgate_assert 14 serial-absent 'store: install ok ORPHAN'
+vgate_assert 14 serial-absent '[EXC] parking:'
+vgate_assert 14 python <<'PY'
+import os, sys
+run = os.environ["RUN_DIR"]
+share = os.path.join(run, "store-share")
+if os.path.exists(os.path.join(share, "ORPHAN.ELF")):
+    sys.exit("ORPHAN.ELF landed despite dep_missing")
+apps = open(os.path.join(share, "APPS.TXT"), "r", encoding="utf-8").read()
+if "ORPHAN.ELF" in apps:
+    sys.exit("ORPHAN row landed despite dep_missing")
+print("run-14 dep_missing refused before any publish")
+PY
