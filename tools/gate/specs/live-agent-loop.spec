@@ -28,7 +28,22 @@
 # because the ~2-4 min wire round trip always outlives an in-session
 # verb: agentd sends the answer and it is never delivered (the same
 # class of transport death as #2436, with the slow op as the trigger;
-# observed live on every attempt). The hermetic flintd rides this spec's
+# observed live on every attempt).
+#
+# M173d (#3045, ADR 0052 amendment) two-principal posture: AGENTD runs
+# under `exec -u2000` and every child it spawns inherits uid_agent
+# (index D15), so everything the loop writes must live under an
+# agent-owned root. AGENT/ and AGENT/AUDIT/ are kernel-minted
+# (`trust.ensure_agent_roots`); the FLINT store subtree is granted to
+# the agent by the seeded OWNERS.TXT row `FLINT 755 2000`, and the
+# agent-sign/flint-remote SECRETS.TXT rows are scoped to uid 2000 —
+# every FLINT consumer on this share is an agent principal. The two
+# monitor-dispatch boots exec their consumers as uid_agent too: they
+# are the agent's own build/push requests landing inside agent-owned
+# workspace (a uid_user GOBUILD cannot write AGENT/APP/.BUILD, and a
+# uid_user push cannot write FLINT/REMOTE.json). Runs 06/07 stay
+# uid_user by design — the fresh share is the USER's machine pulling
+# what the agent pushed. The hermetic flintd rides this spec's
 # own lane, 127.0.0.1:4750 (a shared port means a sibling gate's
 # lsof-sweep murders the daemon mid-run; go-flint pins 4749 for the same
 # reason). Run 05's post-run assert verifies the stream landed
@@ -84,31 +99,31 @@ vgate_repeat 5 BOOTS
 vgate_file script-01.txt <<'EOF'
 net ip 10.0.0.1
 net arp 10.0.0.2
-exec AGENTD.ELF --allow-exec
+exec -u2000 AGENTD.ELF --allow-exec
 EOF
 
 vgate_file script-02.txt <<'EOF'
 vf cat AGENT/BUILD.REQ
-exec GOBUILD.ELF /host/AGENT/APP -o /host/AGENT/APP.ELF
+exec -u2000 GOBUILD.ELF /host/AGENT/APP -o /host/AGENT/APP.ELF
 EOF
 
 vgate_file script-03.txt <<'EOF'
 net ip 10.0.0.1
 net arp 10.0.0.2
-exec AGENTD.ELF --allow-exec
+exec -u2000 AGENTD.ELF --allow-exec
 EOF
 
 vgate_file script-04.txt <<'EOF'
 net ip 10.0.0.1
 net arp 10.0.0.2
-exec AGENTD.ELF --allow-exec
+exec -u2000 AGENTD.ELF --allow-exec
 EOF
 
 vgate_file script-05.txt <<'EOF'
 net ip 10.0.0.1
 net arp 10.0.0.2
 vf cat AGENT/PUSH.REQ
-exec GOSH.ELF -c "FLINT.ELF push --remote=10.0.0.2:4750 --stream=main"
+exec -u2000 GOSH.ELF -c "FLINT.ELF push --remote=10.0.0.2:4750 --stream=main"
 EOF
 
 vgate_file script-06.txt <<'EOF'
@@ -177,18 +192,27 @@ open(os.path.join(share, "AGENTS.TXT"), "w").write(
 #    vector go-flint/live-dev-loop pin, so TRUSTED.TXT below names the
 #    publisher the keyring already knows), the FLINT-SYNC/1 push auth
 #    key, and agent-hmac (the M109c receipt key — the door key is the
-#    Ed25519 row above).
+#    Ed25519 row above). All three rows scope to uid_agent (M173d): the
+#    only FLINT consumers on this share run as uid 2000 — agentd's
+#    gosh.run children and the -u2000 monitor-dispatch boots.
 sig_dir = os.path.join("user", "go", "flint", "testdata", "sig")
 SIGN_SEED_HEX = open(os.path.join(sig_dir, "seed.hex")).read().strip()
 AUTH_KEY_HEX = "ab" * 32
 RECEIPT_KEY_HEX = "a5" * 32
 open(os.path.join(share, "SECRETS.TXT"), "w").write(
     "#v1\n"
-    "agent-sign\t1000\t" + SIGN_SEED_HEX + "\tFLINT.ELF\n"
-    "flint-remote\t1000\t" + AUTH_KEY_HEX + "\tFLINT.ELF\n"
-    "agent-hmac\t1000\t" + RECEIPT_KEY_HEX + "\tAGENTD.ELF\n")
+    "agent-sign\t2000\t" + SIGN_SEED_HEX + "\tFLINT.ELF\n"
+    "flint-remote\t2000\t" + AUTH_KEY_HEX + "\tFLINT.ELF\n"
+    "agent-hmac\t2000\t" + RECEIPT_KEY_HEX + "\tAGENTD.ELF\n")
+# OWNERS.TXT: the ELFs and the keyring stay uid_system (the app-bound
+# secret rows need system_owned_key; the keyring is world-readable).
+# The FLINT store root is the operator-granted AGENT-OWNED subtree —
+# flint's storeRoot is fixed at /host/FLINT, so the seeded row is how
+# uid_agent children mkdir ws/, streams/ and write REMOTE.json under it
+# (defaultOwner carries the agent's ownership down the whole subtree).
 open(os.path.join(share, "OWNERS.TXT"), "w").write(
-    "#v1\nAGENTD.ELF\t644\t0\t-\nFLINT.ELF\t644\t0\t-\nAGENTS.TXT\t444\t0\t-\n")
+    "#v1\nAGENTD.ELF\t644\t0\t-\nFLINT.ELF\t644\t0\t-\nAGENTS.TXT\t444\t0\t-\n"
+    "FLINT\t755\t2000\t-\n")
 
 # 5. The agent sandbox: root + the reserved audit lane + the workspace
 #    dir (fs.write never makes parents).
@@ -198,7 +222,7 @@ for d in ("AGENT", "AGENT/AUDIT", "AGENT/APP"):
 # 6. Stale products must not let a broken run go green: a previous
 #    boot's workspace state, product, dispatch artifact, capture file,
 #    and receipts.
-for stale in ("APP.ELF", "AGENTD.OUT", "AGENT/BUILD.REQ"):
+for stale in ("APP.ELF", "AGENT/AUDIT/AGENTD.OUT", "AGENT/BUILD.REQ"):
     p = os.path.join(share, stale)
     if os.path.exists(p):
         os.remove(p)
@@ -319,6 +343,7 @@ vgate_assert 01 serial-contains 'verb=fs.write ok'
 vgate_assert 01 serial-contains 'verb=gosh.run ok'
 vgate_assert 01 serial-contains 'agentd: spawn pid='
 vgate_assert 01 serial-contains 'agentd: reap pid='
+vgate_assert 01 serial-contains 'name=FLINT.ELF uid=2000'
 vgate_assert 01 serial-contains 'flint: init ok ws=agentapp stream=main'
 vgate_assert 01 serial-contains 'flint: add files=1 new=2 modified=0 deleted=0 unchanged=0'
 vgate_assert 01 serial-contains 'flint: commit ok id='
@@ -363,6 +388,7 @@ vgate_assert 02 serial-contains 'gobuild: order main'
 vgate_assert 02 serial-contains 'gobuild: compile main GOCMDCOMPILE.ELF status=0'
 vgate_assert 02 serial-contains 'gobuild: link GOCMDLINK.ELF status=0'
 vgate_assert 02 serial-contains 'gobuild: build OK -> /host/AGENT/APP.ELF'
+vgate_assert 02 serial-contains 'name=GOBUILD.ELF uid=2000'
 vgate_assert 02 serial-absent 'gobuild: FAIL'
 vgate_assert 02 serial-absent 'newosproc: sys_thread create failed'
 vgate_assert 02 serial-absent '[EXC] parking:'
@@ -487,6 +513,7 @@ vgate_run 05 -- \
 vgate_assert 05 serial-contains 'vf: cat AGENT/PUSH.REQ size='
 vgate_assert 05 serial-contains 'vf: cat ok'
 vgate_assert 05 serial-contains 'flint: push ok stream=main changes=4'
+vgate_assert 05 serial-contains 'name=FLINT.ELF uid=2000'
 vgate_assert 05 serial-absent 'flint: refuse'
 vgate_assert 05 serial-absent '[EXC] parking:'
 vgate_assert 05 serial-absent 'exited status=139'
@@ -708,7 +735,7 @@ import os, shutil, signal, socket, subprocess, sys, time
 run = os.environ["RUN_DIR"]
 share = os.environ.get("VG_SHARE") or os.path.join(run, "share")
 
-for stale in ("APP.ELF", "AGENTD.OUT", "AGENT/BUILD.REQ",
+for stale in ("APP.ELF", "AGENT/AUDIT/AGENTD.OUT", "AGENT/BUILD.REQ",
               "AGENT/PUSH.REQ"):
     p = os.path.join(share, stale)
     if os.path.exists(p):
