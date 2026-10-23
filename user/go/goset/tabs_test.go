@@ -377,7 +377,7 @@ func TestAccessTabShowsAndEditsTheA11yRows(t *testing.T) {
 			t.Fatalf("label[%d] = %q, want %q", i, a.labels()[i], want)
 		}
 	}
-	if a.labels()[2] != "a11y.text_scale = 100  (no app honours this yet)" {
+	if a.labels()[2] != "a11y.text_scale = 100  (honoured by WEB)" {
 		t.Fatalf("text-scale label = %q", a.labels()[2])
 	}
 

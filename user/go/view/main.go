@@ -15,6 +15,7 @@ import (
 
 	"virelai/appkit"
 	"virelai/draw"
+	"virelai/settings"
 	"virelai/tabapp"
 	"virelai/theme"
 	"virelai/vi"
@@ -78,6 +79,15 @@ const (
 	// pause inside the loop does not count).
 	markerPlay = "gview: play "
 
+	// M177a (#3142): `-play` under a11y.reduce_motion — the animation
+	// opens parked on frame 1 and this line says why; space still plays
+	// because pressing it is the user's own request.
+	markerMotionReduced = "gview: motion reduced"
+
+	// M177a (#3142): one line per settings subscription the seat accepts
+	// — the same evidence shape as gocalc's settings-subscribed line.
+	markerSettingSubscribed = "gview: settings subscribed key="
+
 	// M162c (#2986): the save-as legs — `pick save` at raise, `pick save
 	// <path>`/`pick cancel` at result, `saved <path> fmt=<png|qoi> n=<bytes>
 	// sum=<fnv>` on the write, `save refused <path>` when the name names no
@@ -132,6 +142,14 @@ type app struct {
 	playAccum       int64
 	playLastElapsed int64
 
+	// M177a (#3142): the a11y.reduce_motion row in force — read at startup
+	// and kept live by the settings subscription; it gates playback the
+	// app would start on its own (-play), never a key the user pressed.
+	// settingsWatch records that at least one subscription landed, so the
+	// poll can skip its syscall on a shim boot.
+	reduceMotion  bool
+	settingsWatch bool
+
 	// The M162c save-as modal: while pick.Open every key/mouse event is the
 	// picker's — the same FilePicker GOPAINT raises, painted over the
 	// viewer's own canvas.
@@ -158,7 +176,35 @@ var (
 	playNow    = func() int64 { return vi.Nanos() }
 )
 
+// loadGuestTheme applies /host/SETTINGS.TXT at startup — the theme base
+// AND the a11y.contrast switch through the one ApplySettings door every
+// themed app uses, so GOVIEW's backdrop and bars honour the same pair.
+func loadGuestTheme() {
+	b, r := vi.ReadFileAll("/host/SETTINGS.TXT", 2048)
+	if r < 0 || b == nil {
+		return
+	}
+	_ = theme.ApplySettings(b)
+}
+
+// reduceMotionRead is the startup read of a11y.reduce_motion — the schema
+// decode, not a raw-line scan. Missing or corrupt reads off.
+func reduceMotionRead() bool {
+	f := settings.Load()
+	if f.State != settings.StateOK {
+		return false
+	}
+	v, ok := f.Effective(settings.A11yReduceMotionKey)
+	if !ok {
+		return false
+	}
+	on, _ := settings.A11yReduceMotion(v)
+	return on
+}
+
 func main() {
+	loadGuestTheme()
+	reduceMotion := reduceMotionRead()
 	path := argPath()
 
 	// Header first, window second: the window is sized to the image before it
@@ -198,7 +244,20 @@ func main() {
 	}
 	vi.ConsoleLine(markerOpen + vi.Itoa64(int64(ta.Win)) + " " + u32s(ta.W) + "x" + u32s(ta.H))
 
-	a := &app{ta: ta, name: basename(path), path: path, fm: formatOfHeader(head), zoomIdx: zoomDefaultIdx}
+	a := &app{ta: ta, name: basename(path), path: path, fm: formatOfHeader(head), zoomIdx: zoomDefaultIdx,
+		reduceMotion: reduceMotion}
+	// M177a (#3142): theme plus the two a11y keys GOVIEW honours — asked
+	// only of a Go seat, the one seat running the settings bus: a legacy
+	// seat or the shim never acks kind-13, and each ask would park the
+	// startup path for the whole bounded ack window.
+	if peers := vi.WmPeers(appName); peers.Go {
+		for _, key := range []string{"theme", settings.A11yContrastKey, settings.A11yReduceMotionKey} {
+			if settings.Subscribe(key, uint32(ta.Win), appName) {
+				a.settingsWatch = true
+				vi.ConsoleLine(markerSettingSubscribed + key)
+			}
+		}
+	}
 	// M124a-2 (#2677): the drop target. The seat's opens=image admission
 	// filtered the mime; a delivered payload decodes through the same
 	// DecodeImage path as a file load, and the callback repaints itself.
@@ -213,7 +272,7 @@ func main() {
 	// `-play` (flagPlay): playback starts armed on load — the live gate's
 	// way in, since no scripted input channel is free to press space.
 	if argFlag(flagPlay) {
-		a.togglePlay()
+		a.requestPlay()
 	}
 
 	a.pushTitle()
@@ -500,6 +559,58 @@ func (a *app) setFrame(i int) {
 
 // --- playback (M170e) -------------------------------------------------------
 
+// requestPlay is -play's arm: playback the APP would start on its own, so
+// a11y.reduce_motion gates it (M177a #3142). With the row on, a multi-frame
+// animation stays parked on frame 1 and the marker says why; without a
+// playable animation there is no motion to reduce and nothing prints.
+// Space is unaffected — togglePlay answers the user's own request.
+func (a *app) requestPlay() {
+	if a.reduceMotion && a.anim != nil && len(a.anim.Frames) >= 2 {
+		vi.ConsoleLine(markerMotionReduced)
+		return
+	}
+	a.togglePlay()
+}
+
+// settingsApply is one delivered settings notice (M177a #3142): theme and
+// contrast repaint through theme.Current like the startup ApplySettings
+// did; reduce_motion only re-arms the -play gate, so it reports no visual
+// change. Returns whether the frame needs repainting.
+func (a *app) settingsApply(key, value string) bool {
+	switch key {
+	case "theme":
+		return theme.Set(value)
+	case settings.A11yContrastKey:
+		high, ok := settings.A11yContrast(value)
+		if !ok || high == (theme.Contrast() == "high") {
+			return false
+		}
+		theme.SetContrast(high)
+		return true
+	case settings.A11yReduceMotionKey:
+		on, ok := settings.A11yReduceMotion(value)
+		if !ok || on == a.reduceMotion {
+			return false
+		}
+		a.reduceMotion = on
+	}
+	return false
+}
+
+// pollSettings drains one delivered settings notice per loop turn — the
+// same shape browser's pollFontSize keeps. A refusal or a foreign key is
+// just consumed; a repaint asks the caller to present.
+func (a *app) pollSettings() bool {
+	if !a.settingsWatch {
+		return false
+	}
+	key, value, ok := settings.PollChange(uint32(a.ta.Win))
+	if !ok {
+		return false
+	}
+	return a.settingsApply(key, value)
+}
+
 // togglePlay is the space key: start playback on a multi-frame GIF, or
 // pause it. Inert — like the stepper keys — when there is no animation to
 // play. Resuming picks the current frame up with its own full delay; the
@@ -589,6 +700,12 @@ func (a *app) eventLoop() {
 		// M124a-2: seat drag frames for this window — a delivered drop
 		// runs DropTarget (which repaints) here, one poll per loop turn.
 		a.ta.PollDrag()
+		// M177a (#3142): one settings notice per loop turn, same cadence —
+		// a theme/contrast notice repaints out of theme.Current.
+		if a.pollSettings() {
+			a.draw()
+			a.ta.Present()
+		}
 		ev, r, ok := vi.PollEventRaw()
 		if !ok {
 			if r < 0 {

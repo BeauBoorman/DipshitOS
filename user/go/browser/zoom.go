@@ -20,6 +20,7 @@ package main
 import (
 	"virelai/settings"
 	"virelai/vi"
+	"virelai/webstyle"
 )
 
 // zoomLevels is the fixed per-tab ladder — the same progression other
@@ -52,6 +53,31 @@ func fontSizeRead() (value string, base int) {
 	value, _ = settings.Load().Effective("font_size")
 	px, _ := fontSizeBase(value)
 	return value, px
+}
+
+// textScaleRead is the startup read of the a11y.text_scale row (M177a
+// #3142): the stored or effective percent. An absent/corrupt file or an
+// unrecognized row reads 100 — the unscaled contract.
+func textScaleRead() int {
+	value, _ := settings.Load().Effective(settings.A11yTextScaleKey)
+	pct, _ := settings.A11yTextScale(value)
+	return pct
+}
+
+// scaledFontBase resolves the cascade's base text px: the font_size rung
+// multiplied by a11y.text_scale/100, rounded to the nearest whole pixel
+// (M177a #3142). An unresolved rung stands in for the contract's own
+// InitialFontSize — the same fallback CascadeBase applies — so the scale
+// multiplies what the page would have used anyway; a non-positive scale
+// reads as the unscaled 100.
+func scaledFontBase(rung, scale int) int {
+	if rung <= 0 {
+		rung = int(webstyle.InitialFontSize)
+	}
+	if scale <= 0 {
+		scale = 100
+	}
+	return (rung*scale + 50) / 100
 }
 
 // relayout re-runs the cascade and layout on the retained document at the
@@ -133,29 +159,61 @@ func (a *app) zoomReset() {
 
 // fontSizeApply is the settings-change half: a delivered font_size row
 // re-resolves the base text size and reflows the page when the rung
-// actually moved. Frame first, marker second — the zoomSet rule.
+// actually moved. Frame first, marker second — the zoomSet rule. The base
+// the marker names is the APPLIED one — the new rung under the text_scale
+// in force — identical to the rung while text_scale sits at 100.
 func (a *app) fontSizeApply(value string) {
 	px, ok := fontSizeBase(value)
-	if !ok || px == a.fontBase {
+	if !ok {
 		return
 	}
-	a.fontBase = px
+	a.fontRung = px
+	base := scaledFontBase(px, a.textScale)
+	if base == a.fontBase {
+		return
+	}
+	a.fontBase = base
 	a.relayout()
 	a.render()
-	vi.ConsoleLine(markerFontSize + value + " base=" + itoa(px))
+	vi.ConsoleLine(markerFontSize + value + " base=" + itoa(base))
+	a.dirty = false
+}
+
+// textScaleApply is the a11y.text_scale half (M177a #3142): a delivered row
+// re-scales the CURRENT font_size rung and reflows when the rounded base
+// actually moved. The marker prints on every accepted change, base moved
+// or not — the row the user set is the evidence.
+func (a *app) textScaleApply(value string) {
+	pct, ok := settings.A11yTextScale(value)
+	if !ok || pct == a.textScale {
+		return
+	}
+	a.textScale = pct
+	base := scaledFontBase(a.fontRung, pct)
+	if base != a.fontBase {
+		a.fontBase = base
+		a.relayout()
+		a.render()
+	}
+	vi.ConsoleLine(markerTextScale + itoa(pct) + " base=" + itoa(a.fontBase))
 	a.dirty = false
 }
 
 // pollFontSize drains one delivered settings notice per loop turn — the
-// same shape appkit's loop keeps. Only font_size is subscribed, so any
-// delivered key is ours; a refusal or a foreign key just returns.
+// same shape appkit's loop keeps. font_size and a11y.text_scale are the
+// subscribed keys (M177a #3142); a refusal or a foreign key just returns.
 func (a *app) pollFontSize() {
-	if !a.fontWatch {
+	if !a.settingsWatch {
 		return
 	}
 	key, value, ok := settings.PollChange(uint32(a.win))
-	if !ok || key != "font_size" {
+	if !ok {
 		return
 	}
-	a.fontSizeApply(value)
+	switch key {
+	case "font_size":
+		a.fontSizeApply(value)
+	case settings.A11yTextScaleKey:
+		a.textScaleApply(value)
+	}
 }

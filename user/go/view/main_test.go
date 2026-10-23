@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"virelai/tabapp"
+	"virelai/theme"
 	"virelai/webrender"
 )
 
@@ -364,5 +365,92 @@ func TestTogglePlayIsInertWithoutAnimation(t *testing.T) {
 		Frames: []webrender.GIFFrame{{Pix: make([]uint32, 1), Delay: 5}}}
 	if a.togglePlay() {
 		t.Fatal("space on a one-frame GIF must not toggle")
+	}
+}
+
+// TestRequestPlayHonoursReduceMotion is the M177a (#3142) gate: `-play` is
+// playback the app starts on its own, so a11y.reduce_motion parks the
+// animation on frame 1 — while a pressed space, the user's own request,
+// still starts it.
+func TestRequestPlayHonoursReduceMotion(t *testing.T) {
+	var arms []uint64
+	oldArm := playArm
+	playArm = func(ns uint64) int64 { arms = append(arms, ns); return 0 }
+	defer func() { playArm = oldArm }()
+
+	mkAnim := func() *webrender.GIFAnimation {
+		return &webrender.GIFAnimation{Width: 2, Height: 2, Frames: []webrender.GIFFrame{
+			{Pix: make([]uint32, 4), Delay: 5},
+			{Pix: make([]uint32, 4), Delay: 5},
+		}}
+	}
+
+	// reduce_motion on + -play: parked, nothing armed.
+	a := &app{anim: mkAnim(), reduceMotion: true}
+	a.requestPlay()
+	if a.playing || len(arms) != 0 {
+		t.Fatalf("reduce_motion -play: playing=%v arms=%v", a.playing, arms)
+	}
+	// Space is the user's own request — the gate never applies to it.
+	if !a.togglePlay() || !a.playing {
+		t.Fatal("space must still start playback under reduce_motion")
+	}
+	a.pausePlay()
+
+	// reduce_motion off: -play arms like today.
+	b := &app{anim: mkAnim()}
+	b.requestPlay()
+	if !b.playing || len(arms) != 2 {
+		t.Fatalf("plain -play: playing=%v arms=%v", b.playing, arms)
+	}
+
+	// reduce_motion on a still image: nothing to gate, nothing armed.
+	c := &app{reduceMotion: true}
+	c.requestPlay()
+	if c.playing || len(arms) != 2 {
+		t.Fatalf("still image -play: playing=%v arms=%v", c.playing, arms)
+	}
+}
+
+// TestSettingsApplyKeys pins the three keys GOVIEW subscribes to (M177a
+// #3142): theme and a11y.contrast report a repaint through theme.Current,
+// a11y.reduce_motion flips only the -play gate, and a foreign or malformed
+// notice changes nothing.
+func TestSettingsApplyKeys(t *testing.T) {
+	savedTheme, savedContrast := theme.Current, theme.Contrast()
+	t.Cleanup(func() {
+		theme.SetContrast(false)
+		theme.Set("dark")
+		theme.Current = savedTheme
+		theme.SetContrast(savedContrast == "high")
+	})
+	theme.SetContrast(false)
+	theme.Set("dark")
+
+	a := &app{}
+	if !a.settingsApply("theme", "light") || theme.Name() != "light" {
+		t.Fatal("theme notice did not select light")
+	}
+	if a.settingsApply("theme", "bogus") || theme.Name() != "light" {
+		t.Fatal("an unknown theme name moved the base")
+	}
+	if !a.settingsApply("a11y.contrast", "high") ||
+		theme.Contrast() != "high" || theme.Current != theme.LightHC {
+		t.Fatal("contrast notice did not select the HC light table")
+	}
+	if a.settingsApply("a11y.contrast", "high") {
+		t.Fatal("a same-value contrast notice reported a repaint")
+	}
+	if a.settingsApply("a11y.contrast", "garbage") || theme.Contrast() != "high" {
+		t.Fatal("an unparseable contrast notice moved the switch")
+	}
+	if a.settingsApply("a11y.reduce_motion", "on") || !a.reduceMotion {
+		t.Fatal("reduce_motion notice did not arm the gate")
+	}
+	if a.settingsApply("a11y.reduce_motion", "bogus") || !a.reduceMotion {
+		t.Fatal("an unparseable reduce_motion notice moved the gate")
+	}
+	if a.settingsApply("font_size", "large") {
+		t.Fatal("a foreign key reported a repaint")
 	}
 }

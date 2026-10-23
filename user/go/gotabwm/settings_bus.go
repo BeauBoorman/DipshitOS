@@ -88,6 +88,13 @@ func applySettingsPublish(req vi.WmRpc) bool {
 	if key == "theme" {
 		_ = theme.Set(value)
 	}
+	// The a11y.contrast switch applies live like `theme=`: the next
+	// composite repaints the seat's chrome out of the table it selects.
+	if settings.IsA11yContrastKey(key) {
+		if high, ok := settings.A11yContrast(value); ok {
+			theme.SetContrast(high)
+		}
+	}
 	if settings.IsNotifyDNDKey(key) {
 		applyNotifyDNDSetting(value)
 	}
@@ -123,6 +130,9 @@ func seedSettingsBusValues(file settings.File) {
 		appendKey(key.Name)
 	}
 	for _, key := range settings.NotifyKeys {
+		appendKey(key.Name)
+	}
+	for _, key := range settings.A11yKeys {
 		appendKey(key.Name)
 	}
 }

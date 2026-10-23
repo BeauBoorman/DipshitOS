@@ -314,3 +314,65 @@ func TestStylesScaleUniform(t *testing.T) {
 		t.Fatalf("ForNode(nil)=%d want %d", got, webstyle.InitialFontSize)
 	}
 }
+
+// M177a (#3142): the a11y.text_scale row multiplies the font_size rung to
+// make the cascade's base — nearest-whole-px rounding, the contract's own
+// 13px standing in when no rung resolved.
+func TestScaledFontBase(t *testing.T) {
+	for _, c := range []struct {
+		rung, scale, want int
+	}{
+		{11, 100, 11}, {13, 100, 13}, {17, 100, 17}, // unscaled = today
+		{11, 150, 17}, {13, 150, 20}, {17, 150, 26}, // half-up rounding
+		{13, 125, 16}, {17, 125, 21},
+		{0, 150, 20}, // no rung: the contract's 13px scales too
+		{13, 0, 13},  // a zero scale reads as the unscaled 100
+		{13, -50, 13},
+	} {
+		if got := scaledFontBase(c.rung, c.scale); got != c.want {
+			t.Errorf("scaledFontBase(%d,%d) = %d want %d", c.rung, c.scale, got, c.want)
+		}
+	}
+}
+
+// text_scale re-resolves the applied base off the CURRENT font_size rung
+// and reflows — including the card's font_size=large × 150 case (17 -> 26).
+func TestTextScaleApply(t *testing.T) {
+	a := zoomApp(t, `<p>base</p>`)
+	a.fontSizeApply("large")
+	if a.fontBase != 17 || a.fontRung != 17 {
+		t.Fatalf("fontBase=%d rung=%d want 17/17", a.fontBase, a.fontRung)
+	}
+	a.textScaleApply("150")
+	if a.textScale != 150 || a.fontBase != 26 {
+		t.Fatalf("large x 150: scale=%d base=%d want 150/26", a.textScale, a.fontBase)
+	}
+	for _, it := range a.lay.Items {
+		if it.Kind == webrender.ItemText {
+			if it.FontPx != 26 {
+				t.Fatalf("post-scale FontPx=%d want 26", it.FontPx)
+			}
+			break
+		}
+	}
+	// A font_size change under an armed scale lands scaled.
+	a.fontSizeApply("small")
+	if a.fontRung != 11 || a.fontBase != 17 { // 11*1.5 = 16.5 -> 17
+		t.Fatalf("small x 150: rung=%d base=%d want 11/17", a.fontRung, a.fontBase)
+	}
+	// A same-value notice changes nothing; a bogus one is refused whole.
+	lay := a.lay
+	a.textScaleApply("150")
+	if a.lay != lay {
+		t.Fatal("a same-scale notice re-laid the page")
+	}
+	a.textScaleApply("bogus")
+	if a.textScale != 150 || a.lay != lay {
+		t.Fatal("an unknown scale moved the base or the layout")
+	}
+	// Back to 100 returns the rung.
+	a.textScaleApply("100")
+	if a.fontBase != 11 {
+		t.Fatalf("scale 100: base=%d want the bare rung 11", a.fontBase)
+	}
+}

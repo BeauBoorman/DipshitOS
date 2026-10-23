@@ -29,13 +29,20 @@ const (
 	MarkerTokens      = "gotabwm: tokens "
 )
 
+// loadSettingsFile is the decode seam for the boot read — settings.Load on
+// the guest, stubbed in host tests (the paletteSettings/notifySettingsLoad
+// discipline).
+var loadSettingsFile = settings.Load
+
 // loadSettings reads and decodes /host/SETTINGS.TXT at seat start. Missing is
 // silent (a first boot, or the pre-seed default flow); a file that fails the
 // decode is corrupt-fails-closed — one marker line, then the seat runs on its
 // own defaults, never a boot failure. A good decode names the `wm` seat the
-// file carries (the key the boot default turns on) and applies the theme.
+// file carries (the key the boot default turns on) and applies the theme —
+// base AND the a11y.contrast switch, composed the way ApplySettings composes
+// them so a high-contrast boot paints the seat's own chrome in the HC table.
 func loadSettings() string {
-	f := settings.Load()
+	f := loadSettingsFile()
 	if f.State == settings.StateCorrupt {
 		seedSettingsBusValues(settings.File{State: settings.StateMissing})
 		vi.ConsoleLine(MarkerSettingsBad)
@@ -48,6 +55,11 @@ func loadSettings() string {
 	}
 	if v, found := settings.Get(f.Rows, "theme"); found {
 		_ = theme.Set(v)
+	}
+	if v, found := f.Effective(settings.A11yContrastKey); found {
+		if high, valid := settings.A11yContrast(v); valid {
+			theme.SetContrast(high)
+		}
 	}
 	vi.ConsoleLine(MarkerSettingsWM + wm + " keys=" + vi.Itoa64(int64(len(f.Rows))))
 	return wm

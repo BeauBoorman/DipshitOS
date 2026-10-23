@@ -1009,14 +1009,13 @@ func (a *panel) labels() []string {
 }
 
 // accessLabels renders the M165b access tab's three rows. The text-scale
-// row is honest about its reach: reserved and named, honoured by no app
-// yet — the card's words, on the row itself.
+// row names its consumer: WEB scales its base text by it (M177a #3142).
 func (a *panel) accessLabels() []string {
 	out := make([]string, 0, len(a.accessRows))
 	for _, s := range a.accessRows {
 		line := s.Key + " = " + s.Val
 		if s.Key == settings.A11yTextScaleKey {
-			line += "  (no app honours this yet)"
+			line += "  (honoured by WEB)"
 		}
 		out = append(out, line)
 	}

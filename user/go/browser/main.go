@@ -126,8 +126,11 @@ const (
 	// resolved default text size.
 	markerZoom     = "web: zoom "
 	markerFontSize = "web: font-size "
-	markerReload   = "web: reload"
-	markerSettled  = "web: settled"
+	// M177a (#3142): the a11y.text_scale read/apply — `web: text_scale=<n>
+	// base=<px>` names the percent and the scaled base it resolves to.
+	markerTextScale = "web: text_scale="
+	markerReload    = "web: reload"
+	markerSettled   = "web: settled"
 	// M123b (#2576): the blank viewport — the shared empty-state plate owns
 	// the content frame when no page is loaded and no load failed.
 	markerEmpty = "web: empty "
@@ -309,9 +312,16 @@ type app struct {
 	// M126d (#2596): this tab's zoom rung (percent; 100 = the contract's
 	// own) and the default web text px resolved from font_size. zoom.go
 	// owns the ladder, the settings read, and the reflow.
-	zoomPct   int
-	fontBase  int
-	fontWatch bool
+	// M177a (#3142): fontRung is the raw font_size resolution; fontBase is
+	// the APPLIED cascade base — fontRung scaled by a11y.text_scale and
+	// rounded to whole px. textScale is the row's percent (<=0 reads as
+	// the unscaled 100). settingsWatch records that a seat accepted at
+	// least one of the two subscriptions.
+	zoomPct       int
+	fontRung      int
+	fontBase      int
+	textScale     int
+	settingsWatch bool
 	// The bookmark store (FLINT ws/bookmarks atom table) + its sidebar.
 	books            []bookmark
 	bookStream       string
@@ -481,8 +491,13 @@ func main() {
 	// notices re-apply it. A shim boot has no seat — the subscribe just
 	// refuses and the startup read still stands.
 	fontVal, fontPx := fontSizeRead()
-	a.fontBase = fontPx
-	vi.ConsoleLine(markerFontSize + fontVal + " base=" + itoa(fontPx))
+	a.fontRung = fontPx
+	// M177a (#3142): the GOSET a11y.text_scale row multiplies the resolved
+	// rung — read once at startup, then subscribed beside font_size.
+	a.textScale = textScaleRead()
+	a.fontBase = scaledFontBase(fontPx, a.textScale)
+	vi.ConsoleLine(markerFontSize + fontVal + " base=" + itoa(a.fontBase))
+	vi.ConsoleLine(markerTextScale + itoa(a.textScale) + " base=" + itoa(a.fontBase))
 	vi.ConsoleLine(markerOpen + itoa(id))
 	// Fullscreen eligibility uses the existing seat RPC. With no responding
 	// seat, retain the raw shim; resize events determine the presentation.
@@ -495,7 +510,13 @@ func main() {
 	if v, blob, ok := vi.RequestStateRestore(uint32(id), appName); ok {
 		a.noteState(v, blob)
 	}
-	a.fontWatch = settings.Subscribe("font_size", uint32(id), appName)
+	a.settingsWatch = settings.Subscribe("font_size", uint32(id), appName)
+	// The text_scale ask goes only to a Go seat — the settings bus' home.
+	// A legacy seat never acks kind-13, so this ask would double the
+	// bounded ack stall font_size already pays there (M177a #3142).
+	if peers := vi.WmPeers(appName); peers.Go {
+		a.settingsWatch = settings.Subscribe(settings.A11yTextScaleKey, uint32(id), appName) || a.settingsWatch
+	}
 	// The store inventory is read from disk at boot: it is how the gate sees
 	// that a previous run's rows persisted. The bookmark atoms load first so
 	// the count in this line is the on-disk truth, not a later cache.

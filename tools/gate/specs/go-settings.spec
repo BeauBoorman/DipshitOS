@@ -174,6 +174,13 @@ shutil.copy(src, os.path.join(share, "GOTABWM.STAGE"))
 print("staged GOTABWM.ELF as GOTABWM.STAGE (%d bytes)" % os.path.getsize(src))
 PY
 
+# script2 fires on `gosh: attached`, NOT `gotabwm: mode live`: the
+# first-boot workspace's GOSH declares around the same marker, and the
+# seat hands focus to the LAST declare — anchoring on the shell's own
+# settle marker makes GOSET's declare the last one, so the typed lines
+# land in the panel (observed 2026-10-22: GOSET exec'd on `mode live`
+# lost the declare race; `access` et al. arrived as `gosh: line` input).
+#
 # The input-string is three typed lines: `access` opens the tab (the
 # `goset: tab access` marker is its only producer), then each key=value
 # line is apply+save on Enter — two `goset: set`/`goset: saved` pairs.
@@ -192,7 +199,7 @@ vgate_run 02 -- \
     --via-virtio --cvc-snap --snapshot-out '$RUN_DIR/snap-02' \
     --script '$RUN_DIR/script-02.txt' \
     --script2 '$RUN_DIR/script2-02.txt' \
-    --script2-after 'gotabwm: mode live' \
+    --script2-after 'gosh: attached' \
     --input-string $'access\na11y.contrast=high\na11y.reduce_motion=on\n' \
     --input-string-after 'goset: ready ' \
     --script3 '$RUN_DIR/script3-02.txt' \
@@ -266,4 +273,146 @@ if dark > 2:
              "high-contrast variant did not apply" % dark)
 print("hosted workspace (%dx%d@%d,%d): %d/81 px high-contrast Bg, %d plain-Dark strays"
       % (w, h, x, y, hc, dark))
+PY
+
+# --- run 03 (M177a / #3142): the three a11y keys WITH their consumers ------
+# Run 02's leftover GOTABWM.ELF autostarts the seat on this boot — the
+# rename only needed to exist once — and the tag-02 python below writes
+# the third row into SETTINGS.TXT, so the file the seat decodes at boot
+# carries a11y.contrast=high + a11y.reduce_motion=on + a11y.text_scale=150.
+# GOVIEW and WEB exec beside each other under it — the seat plus two
+# hosted Go runtimes, the card's three-runtime envelope.
+#
+#   - the seat's own chrome is an a11y.contrast consumer now: the token
+#     probe reports the DarkHC table and the rail's pixels are HC tokens;
+#   - `-play` is playback GOVIEW starts itself, so reduce_motion parks the
+#     ten-frame GIF on frame 1: `gview: motion reduced`, no `gview: play `;
+#   - WEB's cascade base is fontRung x text_scale/100: the effective
+#     medium rung (13) at 150 reads `web: text_scale=150 base=20`.
+#
+# EXTRA HOST PREREQUISITES (fails honestly when missing):
+#   bash tools/go/build-goview.sh        ->  .build/go/GOVIEW.ELF
+#   bash tools/go/build-web.sh browser   ->  .build/go/WEB.ELF
+
+vgate_setup_python <<'PY'
+import os, shutil, sys
+share = os.environ.get("VG_SHARE") or os.path.join(os.environ["RUN_DIR"], "share")
+for name, how in (("GOVIEW.ELF", "bash tools/go/build-goview.sh"),
+                  ("WEB.ELF", "bash tools/go/build-web.sh browser")):
+    src = os.path.join(".build", "go", name)
+    if not os.path.exists(src):
+        sys.exit(name + " missing (expected " + src + ") - build it first: " + how)
+    shutil.copy(src, os.path.join(share, name))
+    print("staged %s into share (%d bytes)" % (name, os.path.getsize(src)))
+shutil.copy("user/go/view/testdata/play10_160x120.gif",
+            os.path.join(share, "PLAY.GIF"))
+print("staged PLAY.GIF (ten frames at 50 ms)")
+PY
+
+# The run-03 seed, written between the runs the same way go-gostalgia's
+# between-run restore does it: the GOSET save from run 02 already carries
+# the two rows it set, so append-if-absent is the honest complete seed.
+vgate_assert 02 python <<'PY'
+import os, sys
+share = os.environ.get("VG_SHARE")
+if not share:
+    sys.exit("no armed share exported to the assert (vgate_share seed?)")
+p = os.path.join(share, "SETTINGS.TXT")
+body = open(p, encoding="utf-8").read() if os.path.exists(p) else "#v2\n"
+if not body.endswith("\n"):
+    body += "\n"
+added = []
+for row in ("a11y.contrast=high", "a11y.reduce_motion=on", "a11y.text_scale=150"):
+    if row.split("=")[0] + "=" not in body:
+        body += row + "\n"
+        added.append(row)
+open(p, "w", encoding="utf-8").write(body)
+print("run-03 seed: SETTINGS.TXT carries all three a11y rows (added %s)"
+      % (added or "none"))
+PY
+
+vgate_file script-03.txt <<'EOF'
+exec GOVIEW.ELF -play /host/PLAY.GIF
+exec WEB.ELF
+EOF
+
+# The seat autostarts (run 02 left GOTABWM.ELF on the share); the script
+# waits on its settled marker, then both clients declare at once. The
+# snapshot rides `web: repaint` — WEB's start-surface settle — and the run
+# ends on `web: ready`, the marker-settle drain after it.
+vgate_run 03 -- \
+    --screen '$RUN_DIR/screen-03' \
+    --via-virtio --cvc-snap --snapshot-out '$RUN_DIR/snap-03' \
+    --script '$RUN_DIR/script-03.txt' \
+    --script-after 'gotabwm: mode live' \
+    --snapshot-after 'web: repaint' \
+    --script-expect 'web: ready' --timeout 300
+
+# The seat autostarted on the file that carries the a11y rows — the boot
+# path loaded it, so there is no `exec: loaded` line for it; `mode live`
+# is the seat's own settled marker.
+vgate_assert 03 serial-contains 'wm: autostart gotabwm (settings wm=gotabwm)'
+vgate_assert 03 serial-contains 'gotabwm: mode live'
+# The token probe itself says the seat's chrome is the DarkHC table — the
+# boot read applied a11y.contrast=high (DarkHC Bg/Surface/Border/Accent).
+vgate_assert 03 serial-contains 'gotabwm: tokens theme=dark bg=0x000000 surface=0x0d1117 border=0x8b949e accent=0x58a6ff'
+# GOVIEW: settings applied, three subscriptions landed, and -play stayed
+# parked — the reduce_motion gate's marker with NO playback receipt.
+vgate_assert 03 serial-contains 'exec: loaded GOVIEW.ELF'
+vgate_assert 03 serial-contains 'gview: loaded PLAY.GIF 160x120 GIF bytes=24121 frames=10'
+vgate_assert 03 serial-contains 'gview: settings subscribed key=a11y.reduce_motion'
+vgate_assert 03 serial-contains 'gview: motion reduced'
+vgate_assert 03 serial-contains 'gview: ready'
+vgate_assert 03 serial-absent 'gview: play '
+# WEB: the medium rung (13) at 150 percent is the 20px cascade base.
+vgate_assert 03 serial-contains 'exec: loaded WEB.ELF'
+vgate_assert 03 serial-contains 'web: text_scale=150 base=20'
+vgate_assert 03 serial-contains 'web: ready'
+vgate_assert 03 serial-absent '[EXC] parking:'
+vgate_assert 03 serial-absent 'exited status=139'
+
+# The rail is the seat's own chrome: two cells (GOVIEW, WEB) across the
+# 1280 band, focused cell Selection-filled, idle cell BtnIdle, gaps Bg —
+# the DarkHC answers (0x1f3a5f / 0x1c2128 / 0x000000, accent 0x58a6ff) and
+# none of the plain-Dark ones (0x2a4460 / 0x2d3748 / 0x182026 / 0x3b82f6).
+vgate_assert 03 snapshot 'snap-03-*.raw' <<'PY'
+import sys
+
+W, H = 1280, 720
+raw = open(sys.argv[1], "rb").read()
+if len(raw) < W * H * 4:
+    sys.exit("snapshot is %d bytes, want %d (%dx%d BGRX)"
+             % (len(raw), W * H * 4, W, H))
+
+def px(x, y):
+    off = (y * W + x) * 4
+    return (raw[off + 2], raw[off + 1], raw[off])  # BGRX -> (r, g, b)
+
+HC = {(0x00, 0x00, 0x00),          # Bg (rail gaps)
+      (0x1f, 0x3a, 0x5f),          # Selection (focused cell)
+      (0x1c, 0x21, 0x28),          # BtnIdle (unfocused cell)
+      (0x58, 0xa6, 0xff),          # Accent (focus bar)
+      (0x8b, 0x94, 0x9e),          # Border
+      (0xff, 0xff, 0xff),          # Text
+      (0xb1, 0xba, 0xc4)}          # Muted
+DARK = {(0x18, 0x20, 0x26), (0x2a, 0x44, 0x60), (0x2d, 0x37, 0x48),
+        (0x3b, 0x82, 0xf6), (0x33, 0x41, 0x55), (0x94, 0xa3, 0xb8)}
+
+# Cell interiors, away from glyph ink: the fill bands above and below the
+# title row inside each half-width cell.
+samples = []
+for cx in (0, 640):                # the two cells' left edges
+    for dx in range(30, 600, 16):
+        for y in (3, 4, 18, 19):
+            samples.append(px(cx + dx, y))
+hc = sum(1 for c in samples if c in HC)
+dark = sum(1 for c in samples if c in DARK)
+if hc * 2 < len(samples):
+    sys.exit("seat rail: only %d/%d px are DarkHC chrome tokens — "
+             "the seat did not take a11y.contrast=high at boot" % (hc, len(samples)))
+if dark > 2:
+    sys.exit("seat rail: %d px are plain-Dark chrome tokens — the "
+             "high-contrast variant did not apply" % dark)
+print("seat rail: %d/%d px DarkHC chrome tokens, %d plain-Dark strays"
+      % (hc, len(samples), dark))
 PY
