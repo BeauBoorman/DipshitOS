@@ -33,6 +33,11 @@ func TestTermMarkerShapes(t *testing.T) {
 		{markerStateRefused, "goterm: state refused"},
 		{markerNotify, "goterm: notify sent "},
 		{markerNotifyNo, "goterm: notify refused "},
+		{markerFindOpen, "goterm: find open"},
+		{markerFindN, "goterm: find n="},
+		{markerFindHit, "goterm: find hit "},
+		{markerFindMiss, "goterm: find miss"},
+		{markerFindClose, "goterm: find close"},
 		{ttyPath, "/dev/tty"},
 	}
 	for _, c := range cases {

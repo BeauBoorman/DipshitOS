@@ -299,3 +299,39 @@ func TestM132aReservedChordPicks(t *testing.T) {
 		}
 	}
 }
+
+// TestM191aGOTERMFindChordPicks pins the scrollback find's spelling:
+// ctrl+shift+g at GOTERM.ELF's own app scope. The chord is free at every
+// other scope — the kernel's frozen letter rows are c,v,f,k,r and the
+// seat binds no shifted letter g — which is exactly why the card picked
+// it: ctrl+shift+f is the seat's freeze-badge (fires on every WM_KEY
+// regardless of focus, the M124e #2584 precedent) AND the kernel's
+// terminal-search row, twice taken. The collision half of the acceptance
+// is TestGlobalValidates; this pins the row the app's key path answers.
+func TestM191aGOTERMFindChordPicks(t *testing.T) {
+	chord := Chord{Mods: ModCtrl | ModShift, Usage: UsageG}
+	var row *Row
+	for i := range Global {
+		if Global[i].Chord == chord {
+			if row != nil {
+				t.Fatalf("%s is listed twice", chord)
+			}
+			row = &Global[i]
+		}
+	}
+	if row == nil {
+		t.Fatalf("%s is not registered", chord)
+	}
+	if row.Owner != "GOTERM.ELF" || row.Scope != AppScope("GOTERM.ELF") {
+		t.Fatalf("%s: owner=%s scope=%s, want GOTERM.ELF at its app scope",
+			chord, row.Owner, row.Scope)
+	}
+	// ctrl+shift+g must not exist at the kernel's or the seat's dispatch
+	// point: a second meaning there would double-fire on one keystroke.
+	for _, r := range Global {
+		if r.Chord == chord && (r.Scope == ScopeKernelTerminal || r.Scope == ScopeSeat) {
+			t.Errorf("%s also lives at %s — the app row must be the only claim",
+				chord, r.Scope)
+		}
+	}
+}

@@ -59,17 +59,26 @@ func TestChordHintsContent(t *testing.T) {
 // and the seat section is never duplicated.
 func TestChordHintsScopes(t *testing.T) {
 	h := NewChordHints("GOTERM.ELF", chords.ScopeKernelTerminal)
-	kernel := 0
+	kernel, app := 0, 0
 	for _, r := range chords.Global {
-		if r.Scope == chords.ScopeKernelTerminal {
+		switch r.Scope {
+		case chords.ScopeKernelTerminal:
 			kernel++
+		case chords.AppScope("GOTERM.ELF"):
+			app++
 		}
 	}
 	if kernel == 0 {
 		t.Fatal("registry lost its kernel-terminal rows")
 	}
-	if got := h.ChordRows(); got != kernel+len(chords.Global.SeatRows()) {
-		t.Fatalf("GOTERM ChordRows=%d want %d", got, kernel+len(chords.Global.SeatRows()))
+	if app == 0 {
+		t.Fatal("registry lost its GOTERM rows — M191a (#3242) scrollback find gone")
+	}
+	// M191a (#3242): GOTERM's app-scope row (ctrl+shift+g, the scrollback
+	// find bar) joins the overlay's count alongside the kernel chrome and
+	// seat sections.
+	if got := h.ChordRows(); got != kernel+app+len(chords.Global.SeatRows()) {
+		t.Fatalf("GOTERM ChordRows=%d want %d", got, kernel+app+len(chords.Global.SeatRows()))
 	}
 	heads := 0
 	for _, r := range h.Rows {

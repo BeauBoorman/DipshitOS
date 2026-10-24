@@ -1060,8 +1060,138 @@ vgate_run 09 -- \
 
 vgate_assert 09 serial-contains 'exec: loaded GOTERM.ELF'
 vgate_assert 09 serial-contains 'goterm: menubar open'
-vgate_assert 09 serial-contains 'goterm: hints n=52'
+vgate_assert 09 serial-contains 'goterm: hints n=53'
 vgate_assert 09 serial-contains 'goterm: close'
 vgate_assert 09 serial-contains 'rx-goterm-menu-ok'
 vgate_assert 09 serial-absent '[EXC] parking:'
 vgate_assert 09 serial-absent 'exited status=139'
+
+# --- M191a (#3242): GOTERM scrollback find ----------------------------------
+# One seated boot drives the whole bet against the app's own serial
+# markers — the alt-screen overlay paints grid cells, which serial never
+# sees (ADR 0020 selector 2), so the receipts are the app's, printed
+# after the fact they name:
+#
+#   phase 1  a sourced script seeds 60 KNOWN rows into the scrollback
+#            (seed191a-N), well past the visible fold.
+#   phase 2  ctrl-shift-g opens the bar — the kernel's tty encoder folds
+#            shift out of ctrl-letters, so the chord rides the wire as
+#            BEL and the app opens its find session (marker: find open).
+#   phase 3  the pattern chars type in (s,e,e,d,1,9,1,a), each edit
+#            klogging the live count (`find n=`), the last one the full
+#            pattern's 60 hits.
+#   phase 4  return steps to a hit (`find hit` cur=1/60, the row below
+#            the fold — scrollback); n steps forward (cur=2), and N —
+#            shift+n, the runner's chord vocabulary maps it — steps back
+#            (cur=1 again): the n/N cycle.
+#   phase 5  escape closes the bar (`find close`), the editor repaints,
+#            and one more submitted echo proves the prompt came back.
+#
+# The hit marker's row/top are corpus coordinates relative to the fold
+# (negative = scrollback above the visible grid), so the python assert
+# proves the hit sits BELOW the fold and INSIDE the window the bar
+# scrolled to it — the card's scroll-to-hit, in the app's own copy of
+# the surface. The kernel grid's view offset is not reachable from a
+# bound app (no scroll seam exists); the PR says so plainly.
+
+vgate_file script2-06.txt <<'EOF'
+exec -u0 GOTERM.ELF
+EOF
+
+vgate_file script3-06.txt <<'EOF'
+echo rx-goterm-find-ok
+EOF
+
+vgate_setup_python <<'PY'
+import os
+share = os.environ.get("VG_SHARE") or os.path.join(os.environ["RUN_DIR"], "share")
+# 60 seed rows: unique, chord-typable when needed, and a token that only
+# exists in the SEEDED scrollback (never in a typed line), so a hit can
+# only come from the ring.
+with open(os.path.join(share, "SEED191A.SH"), "w") as fh:
+    for i in range(60):
+        fh.write("echo seed191a-%02d\n" % i)
+print("seeded SEED191A.SH (60 rows)")
+PY
+
+vgate_run 06 -- --display --input \
+    --screen '$RUN_DIR/screen-06' \
+    --via-virtio \
+    --script '$RUN_DIR/script-seat5.txt' \
+    --script2 '$RUN_DIR/script2-06.txt' \
+    --script2-after 'gotabwm: present' \
+    --input-string $'source SEED191A.SH\n' \
+    --input-string-after 'goterm: prompt' \
+    --input-chords 'ctrl-shift-g,s,e,e,d,1,9,1,a,return,n,shift-n,escape,e,c,h,o,space,f,i,n,d,o,n,e,return' \
+    --input-chords-after 'goterm: line source SEED191A.SH' \
+    --script3 '$RUN_DIR/script3-06.txt' \
+    --script3-after 'goterm: find close' \
+    --script-expect 'rx-goterm-find-ok' --timeout 300
+
+vgate_assert 06 serial-contains 'exec: loaded GOTABWM.ELF'
+vgate_assert 06 serial-contains 'gotabwm: present'
+vgate_assert 06 serial-contains 'exec: loaded GOTERM.ELF'
+vgate_assert 06 serial-contains 'goterm: attached'
+vgate_assert 06 serial-contains 'goterm: prompt'
+vgate_assert 06 serial-contains 'goterm: line source SEED191A.SH'
+# The bar opened, narrowed live, and closed after the prompt returned.
+vgate_assert 06 serial-contains 'goterm: find open'
+vgate_assert 06 serial-contains 'goterm: find n='
+vgate_assert 06 serial-contains 'goterm: find hit '
+vgate_assert 06 serial-contains 'goterm: find close'
+# The post-close echo submitted through the restored prompt.
+vgate_assert 06 serial-contains 'goterm: line echo findone'
+vgate_assert 06 serial-contains 'rx-goterm-find-ok'
+vgate_assert 06 serial-absent '[EXC] parking:'
+vgate_assert 06 serial-absent 'exited status=139'
+# The whole chain in order, with the counts and geometry proven:
+#   open after the seed's done marker, the live count climbing to 60
+#   (seeded rows only — the typed lines never contain the token), the
+#   first Step landing on a hit BELOW the fold (row<0: scrollback), the
+#   n/N cycle (cur 1 -> 2 -> 1), close, then the restored prompt's echo.
+vgate_assert 06 python <<'PY'
+import os, re, sys
+ser = open(os.environ["VG_SER"], errors="replace").read()
+
+def at(pat, what, start=0):
+    m = re.compile(pat).search(ser, start)
+    if not m:
+        sys.exit("no %s in the serial log" % what)
+    return m
+
+seed_done = at(r"(?m)^goterm: done status=0$", "seed source done")
+opened    = at(r"(?m)^goterm: find open$", "find open", seed_done.end())
+counts    = [int(x) for x in re.findall(r"(?m)^goterm: find n=(\d+)$", ser[opened.end():])]
+if not counts:
+    sys.exit("the bar typed no pattern")
+if counts[-1] != 60:
+    sys.exit("full-pattern count = %d, want 60 (the seeded rows alone)" % counts[-1])
+
+hit1  = at(r"(?m)^goterm: find hit cur=(\d+)/(\d+) row=(-?\d+) top=(-?\d+)$",
+           "first hit", opened.end())
+cur1, tot1, row1, top1 = (int(hit1.group(i)) for i in (1, 2, 3, 4))
+if tot1 != 60 or cur1 != 1:
+    sys.exit("first hit cur=%d/%d, want 1/60" % (cur1, tot1))
+if row1 >= 0:
+    sys.exit("first hit row=%d is at/above the fold — the seeded rows "
+             "must sit in scrollback" % row1)
+if not (top1 <= row1 < top1 + 20):
+    sys.exit("hit row=%d outside its window (top=%d) — no scroll-to-hit"
+             % (row1, top1))
+
+hit2 = at(r"(?m)^goterm: find hit cur=(\d+)/(\d+) row=(-?\d+) top=(-?\d+)$",
+          "n step hit", hit1.end())
+if int(hit2.group(1)) != 2:
+    sys.exit("after n: cur=%s, want 2 (forward cycle)" % hit2.group(1))
+hit3 = at(r"(?m)^goterm: find hit cur=(\d+)/(\d+) row=(-?\d+) top=(-?\d+)$",
+          "N step hit", hit2.end())
+if int(hit3.group(1)) != 1:
+    sys.exit("after N: cur=%s, want 1 (backward cycle)" % hit3.group(1))
+
+closed = at(r"(?m)^goterm: find close$", "find close", hit3.end())
+echo   = at(r"(?m)^goterm: line echo findone$", "post-close echo", closed.end())
+rx     = at(r"(?m)^rx-goterm-find-ok$", "run receipt", echo.end())
+print("find chain OK: open -> n=%d live -> hit 1/60 row=%d (below fold, "
+      "in window top=%d) -> n 2/60 -> N 1/60 -> close -> prompt back"
+      % (counts[-1], row1, top1))
+PY

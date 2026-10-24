@@ -109,6 +109,19 @@ const (
 	// earned silence apart from a toast that died on the wire.
 	markerNotify   = "goterm: notify sent "
 	markerNotifyNo = "goterm: notify refused "
+	// M191a (#3242): the scrollback find bar's receipts. `find open`
+	// follows the first paint of the bar on the alternate screen; each
+	// `find n=` is the live match count after one pattern edit; `find
+	// hit cur/total row/top` follows a Step (row is the hit's corpus row
+	// relative to the visible fold — negative is scrollback above it —
+	// and top the overlay window's first content row on the same scale,
+	// so a hit inside the window is scroll-to-hit, proven); `find close`
+	// follows the editor repaint that restores the prompt.
+	markerFindOpen  = "goterm: find open"
+	markerFindN     = "goterm: find n="
+	markerFindHit   = "goterm: find hit "
+	markerFindMiss  = "goterm: find miss"
+	markerFindClose = "goterm: find close"
 )
 
 func main() {
@@ -436,6 +449,13 @@ func runSession(ta *tabapp.TabApp, fd uint32, ts *termState) {
 					// wait's tty read is the child's byte stream, the
 					// pass-through the card names.
 					hintsSession(ta, ts, fd, editor)
+				} else if n == 1 && readBuf[0] == findOpenByte {
+					// M191a (#3242): ctrl+shift+g — the kernel's tty
+					// encoder folds shift out of ctrl-letters, so the
+					// chord arrives as BEL. A BEL inside a larger chunk
+					// (a paste, a child's bell) stays editor input, the
+					// same single-byte rule the '?' overlay keeps.
+					findSession(ta, ts, fd, editor)
 				} else {
 					feedBytes(readBuf[:n])
 				}
@@ -629,6 +649,334 @@ func shutdown(ta *tabapp.TabApp, fd uint32, status int) {
 	vi.ConsoleLine(markerClose)
 	vi.ConsoleLine(markerOK)
 	ta.CloseAndExit(status)
+}
+
+// --- M191a (#3242): the scrollback find bar --------------------------------
+//
+// ctrl+shift+g opens an incremental find bar over the scrollback grid.
+// The kernel owns the tty presentation and exposes no cell-readback or
+// view-scroll seam to a bound app, so the bar works the one surface the
+// app DOES own completely: the M125e capture ring, re-derived into plain
+// rows (state.go's docBuilder — the same emulator rules the OSC-8 mirror
+// tracks). Searching the ring searches scrollback + visible grid whole.
+//
+// Presentation is the hints overlay's alt-screen recipe: enter ?1049,
+// paint the corpus rows that carry hits, leave, pop. The pattern model
+// is M191c's appkit.Find (issue #3244 landed first — reuse, not a fork):
+// its Scan counts, its Step picks ordinals, this session renders the
+// corpus seam's rows and feeds keys. A Step scrolls its hit to the top
+// content row — the bar's own window IS the scroll-to-hit the card asks
+// for, over the app's copy of the surface (the kernel grid's view offset
+// is not reachable from here; the PR states that bound honestly).
+//
+// n/N cycle like less: a bare n/N steps when the pattern is live and no
+// edit followed the last step (typing "needle" must keep typing), Enter
+// steps forward, Shift-Enter back, Esc clears the highlights and returns
+// the prompt. Overlay writes bypass the capture ring — the bar never
+// searches its own chrome.
+
+// findOpenByte is the chord on the wire: the kernel's hid_to_bytes folds
+// shift out of ctrl-letters, so ctrl+shift+g arrives as BEL (0x07).
+const findOpenByte = 0x07
+
+// findLayout is one content window over the hit rows.
+type findLayout struct {
+	rows []int // hit rows in corpus order
+	top  int  // index into rows of the first shown content row
+}
+
+func findSession(ta *tabapp.TabApp, ts *termState, fd uint32, editor *shlib.Editor) {
+	f := appkit.NewFind()
+	doc := scrollFindDoc(ts)
+	vis := rowsVisible(ta.H)
+
+	var lay findLayout
+	var edited bool // an edit landed since the last Step (n/N stand down)
+	f.Scan = func(pat string) int { return countHits(doc, pat) }
+	f.Show = func(i int) {
+		if r := hitDocRow(doc, f.Pattern(), i); r >= 0 {
+			lay.rows, lay.top = hitRowWindow(doc, f.Pattern(), r, vis), 0
+			edited = false
+			vi.ConsoleLine(markerFindHit + findHitText(f, doc, r, lay))
+		}
+	}
+	f.Miss = func() {
+		lay.rows, lay.top = nil, 0
+		vi.ConsoleLine(markerFindMiss)
+	}
+
+	// rescan rebuilds the corpus (new output may have landed) and the
+	// layout, keeping the overlay honest after every pattern edit.
+	rescan := func() {
+		doc = scrollFindDoc(ts)
+		lay.rows, lay.top = hitDocRows(doc, f.Pattern()), 0
+	}
+
+	paint := func() {
+		writeRaw(ts, fd, findPaint(f, doc, lay, vis))
+	}
+
+	f.Present()
+	rescan()
+	paint()
+	vi.ConsoleLine(markerFindOpen)
+
+	var in [64]byte
+	for {
+		ta.PollStateAsk()
+		n, _ := vi.FileRead(fd, in[:])
+		if n > 0 {
+			for i := 0; i < n; i++ {
+				c := in[i]
+				switch {
+				case c == 0x1b && i+2 < n && in[i+1] == '[':
+					// A CSI sequence the bar does not know is still
+					// skipped whole (the hints overlay's rule).
+					act, used := hintsCSI(in[i:])
+					if used == 0 {
+						used = 3
+					}
+					switch act {
+					case hintsUp:
+						findScroll(&lay, -1)
+					case hintsDown:
+						findScroll(&lay, 1)
+					case hintsPageUp:
+						findScroll(&lay, -(vis - 2))
+					case hintsPageDown:
+						findScroll(&lay, vis-2)
+					case hintsTop:
+						lay.top = 0
+					case hintsBottom:
+						if len(lay.rows) > vis-2 {
+							lay.top = len(lay.rows) - (vis - 2)
+						}
+					}
+					i += used - 1
+				case c == 0x1b:
+					// Esc clears the highlights (the corpus copy goes
+					// with the overlay) and returns the prompt.
+					writeRaw(ts, fd, []byte("\x1b[?1049l"))
+					writeTTY(ts, fd, editor.Repaint())
+					vi.ConsoleLine(markerFindClose)
+					return
+				case c == 0x0e || c == 0x0f, c == 0x07, c == '\r', c == '\n', c == '	', c == 0x08:
+					// Control spellings the bar owns: Enter steps
+					// forward, Backspace edits, the rest are eaten.
+					switch c {
+					case '\r', '\n':
+						f.Step(1)
+					case 0x08:
+						edited = true
+						rescan()
+						f.OnKey(appkit.Key{Usage: 0x2a}) // NamedBackspace
+					}
+				case c < 0x20:
+					// Every other control byte is eaten, never typed.
+				default:
+					if c >= 0x80 {
+						// A multi-byte rune is not fed through the
+						// one-byte path — dropped, the hints overlay's
+						// tolerance for bytes it cannot render.
+						continue
+					}
+					// less's rule: n/N cycle only while the pattern is
+					// live and no edit followed the last step.
+					if !edited && len(f.Pattern()) > 0 {
+						if c == 'n' {
+							f.Step(1)
+							continue
+						}
+						if c == 'N' {
+							f.Step(-1)
+							continue
+						}
+					}
+					edited = true
+					rescan()
+					f.OnKey(appkit.Key{Rune: rune(c)})
+					vi.ConsoleLine(markerFindN + vi.Itoa64(int64(f.Total)))
+				}
+			}
+			paint()
+		}
+		if ev, r, ok := vi.PollEventRaw(); ok {
+			if ta.Dispatch(ev) == tabapp.ActionClosed {
+				shutdown(ta, fd, 0)
+			}
+		} else if r < 0 {
+			shutdown(ta, fd, 1)
+		} else if n <= 0 {
+			vi.Sleep(1)
+		}
+	}
+}
+
+// findScroll steps the content window over the hit rows.
+func findScroll(l *findLayout, delta int) {
+	l.top += delta
+	if l.top > len(l.rows)-(visMin-2) {
+		l.top = len(l.rows) - (visMin - 2)
+	}
+	if l.top < 0 {
+		l.top = 0
+	}
+}
+
+// visMin is the smallest window findScroll clamps against.
+const visMin = 4
+
+// hitRowWindow centers hit row r's neighbourhood: the rows around the
+// hit that fit the window, in corpus order.
+func hitRowWindow(doc *streamDoc, pat string, r, vis int) []int {
+	all := hitDocRows(doc, pat)
+	if len(all) <= vis-2 {
+		return all
+	}
+	pos := 0
+	for i, row := range all {
+		if row == r {
+			pos = i
+			break
+		}
+	}
+	top := pos - (vis-2)/2
+	if top < 0 {
+		top = 0
+	}
+	if top > len(all)-(vis-2) {
+		top = len(all) - (vis - 2)
+	}
+	return all[top : top+vis-2]
+}
+
+// findHitText is the hit marker's body: cur/total, then the hit's corpus
+// row relative to the visible fold (the live grid's newest line —
+// negative is scrollback above it), then the window's top row on the
+// same scale — a hit at or below top is inside the shown window, which
+// is the scroll-to-hit proof the gate asserts.
+func findHitText(f appkit.Find, doc *streamDoc, row int, lay findLayout) string {
+	fold := len(doc.lines) - visFoldReserve
+	cur := f.Cur + 1
+	s := " cur=" + vi.Itoa64(int64(cur)) + "/" + vi.Itoa64(int64(f.Total)) +
+		" row=" + vi.Itoa64(int64(row-fold))
+	if len(lay.rows) > 0 {
+		s += " top=" + vi.Itoa64(int64(lay.rows[0]-fold))
+	}
+	return s
+}
+
+// visFoldReserve is the fold offset the hit marker reports against: the
+// live grid's newest line is the row a full default window (80x25-class
+// geometry) would end on. The marker's row/top are PROOFS, not geometry
+// the app controls — the gate asserts relative ordering (hit below the
+// fold, then inside the window), never the absolute count.
+const visFoldReserve = 24
+
+// writeRaw writes bytes to the tty WITHOUT the capture tee: the find
+// overlay's own chrome must never enter the ring, or the corpus the bar
+// searches would contain the bar.
+func writeRaw(ts *termState, fd uint32, b []byte) {
+	for len(b) > 0 {
+		n := len(b)
+		if n > ttyWriteMax {
+			n = ttyWriteMax
+		}
+		if _, r := vi.FileWrite(fd, b[:n]); r < 0 {
+			return
+		}
+		b = b[n:]
+	}
+}
+
+// findPaint renders one frame: enter the alternate screen, the footer
+// bar (reverse video, the kernel search bar's own face), and the hit
+// rows' window with the current hit selected and its matches marked
+// with SGR 7 spans. Sixel origin rows are named, not searched — an image
+// row shows where the picture began.
+func findPaint(f appkit.Find, doc *streamDoc, lay findLayout, vis int) []byte {
+	pat := f.Pattern()
+	var b []byte
+	b = append(b, "\x1b[?1049h\x1b[?25l\x1b[2J\x1b[H"...)
+
+	// The footer bar: "> pattern  (n)" in reverse video — the kernel
+	// search bar's exact face (searchDrawPrompt).
+	bar := ">" + pat
+	if len(pat) > 0 {
+		if f.Total == 0 {
+			bar += "  no match"
+		} else {
+			cur := 0
+			if f.Cur >= 0 {
+				cur = f.Cur + 1
+			}
+			bar += "  (" + vi.Itoa64(int64(cur)) + "/" + vi.Itoa64(int64(f.Total)) + ")"
+		}
+	}
+	for len(bar) < mirrorCols {
+		bar += " "
+	}
+	b = append(b, "\x1b[7m"...)
+	b = append(b, bar...)
+	b = append(b, "\x1b[27m"...)
+
+	body := vis - 2 // bar + hint line
+	if body < 1 {
+		body = 1
+	}
+	rows := lay.rows
+	if len(rows) > body {
+		rows = rows[lay.top : lay.top+body]
+	}
+	sixel := map[int]bool{}
+	for _, s := range doc.sixels {
+		sixel[s.row] = true
+	}
+	shown := 0
+	for _, r := range rows {
+		if r < 0 || r >= len(doc.lines) || shown == body {
+			continue
+		}
+		shown++
+		b = append(b, '\r', '\n')
+		ln := doc.lines[r]
+		if sixel[r] {
+			// Named, not searched: the row shows the sixel's origin.
+			b = append(b, "[image] row\x1b[27m"...)
+			continue
+		}
+		cur := f.Cur >= 0 && hitDocRow(doc, pat, f.Cur) == r
+		if !cur || len(pat) == 0 {
+			b = append(b, ln...)
+			continue
+		}
+		// The current hit's row carries the highlight — every match on
+		// it reversed; a plain hit row rides plain.
+		b = appendMatchMarks(b, ln, pat)
+	}
+	b = append(b, '\r', '\n')
+	b = append(b, "find: enter=next shift+enter=prev n/N=repeat esc=close"...)
+	return b
+}
+
+// appendMatchMarks appends ln with every non-overlapping match of pat
+// wrapped in SGR 7/27 — the highlight the hit rows carry.
+func appendMatchMarks(b []byte, ln, pat string) []byte {
+	if pat == "" {
+		return append(b, ln...)
+	}
+	for i := 0; i+len(pat) <= len(ln); {
+		if ln[i:i+len(pat)] == pat {
+			b = append(b, "\x1b[7m"...)
+			b = append(b, pat...)
+			b = append(b, "\x1b[27m"...)
+			i += len(pat)
+			continue
+		}
+		b = append(b, ln[i])
+		i++
+	}
+	return b
 }
 
 func writeTTY(ts *termState, fd uint32, b []byte) {
