@@ -248,7 +248,7 @@ func (e *editor) releaseAllLeases() {
 // truncate from the LEFT until the row fits beside the right-aligned
 // status text; the active name is the last resort. A one-buffer ring still
 // shows its single entry — the row is the document's identity.
-func (e *editor) drawBufRow(w, statusW int) {
+func (e *editor) drawBufRow(w, statusW, x0 int) {
 	docs := e.docList()
 	tok := theme.Current
 	adv := font.Advance(1)
@@ -270,7 +270,7 @@ func (e *editor) drawBufRow(w, statusW int) {
 		}
 		total += cellW(i)
 	}
-	avail := (w - 2*textOrigin - statusW - 2) / adv
+	avail := (w - x0 - textOrigin - statusW - 2) / adv
 	if avail < 1 {
 		avail = 1
 	}
@@ -297,7 +297,7 @@ func (e *editor) drawBufRow(w, statusW int) {
 		names[best] = names[best][sz:]
 		total--
 	}
-	x := textOrigin
+	x := x0
 	for i, d := range docs {
 		if i > 0 {
 			x += 2 * adv

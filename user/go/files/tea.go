@@ -65,6 +65,34 @@ func toTea(ev keys.Event) tea.KeyPressMsg {
 		return tea.KeyPressMsg(tea.Key{Code: '\t'})
 	case keys.KeyCtrlZ:
 		return tea.KeyPressMsg(tea.Key{Code: 0x1a})
+	case keys.KeyInsert:
+		return tea.KeyPressMsg(tea.Key{Code: tea.KeyInsert})
+	case keys.KeyDelete:
+		return tea.KeyPressMsg(tea.Key{Code: tea.KeyDelete})
+	case keys.KeyF1:
+		return tea.KeyPressMsg(tea.Key{Code: tea.KeyF1})
+	case keys.KeyF2:
+		return tea.KeyPressMsg(tea.Key{Code: tea.KeyF2})
+	case keys.KeyF3:
+		return tea.KeyPressMsg(tea.Key{Code: tea.KeyF3})
+	case keys.KeyF4:
+		return tea.KeyPressMsg(tea.Key{Code: tea.KeyF4})
+	case keys.KeyF5:
+		return tea.KeyPressMsg(tea.Key{Code: tea.KeyF5})
+	case keys.KeyF6:
+		return tea.KeyPressMsg(tea.Key{Code: tea.KeyF6})
+	case keys.KeyF7:
+		return tea.KeyPressMsg(tea.Key{Code: tea.KeyF7})
+	case keys.KeyF8:
+		return tea.KeyPressMsg(tea.Key{Code: tea.KeyF8})
+	case keys.KeyF9:
+		return tea.KeyPressMsg(tea.Key{Code: tea.KeyF9})
+	case keys.KeyF10:
+		return tea.KeyPressMsg(tea.Key{Code: tea.KeyF10})
+	case keys.KeyF11:
+		return tea.KeyPressMsg(tea.Key{Code: tea.KeyF11})
+	case keys.KeyF12:
+		return tea.KeyPressMsg(tea.Key{Code: tea.KeyF12})
 	default:
 		return tea.KeyPressMsg(tea.Key{Code: 3}) // Ctrl-C
 	}
@@ -102,6 +130,34 @@ func fromTea(k tea.KeyPressMsg) keys.Event {
 		return keys.Event{Key: keys.KeyCtrlC}
 	case 0x1a:
 		return keys.Event{Key: keys.KeyCtrlZ}
+	case tea.KeyInsert:
+		return keys.Event{Key: keys.KeyInsert}
+	case tea.KeyDelete:
+		return keys.Event{Key: keys.KeyDelete}
+	case tea.KeyF1:
+		return keys.Event{Key: keys.KeyF1}
+	case tea.KeyF2:
+		return keys.Event{Key: keys.KeyF2}
+	case tea.KeyF3:
+		return keys.Event{Key: keys.KeyF3}
+	case tea.KeyF4:
+		return keys.Event{Key: keys.KeyF4}
+	case tea.KeyF5:
+		return keys.Event{Key: keys.KeyF5}
+	case tea.KeyF6:
+		return keys.Event{Key: keys.KeyF6}
+	case tea.KeyF7:
+		return keys.Event{Key: keys.KeyF7}
+	case tea.KeyF8:
+		return keys.Event{Key: keys.KeyF8}
+	case tea.KeyF9:
+		return keys.Event{Key: keys.KeyF9}
+	case tea.KeyF10:
+		return keys.Event{Key: keys.KeyF10}
+	case tea.KeyF11:
+		return keys.Event{Key: keys.KeyF11}
+	case tea.KeyF12:
+		return keys.Event{Key: keys.KeyF12}
 	}
 	if k.Text != "" {
 		r := []rune(k.Text)

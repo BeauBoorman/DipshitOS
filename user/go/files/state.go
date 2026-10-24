@@ -163,6 +163,12 @@ type model struct {
 	// rendered ANSI inside this app's own frame.
 	hints appkit.ChordHints
 
+	// M190d (#3239): the appkit menubar on row 0 — titles live beside the
+	// path bar; F10 (the kernel's ESC[21~) engages it and an open menu
+	// plates over the frame's body like the context menu does. Every row
+	// calls the identical method its rune key calls below.
+	bar appkit.MenuBar
+
 	// M149a (#2806): the spacebar QuickLook pane (quick.go). Armed by ' '
 	// on the selection, dismissed by space/Esc or a pointer press; the
 	// listing underneath is never touched.
@@ -222,6 +228,7 @@ const hintsBin = "GOFILES.ELF"
 func newModel(path string, cols, rows int) model {
 	m := model{path: path, pressRow: -1}
 	m.setSize(cols, rows)
+	m.buildMenus()
 	if now := vi.Time(); now >= 0 {
 		expired, rc := vi.TrashExpire(now)
 		if rc < 0 {
@@ -939,6 +946,12 @@ func (m *model) handleKey(ev keys.Event) {
 		default:
 			m.cancelDelete("key=" + keyLabel(ev))
 		}
+		return
+	}
+
+	// M190d: the menubar owns the keyboard once engaged — the grid and
+	// list vocabularies below see nothing while it stands.
+	if m.menuKey(ev) {
 		return
 	}
 
@@ -1734,4 +1747,170 @@ func keyLabel(ev keys.Event) string {
 	default:
 		return "none"
 	}
+}
+
+// --- M190d (#3239): the menubar -------------------------------------------
+//
+// The appkit menubar over the tty grid: its titles share row 0 with the
+// path bar, F10 engages (the kernel's ESC[21~ decode), and an open menu
+// plates over the frame like the M124d context menu — the resting frame's
+// cell geometry never moves. Every row's Action calls the identical method
+// its rune key calls in handleKey; syncMenu keeps the disabled flags
+// honest against live state.
+
+// GOFILES rows carry no Action closure: Update copies the model by value
+// (the tea.Model contract) and writes it back afterwards, so a closure
+// captured at buildMenus time would fire its verb into a detached copy —
+// observed on the first gate run, where the open menu's Return landed
+// silently. menuKey instead detects the open→closed Enter transition and
+// calls menuVerb on THIS m — the copy whose mutations persist — and the
+// dispatch table below calls the identical method the rune keys call.
+func (m *model) buildMenus() {
+	mi := func(label, chord string) appkit.MenuItem {
+		return appkit.MenuItem{Label: label, Shortcut: chord}
+	}
+	m.bar.Menus = []appkit.Menu{
+		{Title: "&File", Items: []appkit.MenuItem{
+			mi("&Open", "enter"),
+			mi("Open &With", "o"),
+			mi("Quick &Look", "space"),
+			mi("&Rename", "r"),
+			mi("&Trash", "d"),
+			mi("Propert&ies", "i"),
+			mi("E&xport", "e"),
+			mi("&Quit", "q"),
+		}},
+		{Title: "&Edit", Items: []appkit.MenuItem{
+			mi("&Copy", "c"),
+			mi("Cu&t", "x"),
+			mi("&Paste", "p"),
+			mi("Restore", "u"),
+			mi("&Mark", "m"),
+			mi("&Unmark all", "M"),
+			mi("&Search", "/"),
+		}},
+		{Title: "&View", Items: []appkit.MenuItem{
+			mi("&Up", "backspace"),
+			mi("&Sort", "s"),
+			mi("&Grid", "t"),
+			mi("Pre&view", "tab"),
+			mi("&Favorites", "f"),
+			mi("Vol&umes", "v"),
+			mi("&Pin folder", "b"),
+			mi("Chord &hints", "?"),
+		}},
+	}
+}
+
+// menuVerb dispatches a fired (menu, item) pair on the Update-copy model —
+// the identical methods the rune keys call in handleKey.
+func (m *model) menuVerb(menu, item int) {
+	switch menu {
+	case 0: // File
+		switch item {
+		case 0:
+			m.openSel()
+		case 1:
+			m.startOpenWith()
+		case 2:
+			m.openQuickLook()
+		case 3:
+			m.startRename()
+		case 4:
+			m.startDelete()
+		case 5:
+			m.openProps()
+		case 6:
+			m.exportSel()
+		case 7:
+			m.quit = true
+		}
+	case 1: // Edit
+		switch item {
+		case 0:
+			m.yankClip(false)
+		case 1:
+			m.yankClip(true)
+		case 2:
+			m.pasteClip()
+		case 3:
+			m.restoreLatest()
+		case 4:
+			m.toggleMark()
+		case 5:
+			m.clearMarks()
+		case 6:
+			m.startSearch()
+		}
+	case 2: // View
+		switch item {
+		case 0:
+			m.goUp()
+		case 1:
+			m.cycleSort()
+		case 2:
+			m.toggleGrid()
+		case 3:
+			m.toggleView()
+		case 4:
+			m.showFavs()
+		case 5:
+			m.showVolumes()
+		case 6:
+			m.toggleFav()
+		case 7:
+			m.openHints()
+		}
+	}
+}
+
+// syncMenu refreshes the rows' Disabled flags against live model state —
+// a disabled row is a genuinely disabled verb (nothing selected, an empty
+// clip queue, an empty marked set, a non-dir pin target), never decoration.
+func (m *model) syncMenu() {
+	if len(m.bar.Menus) == 0 {
+		return
+	}
+	_, hasSel := m.selEntry()
+	// File rows 0..6 all act on the selection; Quit does not.
+	for j := 0; j < 7; j++ {
+		m.bar.Menus[0].Items[j].Disabled = !hasSel
+	}
+	m.bar.Menus[1].Items[2].Disabled = len(m.clipSet) == 0 // Paste
+	m.bar.Menus[1].Items[4].Disabled = m.n == 0            // Mark
+	m.bar.Menus[1].Items[5].Disabled = m.markCount() == 0  // Unmark all
+	selDir := false
+	if e, ok := m.selEntry(); ok && e.Dir() {
+		selDir = true
+	}
+	m.bar.Menus[2].Items[6].Disabled = !selDir // Pin folder
+}
+
+// menuKey drives the bar with the tty spelling of the appkit keys and
+// reports whether the key was consumed. Inactive it answers F10 alone;
+// active it owns the keyboard until it disengages.
+func (m *model) menuKey(ev keys.Event) bool {
+	k := appkit.KeyFromTTY(ev)
+	if k.Usage == 0 && k.Rune == 0 {
+		return false
+	}
+	m.syncMenu()
+	wasOpen, wasBar, wasHover := m.bar.Open, m.bar.Bar, m.bar.Hover
+	if !m.bar.OnKey(k) {
+		return false
+	}
+	if m.bar.Open && !wasOpen && m.bar.Bar >= 0 && m.bar.Bar < len(m.bar.Menus) {
+		t := strings.ReplaceAll(m.bar.Menus[m.bar.Bar].Title, "&", "")
+		m.emit("gofiles: menubar open " + t)
+	}
+	// A fired row closes the menu on Enter: (wasBar, wasHover) is the row —
+	// dispatch its verb on THIS model (see buildMenus for why no closures).
+	if wasOpen && !m.bar.Open && ev.Key == keys.KeyEnter &&
+		wasBar >= 0 && wasHover >= 0 &&
+		wasBar < len(m.bar.Menus) && wasHover < len(m.bar.Menus[wasBar].Items) {
+		label := m.bar.Menus[wasBar].Items[wasHover].Label
+		m.emit("gofiles: menubar " + strings.ReplaceAll(label, "&", ""))
+		m.menuVerb(wasBar, wasHover)
+	}
+	return true
 }

@@ -124,6 +124,18 @@ func (a *app) keyEvent(ev vi.Event) {
 		a.dirty = true
 		return
 	}
+	// M190d: the menubar engages on F10/Alt and owns the keyboard while it
+	// stands — its rows call the same paths the chords below take.
+	a.syncMenu()
+	if k, ok := appkit.NormalizeKey(ev); ok && a.bar.OnKey(k) {
+		if a.bar.Open && !a.menuOpen {
+			vi.ConsoleLine("web: menu open")
+		}
+		a.menuOpen = a.bar.Open
+		a.dirty = true
+		return
+	}
+	a.menuOpen = a.bar.Open
 	if ev.Flags&vi.ModCtrl != 0 && ev.Arg0 == 0x0f { // focused WEB owns Ctrl+L
 		a.focusURL()
 		return

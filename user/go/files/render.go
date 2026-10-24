@@ -75,6 +75,11 @@ func (m model) render() string {
 	if m.mode == modeContext {
 		frame += m.renderCtxMenu()
 	}
+	// M190d: the open menubar plates over the body like the context menu —
+	// row 0 keeps its own cells, so the resting frame's geometry is fixed.
+	if m.bar.Open {
+		frame += m.renderMenuDrop()
+	}
 	// M167a: the focused tile's sixel rides after the frame behind a CUP
 	// into the preview pane — the kernel's image cells replace the blank
 	// rows the frame just painted, and every repaint re-places it (the
@@ -322,14 +327,65 @@ func cup(b *strings.Builder, row, col int) {
 	b.WriteString("H")
 }
 
+// menuRow is row 0 — the M190d menubar sharing the path bar's line: menu
+// titles at the left (the engaged or open title in the selection style),
+// the path behind them. Always painted, so the menus are discoverable at
+// rest; nothing about the row's geometry changes when the bar is active.
+func (m model) menuRow() string {
+	var b strings.Builder
+	pos := 0
+	for i, t := range m.bar.CellTitles() {
+		for pos < t.X {
+			b.WriteString(" ")
+			pos++
+		}
+		style := colMenu
+		if m.bar.Active && i == m.bar.Bar {
+			style = colSel
+		}
+		b.WriteString(style + " " + t.Text + " ")
+		pos = t.X + t.W
+	}
+	b.WriteString(colReset)
+	head := b.String()
+	if avail := m.cols - pos - 1; avail > 0 {
+		return head + " " + colPath + clipVis(m.path, avail) + colReset
+	}
+	return head
+}
+
+// renderMenuDrop is the open menu's plate, painted in place by CUP after
+// the grid — the context menu's overlay idiom: rows pad to the plate
+// width so the plate reads as one band, the hover row takes the selection
+// style, disabled rows dim.
+func (m model) renderMenuDrop() string {
+	x, w, rows, ok := m.bar.CellMenu(m.cols)
+	if !ok {
+		return ""
+	}
+	var b strings.Builder
+	for i, r := range rows {
+		text := r.Text + strings.Repeat(" ", max(0, w-visLen(r.Text)))
+		style := colMenu
+		if r.Disabled {
+			style = colMenuDim
+		} else if r.Hover {
+			style = colSel
+		}
+		cup(&b, 1+i, x)
+		b.WriteString(style + text + colReset)
+	}
+	return b.String()
+}
+
 func (m model) renderLines() []string {
 	lw := m.listCols()
 	body := m.bodyRows()
 
 	lines := make([]string, 0, m.rows)
 
-	// Row 0: the path bar.
-	lines = append(lines, colPath+"  "+clipVis(m.path, m.cols-2)+colReset)
+	// Row 0: the menubar + path line (M190d).
+	lines = append(lines, m.menuRow())
 
 	// Row 1: pane headers, aligned over their panes.
 	lhead := clipVis(" files ", lw)
@@ -370,7 +426,7 @@ func (m model) renderLines() []string {
 	// Status (modal prompts take it over) and the key hints.
 	lines = append(lines, m.statusLine())
 	lines = append(lines, colDim+" "+
-		clipVis("j/k move · enter open · / search · space look · i props · o open with · e export · t grid · v volumes · f pins · b pin · tab view · s sort · backspace up · r rename · m mark · M unmark · d trash · u restore · c/x clip · p paste · q quit",
+		clipVis("f10 menu · j/k move · enter open · / search · space look · i props · o open with · e export · t grid · v volumes · f pins · b pin · tab view · s sort · backspace up · r rename · m mark · M unmark · d trash · u restore · c/x clip · p paste · q quit",
 			m.cols-2)+colReset)
 	return lines
 }

@@ -366,6 +366,14 @@ type app struct {
 	// the open/close edge so its marker follows the frame that shows it.
 	hints     appkit.ChordHints
 	hintsEmit int // 1 = open receipt pending, 2 = close receipt pending
+
+	// M190d (#3239): the appkit menubar shares the title row — titles at
+	// the left, the WEB.ELF tag and JS badge right of them — and an open
+	// menu plates over the URL row and page. Every row calls the identical
+	// path its chord takes (a.key for the rune verbs, the same methods the
+	// chord sites call for the rest).
+	bar      appkit.MenuBar
+	menuOpen bool
 }
 
 // virender adapts the kernel fill batcher to the renderer's Surface.
@@ -482,6 +490,7 @@ func main() {
 	}
 	a := &app{win: id, hist: newHistory(), tStart: t0, zoomPct: 100}
 	a.bindCanvas(winW, winH)
+	a.buildMenus()
 	engine, uiState, monoState, serifState := loadTextEngine()
 	a.text = engine
 	vi.ConsoleLine(markerFonts + engine.Name() + " ui=" + uiState + " mono=" + monoState + " serif=" + serifState)
@@ -1417,6 +1426,13 @@ func (a *app) click(x, y int) {
 		a.pickClick(x, y)
 		return
 	}
+	// M190d: a press on the bar (or anywhere while a menu is up) is the
+	// bar's — the kit's own convention.
+	if a.bar.HitTest(x, y) || a.bar.Active {
+		a.bar.OnClick(x, y)
+		a.dirty = true
+		return
+	}
 	// M123d (#2578): a press inside the error strip is the banner's —
 	// buttons choose, × dismisses, the plate swallows; a press outside
 	// falls through to chrome and page as usual.
@@ -1642,10 +1658,7 @@ func (a *app) render() {
 	rect := func(x, y, w, h int, rgb uint32) { vs.Fill(x, y, w, h, rgb) }
 	present := documentPresentation(width, height)
 
-	// Title band.
-	rect(0, titleY, width, titleH, webrender.ColorChromeBg)
-	webrender.DrawText(vs, 6, titleY+4, fit("WEB.ELF  "+a.title, (width-72)/8), 1, false, webrender.ColorChromeInk, clip)
-	webrender.DrawText(vs, width-58, titleY+4, "JS: off", 1, false, webrender.ColorError, clip)
+	// Title band — the menubar's strip (painted later, over the content).
 
 	// URL row.
 	rect(0, urlRowY, width, urlRowH, webrender.ColorChromeBg)
@@ -1720,6 +1733,21 @@ func (a *app) render() {
 	if a.findOpen {
 		a.paintFindBar(vs, clip, width, height)
 	}
+	// M190d (#3239): the menubar on the title row — titles at the left, an
+	// open menu plating over the URL row and page below. The tag and JS
+	// badge repaint on its right edge where the titles leave room.
+	a.bar.R = widgets.Rect{X: 0, Y: titleY, W: width, H: titleH}
+	a.bar.Draw(vs)
+	menuEnd := 6
+	if n := len(a.bar.Menus); n > 0 {
+		menuEnd = a.bar.TitleRect(n-1).Right() + 8
+	}
+	if tag := fit("WEB.ELF  "+a.title, (width-menuEnd-72)/8); tag != "" {
+		if tx := width - 66 - len(tag)*8; tx > menuEnd {
+			webrender.DrawText(vs, tx, titleY+4, tag, 1, false, webrender.ColorChromeInk, clip)
+		}
+	}
+	webrender.DrawText(vs, width-58, titleY+4, "JS: off", 1, false, webrender.ColorError, clip)
 	vi.ConsoleLine("web: viewport css=1280x720 x=" + itoa(present.X) +
 		" y=" + itoa(present.Y) + " w=" + itoa(present.W) + " h=" + itoa(present.H) + " s=" + itoa(a.scroll))
 
@@ -2081,4 +2109,78 @@ func itoa64(n int64) string {
 		buf[i] = '-'
 	}
 	return string(buf[i:])
+}
+
+// --- M190d (#3239): the menubar -------------------------------------------
+
+// buildMenus lays the bar out: the rune verbs dispatch through a.key
+// itself (the literal chord path) and the modifier chords call the same
+// methods their sites in keyEvent do. syncMenu keeps Disabled honest.
+func (a *app) buildMenus() {
+	mi := func(label, chord string, f func() bool) appkit.MenuItem {
+		return appkit.MenuItem{Label: label, Shortcut: chord, Action: func() bool {
+			vi.ConsoleLine("web: menu " + strings.ReplaceAll(label, "&", ""))
+			f()
+			a.dirty = true
+			return true
+		}}
+	}
+	key := func(u uint32, flags uint16) func() bool {
+		return func() bool { a.key(u, flags); return true }
+	}
+	a.bar.Menus = []appkit.Menu{
+		{Title: "&File", Items: []appkit.MenuItem{
+			mi("&Address…", "ctrl+l", func() bool { a.focusURL(); return true }),
+			mi("&Save page", "s", key(keyS, 0)),
+			mi("Save &as…", "ctrl+shift+s", func() bool { a.openSavePicker(); return true }),
+			mi("Open &download", "o", key(keyO, 0)),
+			mi("Show in &folder", "f", key(keyF, 0)),
+			mi("&Quit", "q", key(keyQ, 0)),
+		}},
+		{Title: "&Edit", Items: []appkit.MenuItem{
+			mi("&Find in page", "ctrl+f", func() bool { a.openFindBar(); return true }),
+			mi("&Bookmark page", "ctrl+d", func() bool { a.bookmarkToggleUI(); return true }),
+			mi("&Bookmarks", "ctrl+b", func() bool { a.toggleSidebar(); return true }),
+		}},
+		{Title: "&View", Items: []appkit.MenuItem{
+			mi("&Reload", "r", key(keyR, 0)),
+			mi("&Back", "backspace", key(keyBacksp, 0)),
+			mi("&Forward", "ctrl+right", key(keyRight, vi.ModCtrl)),
+			mi("&History", "h", key(keyH, 0)),
+			mi("Zoom &in", "ctrl+=", func() bool { a.zoomStep(1); return true }),
+			mi("Zoom &out", "ctrl+-", func() bool { a.zoomStep(-1); return true }),
+			mi("Zoom &reset", "ctrl+0", func() bool { a.zoomReset(); return true }),
+			mi("&Stop", "x", key(keyX, 0)),
+		}},
+		{Title: "&Tools", Items: []appkit.MenuItem{
+			mi("Clear &cache", "k", key(keyK, 0)),
+			mi("Clear &cookies", "c", key(keyC, 0)),
+			mi("&Diagnostics", "f1", func() bool { a.showDiagnostics = !a.showDiagnostics; return true }),
+			mi("Chord &hints", "?", func() bool {
+				a.hints = appkit.NewChordHints(appName)
+				a.hints.R = hintsRect(a)
+				a.hintsEmit = 1
+				return true
+			}),
+		}},
+	}
+}
+
+// syncMenu refreshes Disabled against live state before each key reaches
+// the bar: no page body to save, no finished download, no history to walk,
+// nothing in flight to stop.
+func (a *app) syncMenu() {
+	if len(a.bar.Menus) < 3 {
+		return
+	}
+	f, ed, v := &a.bar.Menus[0], &a.bar.Menus[1], &a.bar.Menus[2]
+	f.Items[1].Disabled = !(len(a.lastBody) > 0 && a.target != "" && ledgerFieldOK(a.target))
+	f.Items[2].Disabled = a.target == ""
+	dlDone := a.dl != nil && a.dl.done
+	f.Items[3].Disabled = !dlDone
+	f.Items[4].Disabled = !dlDone
+	ed.Items[1].Disabled = a.target == ""
+	v.Items[1].Disabled = !a.hist.canBack()
+	v.Items[2].Disabled = !a.hist.canForward()
+	v.Items[7].Disabled = !a.loading && !(a.dl != nil && a.dl.active)
 }

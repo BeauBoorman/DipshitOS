@@ -74,3 +74,38 @@ func TestDecodeCtrlZ(t *testing.T) {
 		t.Fatalf("Decode(0x1a) = (%+v, %d) want (KeyCtrlZ, 1)", ev, n)
 	}
 }
+
+// M190d (#3239): the kernel's function-key and editing-key spellings —
+// xterm's SS3 (F1-F4) and CSI-tilde (editing keys + F5-F12) forms, in the
+// usages kernel/src/input.zig emits.
+func TestDecodeFunctionKeys(t *testing.T) {
+	cases := []struct {
+		in   string
+		want Key
+		n    int
+	}{
+		{"\x1bOP", KeyF1, 3},
+		{"\x1bOS", KeyF4, 3},
+		{"\x1b[2~", KeyInsert, 4},
+		{"\x1b[3~", KeyDelete, 4},
+		{"\x1b[7~", KeyHome, 4},
+		{"\x1b[8~", KeyEnd, 4},
+		{"\x1b[15~", KeyF5, 5},
+		{"\x1b[20~", KeyF9, 5},
+		{"\x1b[21~", KeyF10, 5},
+		{"\x1b[23~", KeyF11, 5},
+		{"\x1b[24~", KeyF12, 5},
+	}
+	for _, tc := range cases {
+		ev, n := Decode([]byte(tc.in))
+		if ev.Key != tc.want || n != tc.n {
+			t.Fatalf("Decode(%q) = (%+v, %d), want (%v, %d)",
+				tc.in, ev, n, tc.want, tc.n)
+		}
+	}
+	// A modifier parameter is a form Decode cannot spell: it degrades to
+	// the same bare ESC a partial sequence gets, never a phantom key.
+	if ev, n := Decode([]byte("\x1b[21;5~")); ev.Key != KeyEsc || n != 1 {
+		t.Fatalf("modified F10 = (%+v, %d), want Esc/1", ev, n)
+	}
+}

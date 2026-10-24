@@ -12,9 +12,11 @@ package appkit
 // fill-only canvas it degrades to flat plates and bitmap labels (§1).
 
 import (
+	"strings"
 	"unicode/utf8"
 
 	"virelai/draw"
+	"virelai/rss/keys"
 	"virelai/theme"
 	"virelai/ttf"
 	"virelai/widgets"
@@ -438,6 +440,128 @@ func (b *MenuBar) OnKey(k Key) bool {
 		}
 	}
 	return true
+}
+
+// KeyFromTTY maps one decoded tty key (virelai/rss/keys) onto the appkit
+// vocabulary — the byte-stream spelling of the same HID usages a canvas
+// app's KEY_DOWN carries (M190d: the menubar's drive path for tty-bound
+// faces — GOFILES's ANSI frame, GOTERM's alternate screen). Unmapped keys
+// return the zero Key; callers feed OnKey only when it names something.
+func KeyFromTTY(ev keys.Event) Key {
+	switch ev.Key {
+	case keys.KeyEnter:
+		return Key{Usage: 0x28}
+	case keys.KeyEsc:
+		return Key{Usage: 0x29}
+	case keys.KeyBackspace:
+		return Key{Usage: 0x2a}
+	case keys.KeyTab:
+		return Key{Usage: 0x2b}
+	case keys.KeyDelete:
+		return Key{Usage: 0x4c}
+	case keys.KeyHome:
+		return Key{Usage: 0x4a}
+	case keys.KeyEnd:
+		return Key{Usage: 0x4d}
+	case keys.KeyRight:
+		return Key{Usage: 0x4f}
+	case keys.KeyLeft:
+		return Key{Usage: 0x50}
+	case keys.KeyDown:
+		return Key{Usage: 0x51}
+	case keys.KeyUp:
+		return Key{Usage: 0x52}
+	case keys.KeyPageUp:
+		return Key{Usage: 0x4b}
+	case keys.KeyPageDown:
+		return Key{Usage: 0x4e}
+	case keys.KeyF10:
+		return Key{Usage: 0x43}
+	case keys.KeyRune:
+		return Key{Rune: ev.Rune}
+	}
+	return Key{}
+}
+
+// CellTitle is one bar title's VT degrade facts: the mnemonic-stripped
+// label and its cell span on the bar row — the cell-space TitleRect.
+type CellTitle struct {
+	Text string
+	X    int
+	W    int
+}
+
+// CellTitles lays the titles out in cells for a VT face (GOFILES's ANSI
+// frame, GOTERM's alternate screen): a one-cell left margin and each title
+// padded one cell either side, matching TitleRect's plate spacing.
+func (b *MenuBar) CellTitles() []CellTitle {
+	out := make([]CellTitle, 0, len(b.Menus))
+	x := 1
+	for i := range b.Menus {
+		title, _, _ := mnemonic(b.Menus[i].Title)
+		w := utf8.RuneCountInString(title) + 2
+		out = append(out, CellTitle{Text: title, X: x, W: w})
+		x += w
+	}
+	return out
+}
+
+// CellRow is one open-menu row's VT degrade facts: the composed row text
+// (label left, shortcut right) plus its disabled/hover state.
+type CellRow struct {
+	Text     string
+	Disabled bool
+	Hover    bool
+}
+
+// CellMenu is the open menu's VT degrade — the cell-space PopoverRect +
+// drawMenu. It returns the plate's origin cell, its width in cells, and
+// one CellRow per item; gridW clamps the plate's origin so it stays on the
+// grid like PopoverRect clamps to the bar's span. ok is false with no menu
+// open.
+func (b *MenuBar) CellMenu(gridW int) (x, w int, rows []CellRow, ok bool) {
+	if !b.Open || b.Bar < 0 || b.Bar >= len(b.Menus) {
+		return 0, 0, nil, false
+	}
+	m := &b.Menus[b.Bar]
+	w = 0
+	for j := range m.Items {
+		label, _, _ := mnemonic(m.Items[j].Label)
+		iw := utf8.RuneCountInString(label)
+		if m.Items[j].Shortcut != "" {
+			iw += 4 + utf8.RuneCountInString(m.Items[j].Shortcut)
+		}
+		if iw > w {
+			w = iw
+		}
+	}
+	w += 2 // one-cell pad either side
+	if w < 12 {
+		w = 12
+	}
+	titles := b.CellTitles()
+	x = titles[b.Bar].X
+	if gridW > w && x+w > gridW-1 {
+		x = gridW - 1 - w
+	}
+	if x < 0 {
+		x = 0
+	}
+	rows = make([]CellRow, len(m.Items))
+	for j := range m.Items {
+		it := &m.Items[j]
+		label, _, _ := mnemonic(it.Label)
+		text := " " + label
+		if it.Shortcut != "" {
+			pad := w - 1 - utf8.RuneCountInString(text) - utf8.RuneCountInString(it.Shortcut)
+			if pad < 1 {
+				pad = 1
+			}
+			text += strings.Repeat(" ", pad) + it.Shortcut
+		}
+		rows[j] = CellRow{Text: text, Disabled: it.Disabled, Hover: j == b.Hover}
+	}
+	return x, w, rows, true
 }
 
 // OnClick is the Focusable pointer path: a title opens (or closes) its menu,
