@@ -627,7 +627,7 @@ render `Line(cols)` — GOFILES maps its keys onto it exactly so.
 
 The banner never syscalls: Copy Error hands back a `BannerCopy` choice
 and the app runs its own clipboard seam — GOFILES's resolution is the
-shape ([`user/go/files/state.go:1136`](../user/go/files/state.go)):
+shape ([`user/go/files/act.go:155`](../user/go/files/act.go)):
 
 ```go
 case choice == appkit.BannerCopy:

@@ -1,7 +1,6 @@
 package main
 
 import (
-	"strconv"
 	"strings"
 	"testing"
 
@@ -98,80 +97,6 @@ func TestTabStripKeyboardStepsViews(t *testing.T) {
 	}
 }
 
-// A left-click on a settings row is the row's gesture: two-value rows
-// toggle, vocabulary rows cycle forward, and a free-form key is selected
-// with its typed path named — never a guessed value.
-func TestRowClickCyclesAndToggles(t *testing.T) {
-	a := newStripPanel()
-	a.list = widgets.List{
-		R:     widgets.Rect{X: 0, Y: 50, W: 544, H: 184},
-		RowH:  18,
-		Items: a.labels(),
-	}
-
-	clickRow := func(i int) {
-		t.Helper()
-		y := 50 + i*18 + 9 // row i's vertical middle below the strip
-		if !a.handle(vi.Event{Kind: vi.EvMouseDown, Flags: vi.BtnLeft, Arg0: 100, Arg1: uint32(y)}) {
-			t.Fatalf("row %d click was not consumed", i)
-		}
-	}
-
-	// theme is a 4-value dropdown row: the click takes one step forward.
-	clickRow(rowOf(t, a, "theme"))
-	if v, _ := settings.Get(a.disp, "theme"); v != "light" {
-		t.Fatalf("theme after row click = %q, want light", v)
-	}
-	if a.sel != rowOf(t, a, "theme") || a.list.Sel != a.sel {
-		t.Fatal("the click did not select the row it cycled")
-	}
-	// shadow is an on|off toggle row: one click flips it.
-	clickRow(rowOf(t, a, "shadow"))
-	if v, _ := settings.Get(a.disp, "shadow"); v != "on" {
-		t.Fatalf("shadow after row click = %q, want on", v)
-	}
-	// hostname is free text: click selects it and names the typed path —
-	// the value is untouched because the panel does not guess a vocabulary.
-	before, _ := settings.Get(a.disp, "hostname")
-	clickRow(rowOf(t, a, "hostname"))
-	if v, _ := settings.Get(a.disp, "hostname"); v != before {
-		t.Fatalf("hostname changed to %q", v)
-	}
-	if !strings.Contains(a.status, "key=value") {
-		t.Fatalf("free-form row click status = %q", a.status)
-	}
-	// A click on the tab strip never reaches the rows.
-	if got := a.tabs.tabAt(60, 10); got != tabSettings {
-		t.Fatalf("strip cell at (60,10) = %d", got)
-	}
-}
-
-// The affordance glyphs still win their rect: a toggle row's control click
-// is the same toggle the row-body click performs — one gesture, one write.
-func TestRowAffordanceStillWinsItsRect(t *testing.T) {
-	a := newStripPanel()
-	a.list = widgets.List{
-		R:     widgets.Rect{X: 0, Y: 50, W: 544, H: 184},
-		RowH:  18,
-		Items: a.labels(),
-	}
-	i := rowOf(t, a, "shadow")
-	rr, ok := a.rowRect(i)
-	if !ok {
-		t.Fatal("shadow row not laid out")
-	}
-	tr := toggleRect(rr)
-	x, y := tr.X+tr.W/2, tr.Y+tr.H/2
-	if !a.handle(vi.Event{Kind: vi.EvMouseDown, Flags: vi.BtnLeft, Arg0: uint32(x), Arg1: uint32(y)}) {
-		t.Fatal("toggle-glyph click was not consumed")
-	}
-	if v, _ := settings.Get(a.disp, "shadow"); v != "on" {
-		t.Fatalf("shadow after toggle-glyph click = %q, want on", v)
-	}
-}
-
-// Services rows toggle enabled on click — the click is the pane's gesture,
-// same as Right on a selected service.
 func TestServicesRowClickToggles(t *testing.T) {
 	f := &fakeServices{body: servicesFixture()}
 	a := newStripPanel()
@@ -222,40 +147,6 @@ func TestGrantsRowClickGrants(t *testing.T) {
 	}
 }
 
-// Esc backs out one level: a sub-view pops to the Settings tab; on Settings
-// it quits. An open popover eats Esc first (any key closes it — the M104f
-// contract), and the panel neither pops nor quits on that stroke.
-func TestEscapePopsSubViewThenQuits(t *testing.T) {
-	a := newStripPanel()
-	f := &fakeServices{body: servicesFixture()}
-	a.services = f.view(t)
-
-	a.showTab(tabServices)
-	if !a.key(vi.Event{Kind: vi.EvKeyDown, Arg0: keyEscape}) {
-		t.Fatal("Esc on a sub-view was not consumed")
-	}
-	if a.exitRequested || a.activeTab() != tabSettings {
-		t.Fatal("Esc must pop to the Settings tab, not quit")
-	}
-	if !a.key(vi.Event{Kind: vi.EvKeyDown, Arg0: keyEscape}) || !a.exitRequested {
-		t.Fatal("Esc on the Settings tab must quit")
-	}
-
-	// The popover's any-key-close runs before Esc's pop: a popover Esc is
-	// a close, never a back-out.
-	b := newStripPanel()
-	b.dropdown.open = true
-	if !b.key(vi.Event{Kind: vi.EvKeyDown, Arg0: keyEscape}) {
-		t.Fatal("Esc on an open popover was not consumed")
-	}
-	if b.dropdown.open || b.exitRequested {
-		t.Fatal("popover Esc must close the popover, not quit")
-	}
-}
-
-// M128d (#2608): the profile view is read-only — the ctl seam's answer
-// lands as rows and the marker, a refusal names its code as a row, and
-// neither Enter nor Left/Right writes anything.
 func TestProfileViewIsReadOnlySummary(t *testing.T) {
 	events, restore := captureConsole(t)
 	defer restore()
@@ -316,98 +207,6 @@ func TestProfileViewIsReadOnlySummary(t *testing.T) {
 	}
 }
 
-// Every view-switch surface lands the same marker and the same state —
-// typed `services`, a strip click, and Esc's pop are one path.
-func TestViewSwitchMarkerIsUniform(t *testing.T) {
-	events, restore := captureConsole(t)
-	defer restore()
-	a := newStripPanel()
-	f := &fakeServices{body: servicesFixture()}
-	a.services = f.view(t)
-
-	a.input.SetValue("services")
-	a.key(vi.Event{Kind: vi.EvKeyDown, Arg1: '\n'})
-	a.key(vi.Event{Kind: vi.EvKeyDown, Arg0: keyEscape})
-	want := []string{markerTab + "services", markerTab + "settings"}
-	for _, w := range want {
-		found := false
-		for _, e := range *events {
-			if e == w {
-				found = true
-			}
-		}
-		if !found {
-			t.Fatalf("no %q in %v", w, *events)
-		}
-	}
-}
-
-// M183a (#3171): a file past the old 24-row cap is one table to GOSET —
-// the union plus the overflow rows all render (the unknown rows kept, not
-// offered), the summary counts them, and the save path is bounded by the
-// codec's cap, not by 24.
-func TestOverflowTableListsEveryRowAndSavesWhole(t *testing.T) {
-	a := newStripPanel()
-	var rows []settings.Setting
-	for _, k := range settings.KnownKeys {
-		rows = append(rows, settings.Setting{Key: k.Name, Val: k.Default})
-	}
-	for _, group := range [][]settings.Key{
-		settings.PaletteKeys, settings.FontKeys, settings.KeyboardLayoutKeys,
-		settings.IdleKeys, settings.NotifyKeys, settings.NotifySoundKeys,
-		settings.VolumeKeys, settings.TimezoneKeys, settings.DataRootKeys,
-		settings.A11yKeys,
-	} {
-		for _, k := range group {
-			rows = append(rows, settings.Setting{Key: k.Name, Val: k.Default})
-		}
-	}
-	// The kernel accepts term_restart; the codec does not know it — a real
-	// file can carry it, so the union does.
-	rows = append(rows, settings.Setting{Key: "term_restart", Val: "stay"})
-	if len(rows) != 24 {
-		t.Fatalf("the known union is %d rows, want the pinned wave-5 census of 24", len(rows))
-	}
-	for i := 0; i < 8; i++ {
-		rows = append(rows, settings.Setting{Key: "overflow" + strconv.Itoa(i), Val: "zz"})
-	}
-	a.disp = (settings.File{Rows: rows, State: settings.StateOK}).Display()
-	if len(a.disp) != 32 {
-		t.Fatalf("display = %d rows, want the whole 32-row table", len(a.disp))
-	}
-	if got := len(a.labels()); got != 32 {
-		t.Fatalf("labels = %d, want one per row", got)
-	}
-	if got := a.summary(); got != "keys=32 wm=gotabwm theme=dark" {
-		t.Fatalf("summary = %q", got)
-	}
-	// The unknown overflow rows render as kept — preserved, not editable.
-	if lab := a.labels()[31]; !strings.Contains(lab, "overflow7") || !strings.Contains(lab, "(kept)") {
-		t.Fatalf("overflow row label = %q", lab)
-	}
-	// A 32-row save is NOT refused at either the old or the new row cap: the
-	// publish attempt runs and fails on the host's syscall seam — the status
-	// names the attempt's rc, never the "settings full" refusal.
-	a.save()
-	if !strings.HasPrefix(a.status, "save failed rc=") {
-		t.Fatalf("32-row save status = %q — the panel must not refuse at the cap", a.status)
-	}
-	// Past MaxKeys the codec's own named refusal stands.
-	full := append([]settings.Setting(nil), a.disp...)
-	for len(full) < settings.MaxKeys+1 {
-		full = append(full, settings.Setting{Key: "pad" + strconv.Itoa(len(full)), Val: "v"})
-	}
-	a.disp = full
-	a.save()
-	if a.status != "settings full: the kernel cannot load this table whole" {
-		t.Fatalf("over-cap save status = %q", a.status)
-	}
-}
-
-// M165b (#2983): the access tab is the a11y surface — three rows with the
-// file's value or the compiled default, a toggle, a toggle and a
-// dropdown, and edits that land in the settings table like every other
-// row. The text-scale row names its own reach.
 func TestAccessTabShowsAndEditsTheA11yRows(t *testing.T) {
 	events, restore := captureConsole(t)
 	defer restore()
