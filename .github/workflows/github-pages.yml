@@ -54,6 +54,18 @@ jobs:
         with:
           fetch-depth: 0
 
+      # Component-registry page render (M189c, issue #3227). The site's
+      # components page carries a generated region (BEGIN/END markers)
+      # rendered from docs/component-registry.md; regenerate it at publish
+      # time so the published page is exactly the registry, then fail if
+      # the committed copy had drifted (the docs gate owns the red, this
+      # only guarantees what gets published).
+      - name: Render component-registry site page
+        run: |
+          python3 tools/render-component-site.py
+          git diff --exit-code site/components.md || \
+            (echo "site/components.md drifted from the registry — commit the re-render (M189c)"; exit 1)
+
       # The Boris toolchain is a one-way dependency: this repo publishes its
       # site with a Boris binary, and the Boris revision is the single pin
       # in .github/boris-pin.json, recorded in the retained evidence.

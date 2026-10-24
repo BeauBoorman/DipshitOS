@@ -117,6 +117,56 @@ jobs:
           print(f"truth guard ok: {len(built)} built .BIN names, milestone watermark M{limit}")
           PY
 
+      # Component-registry freshness (M189c, issue #3227). The registry
+      # (M189a) is the one truth for what ships and at what version; the
+      # site renders it (site/components.md, generated region between the
+      # BEGIN/END markers by tools/render-component-site.py). This check
+      # fails a PR that ships an app without a site-visible row: an
+      # image/apps.txt row with no registry `app` row, or a registry whose
+      # render is stale on the site page, both red the docs gate. Same
+      # fail-the-PR shape as the deleted-binary rule above; the
+      # test_component_registry.py drift check in verify-portable remains
+      # the deeper semantic guard (appver vs StateVersion, refs, grammar).
+      - name: Component-registry freshness (apps.txt <-> registry <-> site)
+        run: |
+          python3 tools/render-component-site.py --check
+          python3 - <<'PY2'
+          import re, sys, pathlib
+          root = pathlib.Path(".")
+          apps = set()
+          for line in (root / "image/apps.txt").read_text().splitlines():
+              line = line.strip()
+              if not line or line.startswith("#") or "|" not in line:
+                  continue
+              apps.add(line.split("|", 1)[0].strip())
+          reg = (root / "docs/component-registry.md").read_text()
+          site = (root / "site/components.md").read_text()
+          fails = []
+          rows = {}
+          for lineno, line in enumerate(reg.splitlines(), 1):
+              cells = [c.strip() for c in line.strip().strip("|").split("|")] \
+                  if line.strip().startswith("|") else None
+              if not cells or len(cells) != 6 or cells[0] in ("name", ""):
+                  continue
+              if set(cells[0]) <= {"-", ":", " "}:
+                  continue
+              rows[cells[2]] = (lineno, cells)
+          for binary in sorted(apps):
+              if binary not in rows:
+                  fails.append(
+                      "image/apps.txt: %s has no component-registry row — "
+                      "add one so the site shows it (M189c)" % binary)
+                  continue
+              if binary not in site:
+                  fails.append(
+                      "site/components.md: %s missing from the rendered "
+                      "registry — run tools/render-component-site.py" % binary)
+          if fails:
+              print("\n".join(fails))
+              sys.exit(1)
+          print("registry freshness ok: %d apps.txt rows, all on the site" % len(apps))
+          PY2
+
       # The Boris revision is the single pin in .github/boris-pin.json,
       # shared with the Pages publish workflow: this gate always validates
       # the same toolchain that publishes.

@@ -200,6 +200,8 @@ fixtures, the serial logs are not committed.*
 - [[roadmap|Roadmap & status]] — what has landed and what comes next.
 - [[names|Project names & lore]] — what "Road Pops" and "Driving Award" mean.
 - [[evidence|Evidence & testing]] — how a claimed feature is proven to work.
+- [[components|Components]] — every shipped component and its one version
+  surface, rendered from the canonical registry.
 
 ## Who this is for
 

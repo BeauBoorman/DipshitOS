@@ -30,6 +30,8 @@ so.
   appkit, spaces, split panes, the chord registry, and session fidelity.
 - [[apps|The app fleet]] — what ships on the image: editors, shell, browser,
   sheets, paint, IRC, games, and the signed-store installs.
+- [[components|Components]] — the per-component version surfaces behind the
+  fleet, rendered from the canonical registry so it cannot lag.
 - [[media|Media & typography]] — bounded PDF, SVG raster, JPEG/GIF/PNG/QOI
   decode, sixel terminal graphics, and the font stack.
 - [[programs|Runtimes & demos]] — the WASM interpreter, QuickJS, the

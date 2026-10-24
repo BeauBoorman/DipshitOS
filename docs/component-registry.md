@@ -5,6 +5,11 @@ surface that answers "what version is it", the owning gate spec or contract,
 and its state. Checked by `tools/tests/test_component_registry.py`, which
 runs in `just verify-portable` — a row that disagrees with `image/apps.txt`,
 with a spec pin it cites, or with the release grammar fails the build.
+The registry is also what the public site renders: `site/components.md`
+carries a generated region (M189c, #3227) produced by
+`tools/render-component-site.py`, re-rendered at publish time, and the
+docs gate fails a PR that lets `image/apps.txt`, this file, or the
+rendered page drift apart.
 
 ## The version rule
 

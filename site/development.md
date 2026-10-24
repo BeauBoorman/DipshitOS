@@ -137,3 +137,9 @@ testing policy, the hardware contract, archived trackers. The site
 promotes and summarizes the warehouse and links to the canonical files;
 it never duplicates the ledger. [[layout|The repository map]] shows where
 each lives.
+
+The component registry is the one deliberate render: the
+[[components|components page]] carries a generated region re-rendered from
+`docs/component-registry.md` at publish time (`tools/render-component-site.py`),
+and the docs gate fails a PR that lets the manifest, the registry, or the
+rendered page drift apart — the site cannot lag development silently.
