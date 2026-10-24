@@ -3053,10 +3053,22 @@ PY
 # 0009's KEY_DOWN fan-out lands on the seat's own window, so `ls` + the
 # passphrases typed while locked never reach GOSH — asserted as no
 # 'gosh: line' row between 'gotabwm: locked' and 'gotabwm: unlocked'.
+#
+# Both boots pass --screen: it arms the virtio-gpu the seat's
+# WmctlRegister requires — headless the register answers ENXIO and no
+# 'gosh: prompt' ever arrives, so these legs could never run green as
+# first authored (M194a observation; the go-wm-seat shape).
 # ---------------------------------------------------------------------------
 
+# The rm is insurance, not the leg's premise: the refusal leg WANTS no
+# credential, so `vf: rm ... ok` only prints on the path where a stale
+# VAULT.BIN existed to delete — absent, the monitor answers
+# `error: vf rm: ...: not found on the host share` and a gate on the
+# success receipt deadlocks the boot. The echo runs strictly after the
+# rm resolves either way, so the chord releases on it instead.
 vgate_file script-11a.txt <<'EOF'
 vf rm GOVAULT/VAULT.BIN
+echo rx-dogfood-11-clean
 EOF
 
 vgate_file script-11b.txt <<'EOF'
@@ -3065,10 +3077,11 @@ EOF
 
 vgate_run 11 -- \
     --via-virtio \
+    --screen '$RUN_DIR/screen-11' \
     --script '$RUN_DIR/script-11a.txt' \
     --script-after 'gosh: prompt' \
     --input-chords 'ctrl-shift-l' \
-    --input-chords-after 'vf: rm GOVAULT/VAULT.BIN' \
+    --input-chords-after 'rx-dogfood-11-clean' \
     --script2 '$RUN_DIR/script-11b.txt' \
     --script2-after 'gotabwm: lock refused no_credential' \
     --script-expect 'rx-dogfood-11-ok' --timeout 240
@@ -3097,6 +3110,7 @@ EOF
 
 vgate_run 12 -- \
     --via-virtio \
+    --screen '$RUN_DIR/screen-12' \
     --script '$RUN_DIR/script-12a.txt' \
     --script-after 'gosh: prompt' \
     --input-chords 'h,u,n,t,e,r,2,return,h,u,n,t,e,r,2,return' \
