@@ -897,7 +897,7 @@ vgate_assert 12 serial-contains 'goedit: present'
 # seat row (29 in the shipped table + M132a's seven reserved rows = 36)
 # = 40; NO kernel-terminal rows — this window is not a tty front-end, so
 # those chords do not answer here.
-vgate_assert 12 serial-contains 'goedit: hints n=40'
+vgate_assert 12 serial-contains 'goedit: hints n=44'
 vgate_assert 12 serial-contains 'goedit: hints row ctrl+s publish the buffer (save)'
 vgate_assert 12 serial-contains 'goedit: hints row ctrl+f '
 vgate_assert 12 serial-contains 'goedit: hints row ctrl+g '
@@ -1511,3 +1511,34 @@ vgate_assert 17 serial-absent 'goedit: buffer full'
 vgate_assert 17 serial-absent 'goedit: save error'
 vgate_assert 17 serial-absent '[EXC] parking:'
 vgate_assert 17 serial-absent 'exited status=139'
+
+# --- M190d (#3239) run 18: the menubar — F10 engages File, the menu opens
+# on down, and the Save row fires the same save path ctrl-s takes: the row
+# receipt, the menu-open receipt, and the byte-identical publish marker.
+vgate_file script2-18.txt <<'EOFS'
+exec GOEDIT.ELF /host/EDIT/SEED.TXT
+EOFS
+
+vgate_file script3-18.txt <<'EOFS'
+dui close 2
+echo rx-goedit-menu-ok
+EOFS
+
+vgate_run 18 -- \
+    --screen '$RUN_DIR/screen-18' \
+    --via-virtio \
+    --script '$RUN_DIR/script.txt' \
+    --script2 '$RUN_DIR/script2-18.txt' --script2-after 'tabwm: sidebar-rendered' \
+    --input-chords 'f10,down,down,down,return' \
+    --input-chords-after 'goedit: present' \
+    --script3 '$RUN_DIR/script3-18.txt' --script3-after 'goedit: saved ' \
+    --script-expect 'rx-goedit-menu-ok' --timeout 240
+
+vgate_assert 18 serial-contains 'exec: loaded GOEDIT.ELF'
+vgate_assert 18 serial-contains 'goedit: read /host/EDIT/SEED.TXT n='
+vgate_assert 18 serial-contains 'goedit: menu open'
+vgate_assert 18 serial-contains 'goedit: menu Save'
+vgate_assert 18 serial-contains 'goedit: saved /host/EDIT/SEED.TXT n='
+vgate_assert 18 serial-contains 'rx-goedit-menu-ok'
+vgate_assert 18 serial-absent '[EXC] parking:'
+vgate_assert 18 serial-absent 'exited status=139'

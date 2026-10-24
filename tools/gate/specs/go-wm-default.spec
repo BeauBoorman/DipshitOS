@@ -1534,3 +1534,48 @@ vgate_assert 21 serial-absent 'exec: loaded GOCLOCK.ELF'
 vgate_assert 21 serial-absent 'gotabwm: launcher exec GOCLOCK.ELF'
 vgate_assert 21 serial-absent '[EXC] parking:'
 vgate_assert 21 serial-absent 'exited status=139'
+
+# --- M194f (#3286) run 22: GOWELCOME's thin owning leg -----------------------
+#
+# Boot 19 already proves the seat's first-boot exec reaches the tour's face;
+# this is the app's OWN leg — the registry row's pin. The face chain
+# (open/declare/present/ready) replays under a monitor exec, then two tour
+# buttons answer through digit keys — the tour's documented keyboard
+# spelling of the launcher row (tour.go digitLaunch rides the same
+# a.launch path a click takes, so no canvas-geometry click is needed).
+# `2` names the honest refusal — GOFILES.ELF is deliberately never staged
+# in this spec — and `4` execs the staged GOTERM.ELF for real. The leg
+# ends on the launch receipt: the successful exec moves focus to the new
+# Terminal tab, so a following `q` would land there, not on the tour —
+# GOWELCOME's Esc/q quit chord is unpinned by design in this spec.
+vgate_file script-22.txt <<'EOF'
+set GOMAXPROCS=1
+exec GOWELCOME.ELF
+EOF
+
+vgate_run 22 -- \
+    --screen '$RUN_DIR/screen-22' --via-virtio \
+    --script '$RUN_DIR/script-22.txt' \
+    --script-after 'gotabwm: mode live' \
+    --input-chords '2' \
+    --input-chords-after 'gowelcome: ready' \
+    --input-chords2 '4' \
+    --input-chords2-after 'gowelcome: launch fail GOFILES.ELF' \
+    --script-expect 'gowelcome: launch GOTERM.ELF' --script-expect-tail 5 \
+    --timeout 300
+
+vgate_assert 22 serial-contains 'wm: autostart gotabwm (settings wm=gotabwm)'
+vgate_assert 22 serial-contains 'gotabwm: mode live'
+vgate_assert 22 serial-contains 'exec: loaded GOWELCOME.ELF'
+vgate_assert 22 serial-contains 'gowelcome: open id='
+vgate_assert 22 serial-contains 'gowelcome: declare accepted'
+vgate_assert 22 serial-contains 'gowelcome: present'
+vgate_assert 22 serial-contains 'gowelcome: ready'
+vgate_assert 22 serial-contains 'gowelcome: launch fail GOFILES.ELF'
+vgate_assert 22 serial-contains 'gowelcome: launch GOTERM.ELF'
+# The launched app is live on the seat: `exec: loaded` is the MONITOR's
+# marker — an in-guest exec shows as the app's own open/declare chain.
+vgate_assert 22 serial-contains 'goterm: open id='
+vgate_assert 22 serial-contains 'goterm: declare accepted'
+vgate_assert 22 serial-absent '[EXC] parking:'
+vgate_assert 22 serial-absent 'exited status=139'

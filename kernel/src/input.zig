@@ -320,13 +320,17 @@ fn emitFunctionKey(out: *[max_key_bytes]u8, usage: u8, modifier: u8) usize {
             out[5] = final;
             return 6;
         },
-        0x3f => return emitCsiTilde(out, 15, modifier), // F5
-        0x40 => return emitCsiTilde(out, 17, modifier), // F6
-        0x41 => return emitCsiTilde(out, 18, modifier), // F7
-        0x42 => return emitCsiTilde(out, 19, modifier), // F8
-        0x43 => return emitCsiTilde(out, 20, modifier), // F9
-        0x44 => return emitCsiTilde(out, 21, modifier), // F10
-        0x46 => return emitCsiTilde(out, 23, modifier), // F11
+        // USB HID function-row usages run F1=0x3a..F12=0x45 — the table
+        // used to skip 0x3e (real F5), so every F-key from F5 on emitted
+        // the previous key's tilde spelling (F10 arrived as F9's
+        // `ESC[20~`) and F5 emitted nothing at all.
+        0x3e => return emitCsiTilde(out, 15, modifier), // F5
+        0x3f => return emitCsiTilde(out, 17, modifier), // F6
+        0x40 => return emitCsiTilde(out, 18, modifier), // F7
+        0x41 => return emitCsiTilde(out, 19, modifier), // F8
+        0x42 => return emitCsiTilde(out, 20, modifier), // F9
+        0x43 => return emitCsiTilde(out, 21, modifier), // F10
+        0x44 => return emitCsiTilde(out, 23, modifier), // F11
         0x45 => return emitCsiTilde(out, 24, modifier), // F12
         else => return 0,
     }
@@ -398,7 +402,7 @@ pub fn hid_to_bytes(usage: u8, shift: bool, alt: bool, ctrl: bool, out: *[max_ke
     // Function keys and Insert have xterm modifier forms too, so they are
     // decoded before the ctrl-letter fast path below.
     switch (usage) {
-        0x3a...0x3d, 0x3f...0x46 => return emitFunctionKey(out, usage, modifier),
+        0x3a...0x45 => return emitFunctionKey(out, usage, modifier),
         0x70 => return emitCsiTilde(out, 2, modifier), // Insert
         else => {},
     }
@@ -1387,13 +1391,13 @@ test "input: hid_to_bytes maps the full function-key and Insert vocabulary" {
         .{ .usage = 0x3b, .want = "\x1bOQ" }, // F2
         .{ .usage = 0x3c, .want = "\x1bOR" }, // F3
         .{ .usage = 0x3d, .want = "\x1bOS" }, // F4
-        .{ .usage = 0x3f, .want = "\x1b[15~" }, // F5
-        .{ .usage = 0x40, .want = "\x1b[17~" }, // F6
-        .{ .usage = 0x41, .want = "\x1b[18~" }, // F7
-        .{ .usage = 0x42, .want = "\x1b[19~" }, // F8
-        .{ .usage = 0x43, .want = "\x1b[20~" }, // F9
-        .{ .usage = 0x44, .want = "\x1b[21~" }, // F10
-        .{ .usage = 0x46, .want = "\x1b[23~" }, // F11
+        .{ .usage = 0x3e, .want = "\x1b[15~" }, // F5
+        .{ .usage = 0x3f, .want = "\x1b[17~" }, // F6
+        .{ .usage = 0x40, .want = "\x1b[18~" }, // F7
+        .{ .usage = 0x41, .want = "\x1b[19~" }, // F8
+        .{ .usage = 0x42, .want = "\x1b[20~" }, // F9
+        .{ .usage = 0x43, .want = "\x1b[21~" }, // F10
+        .{ .usage = 0x44, .want = "\x1b[23~" }, // F11
         .{ .usage = 0x45, .want = "\x1b[24~" }, // F12
         .{ .usage = 0x70, .want = "\x1b[2~" }, // Insert
     };
@@ -1408,7 +1412,7 @@ test "input: hid_to_bytes maps the full function-key and Insert vocabulary" {
     var out: [max_key_bytes]u8 = undefined;
     var n = hid_to_bytes(0x3a, true, false, false, &out); // Shift-F1
     try std.testing.expectEqualSlices(u8, "\x1b[1;2P", out[0..n]);
-    n = hid_to_bytes(0x3f, false, false, true, &out); // Ctrl-F5
+    n = hid_to_bytes(0x3e, false, false, true, &out); // Ctrl-F5
     try std.testing.expectEqualSlices(u8, "\x1b[15;5~", out[0..n]);
 }
 

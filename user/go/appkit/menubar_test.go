@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"virelai/draw"
+	"virelai/rss/keys"
 	"virelai/theme"
 	"virelai/ttf"
 	"virelai/widgets"
@@ -195,4 +196,57 @@ func TestMenuBarGolden(t *testing.T) {
 	bare := &MenuBar{R: widgets.Rect{X: 4, Y: 192, W: 232, H: 24}, Menus: demoMenus(&quit, &exp)}
 	bare.Draw(c)
 	checkCompositeGolden(t, "appkit-menubar", c)
+}
+
+// M190d (#3239): the VT degrade — CellTitles mirrors TitleRect's cell
+// layout, CellMenu mirrors the popover's rows with their disabled/hover
+// state, and KeyFromTTY carries the byte stream onto the same usages a
+// canvas app's KEY_DOWN delivers.
+func TestCellTitlesAndMenu(t *testing.T) {
+	var b MenuBar
+	b.Menus = []Menu{
+		{Title: "&File", Items: []MenuItem{
+			{Label: "&Open", Shortcut: "ctrl+o"},
+			{Label: "&Save", Shortcut: "ctrl+s", Disabled: true},
+		}},
+		{Title: "&Edit", Items: []MenuItem{
+			{Label: "Cu&t", Shortcut: "ctrl+x"},
+		}},
+	}
+	titles := b.CellTitles()
+	if len(titles) != 2 || titles[0].Text != "File" || titles[1].Text != "Edit" {
+		t.Fatalf("CellTitles = %+v", titles)
+	}
+	if titles[0].X != 1 || titles[0].W != 6 || titles[1].X != 7 {
+		t.Fatalf("title cells = %+v", titles)
+	}
+	if _, _, _, ok := b.CellMenu(80); ok {
+		t.Fatal("CellMenu ok with no menu open")
+	}
+	b.OpenMenu(0)
+	x, w, rows, ok := b.CellMenu(80)
+	if !ok || x != titles[0].X || len(rows) != 2 {
+		t.Fatalf("CellMenu = x=%d w=%d rows=%d ok=%v", x, w, len(rows), ok)
+	}
+	if rows[0].Text != " Open    ctrl+o" || rows[0].Disabled || !rows[0].Hover {
+		t.Fatalf("row0 = %+v", rows[0])
+	}
+	if !rows[1].Disabled || rows[1].Hover {
+		t.Fatalf("row1 = %+v", rows[1])
+	}
+}
+
+func TestKeyFromTTY(t *testing.T) {
+	if got := KeyFromTTY(keys.Event{Key: keys.KeyF10}); got.Usage != 0x43 {
+		t.Fatalf("F10 = %+v", got)
+	}
+	if got := KeyFromTTY(keys.Event{Key: keys.KeyEnter}); got.Usage != 0x28 {
+		t.Fatalf("Enter = %+v", got)
+	}
+	if got := KeyFromTTY(keys.Event{Key: keys.KeyRune, Rune: 'x'}); got.Rune != 'x' {
+		t.Fatalf("rune = %+v", got)
+	}
+	if got := KeyFromTTY(keys.Event{Key: keys.KeyCtrlC}); got.Usage != 0 || got.Rune != 0 {
+		t.Fatalf("unmapped = %+v, want zero", got)
+	}
 }

@@ -1035,6 +1035,38 @@ print("notify chain OK: sleep6 focused -> silence; sleep7 blurred -> "
       % (dur, wid))
 PY
 
+# --- M190d (#3239) run 09: the menubar over the bound tty — F10 reaches
+# the app as ESC[21~, engages the alternate-screen bar, right right lands
+# on View, down opens it, return fires Chord hints: the identical '?' face
+# and its registry receipts the bare-'?' path prints.
+# M191a (#3242): hints n=52→53 — GOTERM's own ctrl+shift+g scrollback-find
+# row joins the count (app 1 + seat 40 + kernel 12).
+vgate_file script2-09.txt <<'EOFS'
+exec GOTERM.ELF
+EOFS
+
+vgate_file script3-09.txt <<'EOFS'
+dui close 2
+echo rx-goterm-menu-ok
+EOFS
+
+vgate_run 09 -- \
+    --screen '$RUN_DIR/screen-09' \
+    --via-virtio \
+    --script '$RUN_DIR/script.txt' \
+    --script2 '$RUN_DIR/script2-09.txt' --script2-after 'tabwm: sidebar-rendered' \
+    --input-chords 'f10,right,right,down,return' \
+    --input-chords-after 'goterm: prompt' \
+    --script3 '$RUN_DIR/script3-09.txt' --script3-after 'goterm: hints n=' \
+    --script-expect 'rx-goterm-menu-ok' --timeout 240
+
+vgate_assert 09 serial-contains 'exec: loaded GOTERM.ELF'
+vgate_assert 09 serial-contains 'goterm: menubar open'
+vgate_assert 09 serial-contains 'goterm: hints n=53'
+vgate_assert 09 serial-contains 'goterm: close'
+vgate_assert 09 serial-contains 'rx-goterm-menu-ok'
+vgate_assert 09 serial-absent '[EXC] parking:'
+vgate_assert 09 serial-absent 'exited status=139'
 # --- M191a (#3242): GOTERM scrollback find ----------------------------------
 # One seated boot drives the whole bet against the app's own serial
 # markers — the alt-screen overlay paints grid cells, which serial never

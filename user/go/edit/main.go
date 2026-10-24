@@ -576,6 +576,14 @@ type editor struct {
 	hints     appkit.ChordHints
 	hintsEmit int // 1 = open receipt pending, 2 = close receipt pending
 
+	// M190d (#3239): the appkit menubar shares the chrome row — titles at
+	// the left, the buffer row and status right of them — and an open menu
+	// plates over the document. Every row calls the identical method its
+	// chord calls in handleKey. menuOpen tracks the open transition so the
+	// `goedit: menu open` receipt prints once.
+	mbar     appkit.MenuBar
+	menuOpen bool
+
 	// M149c (#2808): the -minimap flag — the document's right-edge column
 	// of one pixel row per buffer line, and the press-to-jump arm.
 	minimap bool
@@ -671,6 +679,7 @@ func main() {
 	// decodes into the app's own state before the buffer even loads. The
 	// decoded path wins over argv: a session re-exec runs the bare bin.
 	e := &editor{doc: doc{path: path}, diagsArg: diagPath, minimap: minimap}
+	e.buildMenus()
 	ta := tabapp.Init(tabapp.Config{
 		Name:  appName,
 		Title: appTitle,
@@ -922,6 +931,12 @@ func (e *editor) handle(ev vi.Event) bool {
 			return true
 		}
 	}
+	// M190d: a press on the bar (or anywhere while a menu is up) is the
+	// bar's — the kit's own convention.
+	if ev.Kind == vi.EvMouseDown && (e.mbar.HitTest(int(ev.Arg0), int(ev.Arg1)) || e.mbar.Active) {
+		e.mbar.OnClick(int(ev.Arg0), int(ev.Arg1))
+		return true
+	}
 	return e.key(ev)
 }
 
@@ -1013,6 +1028,18 @@ func (e *editor) handleKey(ev vi.Event) bool {
 	case modeHints:
 		return e.hintsKey(ev)
 	}
+	// M190d: the menubar engages on F10/Alt from any non-modal mode and
+	// owns the keyboard while it stands — its rows call the identical
+	// methods the chords below dispatch to.
+	e.syncMenu()
+	if k, ok := appkit.NormalizeKey(ev); ok && e.mbar.OnKey(k) {
+		if e.mbar.Open && !e.menuOpen {
+			vi.ConsoleLine("goedit: menu open")
+		}
+		e.menuOpen = e.mbar.Open
+		return true
+	}
+	e.menuOpen = e.mbar.Open
 	// M121c (#2566): '?' opens the chord-hint overlay from the document or
 	// the diagnostics panel — the registry's app + seat rows painted over
 	// the buffer. A bar keeps '?' as text (a find pattern may literally be
@@ -2217,7 +2244,6 @@ func (e *editor) draw() {
 	// row takes the old `Edit  <path>` text's place, sized against it.
 	status := e.statusText()
 	sw := utf8.RuneCountInString(status) * adv
-	e.drawBufRow(w, sw)
 	if sw < w-textOrigin {
 		e.drawText(w-textOrigin-sw, 8, status, tok.InkMuted)
 	}
@@ -2383,6 +2409,17 @@ func (e *editor) draw() {
 	} else if e.mode == modeHints {
 		e.hints.Draw(e.ta.Canvas())
 	}
+	// M190d: the menubar paints over the document (an open menu's popover
+	// drops onto the text) but under every modal surface and the banner.
+	// The buffer row follows it on the shared chrome row, starting right
+	// of the menu titles.
+	e.mbar.R = widgets.Rect{X: 0, Y: 0, W: w, H: chromeH}
+	e.mbar.Draw(e.ta.Canvas())
+	menuEnd := textOrigin
+	if n := len(e.mbar.Menus); n > 0 {
+		menuEnd = e.mbar.TitleRect(n-1).Right() + adv
+	}
+	e.drawBufRow(w, sw, menuEnd)
 	// M123d: the error strip paints last of all — it stands over whatever
 	// the frame already drew.
 	if e.banner.Open && e.ta != nil {
@@ -2560,4 +2597,85 @@ func (e *editor) drawMinimap(w, h int) {
 		line++
 		start = i + 1
 	}
+}
+
+// --- M190d (#3239): the menubar -------------------------------------------
+//
+// buildMenus lays the bar out; every Action calls the identical method its
+// chord dispatches to in handleKey. syncMenu keeps Disabled honest against
+// live state — a disabled row is a genuinely disabled verb, not greyed
+// decoration.
+func (e *editor) buildMenus() {
+	mi := func(label, chord string, f func() bool) appkit.MenuItem {
+		return appkit.MenuItem{Label: label, Shortcut: chord, Action: func() bool {
+			vi.ConsoleLine("goedit: menu " + strings.ReplaceAll(label, "&", ""))
+			f()
+			return true
+		}}
+	}
+	e.mbar.Menus = []appkit.Menu{
+		{Title: "&File", Items: []appkit.MenuItem{
+			mi("&Open…", "ctrl+o", func() bool { return e.startPick(false) }),
+			mi("Open in &New Buffer", "ctrl+shift+o", func() bool { return e.startPickBuf() }),
+			mi("&Save", "ctrl+s", func() bool { e.save(); return true }),
+			mi("Save &As…", "ctrl+shift+s", func() bool { return e.startPick(true) }),
+			mi("&Close Buffer", "ctrl+w", func() bool { return e.closeBufAsk() }),
+			mi("N&ext Buffer", "ctrl+pagedown", func() bool { return e.switchBuf(1) }),
+			mi("&Previous Buffer", "ctrl+pageup", func() bool { return e.switchBuf(-1) }),
+		}},
+		{Title: "&Edit", Items: []appkit.MenuItem{
+			mi("&Undo", "ctrl+z", func() bool { e.undo(); return true }),
+			mi("&Redo", "ctrl+shift+z", func() bool { e.redo(); return true }),
+			mi("Cu&t", "ctrl+x", func() bool { e.cut(); return true }),
+			mi("&Copy", "ctrl+c", func() bool { e.copy(); return true }),
+			mi("&Paste", "ctrl+v", func() bool { e.paste(); return true }),
+			mi("Select &All", "ctrl+a", func() bool { e.selectAll(); return true }),
+			mi("&Mark", "ctrl+shift+m", func() bool { return e.toggleMark() }),
+		}},
+		{Title: "&Search", Items: []appkit.MenuItem{
+			mi("&Find", "ctrl+f", func() bool { return e.openBar(modeFind) }),
+			mi("&Replace", "ctrl+r", func() bool { return e.openBar(modeReplace) }),
+			mi("&Goto Line", "ctrl+g", func() bool { return e.openBar(modeGoto) }),
+			mi("&Errors", "ctrl+e", func() bool { return e.openErrors() }),
+			mi("Ne&xt Error", "ctrl+n", func() bool { return e.stepDiag(1) }),
+			mi("Pre&v Error", "ctrl+p", func() bool { return e.stepDiag(-1) }),
+		}},
+		{Title: "&View", Items: []appkit.MenuItem{
+			mi("Match &Bracket", "ctrl+b", func() bool { return e.jumpMatch() }),
+			mi("&Fold Block", "ctrl+k", func() bool { return e.toggleFold() }),
+			mi("&Unfold All", "ctrl+u", func() bool { return e.clearFolds() }),
+			mi("Chord &hints", "?", func() bool {
+				e.hints = appkit.NewChordHints(appName)
+				e.mode = modeHints
+				e.hintsEmit = 1
+				return true
+			}),
+		}},
+	}
+}
+
+// syncMenu refreshes Disabled against live state before each key reaches
+// the bar: one-buffer ring, empty undo/redo stacks, no selection, an empty
+// clipboard, no diagnostics, no bracket match, no folds.
+func (e *editor) syncMenu() {
+	if len(e.mbar.Menus) < 4 {
+		return
+	}
+	f, ed, s, v := &e.mbar.Menus[0], &e.mbar.Menus[1], &e.mbar.Menus[2], &e.mbar.Menus[3]
+	oneBuf := len(e.docList()) <= 1
+	f.Items[4].Disabled = oneBuf
+	f.Items[5].Disabled = oneBuf
+	f.Items[6].Disabled = oneBuf
+	ed.Items[0].Disabled = len(e.hist.undo) == 0
+	ed.Items[1].Disabled = len(e.hist.redo) == 0
+	_, _, selOn := e.selRange()
+	ed.Items[2].Disabled = !selOn
+	ed.Items[3].Disabled = !selOn
+	cb, rc := clipRead()
+	ed.Items[4].Disabled = rc < 0 || len(cb) == 0
+	s.Items[4].Disabled = len(e.diags) == 0
+	s.Items[5].Disabled = len(e.diags) == 0
+	_, mOK := e.matchCell()
+	v.Items[0].Disabled = !mOK
+	v.Items[2].Disabled = len(e.folds) == 0
 }

@@ -1053,9 +1053,10 @@ vgate_assert 09 serial-contains 'goterm: ready'
 vgate_assert 09 serial-contains 'goterm: line read Q'
 # n= is the registry's own count for GOTERM's scope (app + seat +
 # kernel-terminal): 36 at M121c, 48 after the M121b/M121e/M132/M137
-# additions — re-pinned, not relaxed (the value is what the registry
-# reports today; a drift in the overlay's row list fails here).
-vgate_assert 09 serial-contains 'goterm: hints n=48'
+# additions, 52 with the M190a clip-menu, M190b shot pair and M190e
+# lock seat rows — re-pinned, not relaxed (the value is what the
+# registry reports today; a drift in the overlay's row list fails here).
+vgate_assert 09 serial-contains 'goterm: hints n=52'
 vgate_assert 09 serial-contains 'goterm: hints row ctrl+shift+c copy the terminal selection'
 vgate_assert 09 serial-contains 'goterm: hints row ctrl+shift+p summon the command palette'
 vgate_assert 09 serial-contains 'goterm: hints close'

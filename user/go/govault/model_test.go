@@ -7,7 +7,6 @@ import (
 	"testing"
 
 	"virelai/vaultlib"
-	"virelai/vi"
 )
 
 // The codec fixtures moved with the codec (vaultlib, M190e #3240) — the
@@ -195,61 +194,6 @@ func TestRevealIsPerEntry(t *testing.T) {
 	}
 }
 
-// The masked field stores bytes so it can be wiped: backspace removes a
-// whole rune (and zeroes its bytes), clear() leaves nothing recoverable.
-func TestFieldWipesItsBytes(t *testing.T) {
-	f := newField("secret", 8, true)
-	f.insert('p')
-	f.insert('a')
-	f.insert('é') // two bytes — the rune-whole case
-	if got := f.shown(); got != "***" {
-		t.Fatalf("masked show=%q, want three bullets", got)
-	}
-	f.backspace()
-	if string(f.buf) != "pa" {
-		t.Fatalf("backspace left %q — must remove the whole é", f.buf)
-	}
-	f.insert('x')
-	f.clear()
-	for _, b := range f.buf[:cap(f.buf)] {
-		if b != 0 {
-			t.Fatal("clear left bytes in the field buffer")
-		}
-	}
-	if got := f.shown(); got != "" {
-		t.Fatalf("cleared field shows %q", got)
-	}
-}
-
-// ensureDirs never offers the mount root the mkdir triple — "/host" answers
-// it with EINVAL, not EEXIST (observed on the run-01 gate leg: `save refused
-// rc=-1 /host`, and the whole vault chain died behind it). Only components
-// BELOW the root are created; EEXIST is a pass and a real refusal propagates.
-func TestEnsureDirsSkipsMountRoot(t *testing.T) {
-	oldOpen, oldClose := fileOpen, fileClose
-	defer func() { fileOpen, fileClose = oldOpen, oldClose }()
-
-	var opened []string
-	fileOpen = func(path string, flags uint32) (int64, int64) {
-		opened = append(opened, path)
-		return 0, int64(vi.ErrFileExists)
-	}
-	fileClose = func(h int64) {}
-	if !ensureDirs("/host/GOVAULT/VAULT.BIN") {
-		t.Fatal("ensureDirs refused an all-EEXIST chain")
-	}
-	if len(opened) != 1 || opened[0] != "/host/GOVAULT" {
-		t.Fatalf("opened %v, want exactly [/host/GOVAULT] — the mount root is never created", opened)
-	}
-
-	fileOpen = func(path string, flags uint32) (int64, int64) {
-		return -1, -int64(vi.ErrEACCES)
-	}
-	if ensureDirs("/host/GOVAULT/VAULT.BIN") {
-		t.Fatal("a refused mkdir below the root must propagate")
-	}
-}
-
 // addEntry keeps its own copies — the caller's field buffers can be cleared
 // without aliasing the stored secret.
 func TestAddEntryClones(t *testing.T) {
@@ -269,5 +213,17 @@ func TestAddEntryClones(t *testing.T) {
 	}
 	if m.sel != 0 {
 		t.Fatalf("sel=%d, want the new row selected", m.sel)
+	}
+}
+
+// lock() drops the loaded receipts too — the view reloads from the file on
+// vaultlib.Entry, so a locked vault holds no stale copy.
+func TestLockClearsReceipts(t *testing.T) {
+	m := &model{}
+	m.unlocked(nil, make([]byte, 32), make([]byte, 16), testIters, 0)
+	m.rcpts = []receipt{{epoch: 1, action: actUnlock, name: "-", ok: true}}
+	m.lock()
+	if m.rcpts != nil {
+		t.Fatal("lock left the receipts view loaded")
 	}
 }

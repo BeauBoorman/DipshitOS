@@ -30,6 +30,24 @@ const (
 	// tty-bound front-ends see the chord as this control byte, never as a
 	// window KEY_DOWN; an app that does not bind it ignores it as before.
 	KeyCtrlZ
+	// M190d (#3239): the remaining keys the kernel's tty encoder spells —
+	// editing keys and the function row in xterm's SS3/CSI-tilde forms
+	// (kernel/src/input.zig emitFunctionKey/emitCsiTilde). Before this
+	// decode they degraded to a bare ESC followed by literal bytes.
+	KeyInsert
+	KeyDelete
+	KeyF1
+	KeyF2
+	KeyF3
+	KeyF4
+	KeyF5
+	KeyF6
+	KeyF7
+	KeyF8
+	KeyF9
+	KeyF10
+	KeyF11
+	KeyF12
 )
 
 // Event is one decoded key. Rune is set only for KeyRune.
@@ -48,6 +66,19 @@ func Decode(b []byte) (Event, int) {
 	c := b[0]
 	switch {
 	case c == 0x1b:
+		if len(b) >= 3 && b[1] == 'O' {
+			// SS3 <final> — xterm's unmodified F1-F4 spelling.
+			switch b[2] {
+			case 'P':
+				return Event{Key: KeyF1}, 3
+			case 'Q':
+				return Event{Key: KeyF2}, 3
+			case 'R':
+				return Event{Key: KeyF3}, 3
+			case 'S':
+				return Event{Key: KeyF4}, 3
+			}
+		}
 		if len(b) >= 3 && b[1] == '[' {
 			switch b[2] {
 			case 'A':
@@ -63,13 +94,8 @@ func Decode(b []byte) (Event, int) {
 			case 'F':
 				return Event{Key: KeyEnd}, 3
 			}
-			if len(b) >= 4 && b[3] == '~' {
-				switch b[2] {
-				case '5':
-					return Event{Key: KeyPageUp}, 4
-				case '6':
-					return Event{Key: KeyPageDown}, 4
-				}
+			if ev, n := csiTilde(b); n > 0 {
+				return ev, n
 			}
 		}
 		return Event{Key: KeyEsc}, 1
@@ -89,4 +115,53 @@ func Decode(b []byte) (Event, int) {
 	default:
 		return Event{Key: KeyRune, Rune: rune(c)}, 1
 	}
+}
+
+// csiTilde decodes `ESC [ <n> ~` — the kernel's editing-key and F5-F12
+// tilde spellings. A ';' before the '~' marks a modifier form the caller
+// cannot spell, so it degrades to a bare ESC like any partial sequence
+// (0 used means the caller falls through).
+func csiTilde(b []byte) (Event, int) {
+	i, n := 2, 0
+	for i < len(b) && i < 8 && b[i] >= '0' && b[i] <= '9' {
+		n = n*10 + int(b[i]-'0')
+		i++
+	}
+	if i == 2 || i >= len(b) || b[i] != '~' {
+		return Event{}, 0
+	}
+	k := KeyNone
+	switch n {
+	case 2:
+		k = KeyInsert
+	case 3:
+		k = KeyDelete
+	case 5:
+		k = KeyPageUp
+	case 6:
+		k = KeyPageDown
+	case 7:
+		k = KeyHome
+	case 8:
+		k = KeyEnd
+	case 15:
+		k = KeyF5
+	case 17:
+		k = KeyF6
+	case 18:
+		k = KeyF7
+	case 19:
+		k = KeyF8
+	case 20:
+		k = KeyF9
+	case 21:
+		k = KeyF10
+	case 23:
+		k = KeyF11
+	case 24:
+		k = KeyF12
+	default:
+		return Event{}, 0
+	}
+	return Event{Key: k}, i + 1
 }

@@ -31,6 +31,7 @@
 package main
 
 import (
+	"bytes"
 	"strings"
 
 	"virelai/appkit"
@@ -394,6 +395,27 @@ func runSession(ta *tabapp.TabApp, fd uint32, ts *termState) {
 			}
 		}
 
+		// feedBytes runs one tty chunk's normal path: SGR mouse reports are
+		// not editor input — strip them; a press+release on one link cell
+		// opens it (M149b). The rest feeds the line editor.
+		feedBytes := func(b []byte) {
+			clean, reps := ts.mi.extract(b)
+			for _, r := range reps {
+				if cx, cy, ok := ts.mi.clickCell(r); ok {
+					if uri, found := ts.lt.linkAt(cx, cy, rowsVisible(ta.H)); found {
+						openLink(ts, ta, fd, editor, hst, uri)
+					} else {
+						vi.ConsoleLine("goterm: link miss cell=" +
+							vi.Itoa64(int64(cx)) + "," +
+							vi.Itoa64(int64(cy)))
+					}
+				}
+			}
+			if len(clean) > 0 {
+				handle(editor.Feed(clean))
+			}
+		}
+
 		var readBuf [64]byte
 		for !restart {
 			// M125e (#2590): the seat's save notice is a mailbox message,
@@ -406,14 +428,26 @@ func runSession(ta *tabapp.TabApp, fd uint32, ts *termState) {
 			ta.PollSelPaste()
 			n, _ := vi.FileRead(fd, readBuf[:])
 			if n > 0 {
-				// M121c (#2566): a bare '?' keystroke at the prompt opens
-				// the chord-hint overlay on the tty's alternate screen. A
-				// '?' arriving inside a larger chunk (a paste, a typed
-				// burst) stays editor input; a '?' typed while a child
-				// owns the terminal never reaches this loop at all — the
-				// wait's tty read is the child's byte stream, the
-				// pass-through the card names.
-				if n == 1 && readBuf[0] == '?' {
+				// M190d (#3239): F10 (the kernel's ESC[21~) engages the
+				// menubar. Bytes ahead of the chord feed normally; the
+				// chunk's tail rides into the menu session as its first
+				// input — the rest of the gesture is its navigation.
+				if i := bytes.Index(readBuf[:n], menuF10); i >= 0 {
+					if i > 0 {
+						feedBytes(readBuf[:i])
+					}
+					if !restart {
+						menuPerform(menuSession(ta, ts, fd, readBuf[i+len(menuF10):n]),
+							ta, ts, fd, editor, handle)
+					}
+				} else if n == 1 && readBuf[0] == '?' {
+					// M121c (#2566): a bare '?' keystroke at the prompt opens
+					// the chord-hint overlay on the tty's alternate screen. A
+					// '?' arriving inside a larger chunk (a paste, a typed
+					// burst) stays editor input; a '?' typed while a child
+					// owns the terminal never reaches this loop at all — the
+					// wait's tty read is the child's byte stream, the
+					// pass-through the card names.
 					hintsSession(ta, ts, fd, editor)
 				} else if n == 1 && readBuf[0] == findOpenByte {
 					// M191a (#3242): ctrl+shift+g — the kernel's tty
@@ -423,23 +457,7 @@ func runSession(ta *tabapp.TabApp, fd uint32, ts *termState) {
 					// same single-byte rule the '?' overlay keeps.
 					findSession(ta, ts, fd, editor)
 				} else {
-					// M149b: SGR mouse reports are not editor input —
-					// strip them; a press+release on one link cell opens it.
-					clean, reps := ts.mi.extract(readBuf[:n])
-					for _, r := range reps {
-						if cx, cy, ok := ts.mi.clickCell(r); ok {
-							if uri, found := ts.lt.linkAt(cx, cy, rowsVisible(ta.H)); found {
-								openLink(ts, ta, fd, editor, hst, uri)
-							} else {
-								vi.ConsoleLine("goterm: link miss cell=" +
-									vi.Itoa64(int64(cx)) + "," +
-									vi.Itoa64(int64(cy)))
-							}
-						}
-					}
-					if len(clean) > 0 {
-						handle(editor.Feed(clean))
-					}
+					feedBytes(readBuf[:n])
 				}
 			}
 			for editor.Pending() {
